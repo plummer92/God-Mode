@@ -1,28 +1,44 @@
 {
   "approved": [
-    "NFLX",
     "META",
+    "NFLX",
+    "QQQ",
+    "MSFT",
+    "NVDA",
     "AAPL",
-    "AMZN",
-    "TSLA",
-    "AMD",
-    "COIN",
-    "GME",
     "SPY",
     "IWM"
   ],
   "buy": [
-    "NFLX",
     "META",
+    "NFLX",
+    "QQQ",
+    "MSFT",
+    "NVDA",
     "AAPL",
-    "AMZN",
-    "TSLA",
-    "AMD",
-    "COIN",
-    "GME",
     "SPY",
     "IWM"
   ],
-  "sell": [],
-  "updated": "2026-03-17T16:18:14.628934"
+  "sell": [
+    "IWM",
+    "SPY",
+    "AMZN",
+    "QQQ",
+    "META",
+    "TSLA",
+    "GME",
+    "COIN"
+  ],
+  "short": [
+    "IWM",
+    "SPY",
+    "AMZN",
+    "QQQ",
+    "META",
+    "TSLA",
+    "GME",
+    "COIN"
+  ],
+  "updated": "2026-03-20T11:49:12.306232-05:00",
+  "roster_managed": true
 }
