@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """strategy_lab.py — runs every 6 hours testing strategy combinations"""
-import sqlite3, json, os, time
+import sqlite3, time
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -51,7 +51,7 @@ def init_db():
 def get_signals(symbol, sig_filter, rvol):
     try:
         conn = sqlite3.connect(DB_PATH)
-        ph = " OR ".join([f"signal_type LIKE ?" for _ in sig_filter])
+        ph = " OR ".join(["signal_type LIKE ?" for _ in sig_filter])
         params = [symbol] + [f"%{s}%" for s in sig_filter] + [rvol]
         cur = conn.cursor()
         cur.execute(f"""SELECT timestamp, signal_type, price, rvol FROM signals

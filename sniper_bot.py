@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 import os as _os
 _BROKER = _os.getenv("BROKER", "alpaca").lower()
 if _BROKER == "ibkr":
-    from ibkr_client import IBKRClient, IBKROrderRequest
+    from ibkr_client import IBKROrderRequest
     class OrderSide:
         BUY = "BUY"
         SELL = "SELL"
@@ -271,7 +271,6 @@ def get_approved_symbols() -> dict:
         approved_path = "/home/theplummer92/approved_symbols.json"
         with open(approved_path, "r") as f:
             data = json.load(f)
-        all_symbols = [s.upper() for s in data.get("approved", [])]
         # If JSON has buy/sell split, use it. Otherwise apply backtest-based defaults.
         if "buy" in data and "sell" in data:
             return {
@@ -279,7 +278,7 @@ def get_approved_symbols() -> dict:
                 "sell": [s.upper() for s in data["sell"]],
             }
     except Exception:
-        all_symbols = []
+        pass
 
     # Backtest-optimised defaults
     return {

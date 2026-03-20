@@ -9,7 +9,6 @@ import json
 import pandas as pd
 from datetime import datetime
 import pytz
-import os
 
 DB_PATH      = "/home/theplummer92/wolfe_signals.db"
 REGIME_PATH  = "/home/theplummer92/regime_snapshot.json"

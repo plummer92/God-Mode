@@ -5,12 +5,12 @@ Uses Alpaca paper account to simulate IBKR short trades
 Tracks performance so we have real data when we switch to live IBKR
 """
 import os, sqlite3, time, json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 load_dotenv("/home/theplummer92/.env")
 
@@ -107,7 +107,7 @@ def execute_short(client, symbol, price, signal):
             log(f"SKIP {symbol}: not in short approved list")
             return
 
-        order = client.submit_order(MarketOrderRequest(
+        client.submit_order(MarketOrderRequest(
             symbol=symbol,
             notional=TRADE_NOTIONAL,
             side=OrderSide.SELL,

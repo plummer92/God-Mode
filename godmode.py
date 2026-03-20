@@ -28,7 +28,7 @@ import sqlite3
 import csv
 import signal
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import yfinance as yf
 from dotenv import load_dotenv
