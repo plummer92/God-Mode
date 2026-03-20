@@ -123,7 +123,7 @@ def run():
     log(f"Short approved: {', '.join(SHORT_APPROVED)}")
 
     client     = get_client()
-    last_check = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+    last_check = (datetime.utcnow() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
 
     # Log starting equity
     acct = client.get_account()
@@ -160,7 +160,7 @@ def run():
                         continue
                     seen.add(key)
                     execute_short(client, symbol, float(price), sig_type)
-                last_check = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+                last_check = (datetime.utcnow() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
 
             # Heartbeat every minute
             log(f"heartbeat | paper equity=${equity:.2f} | VIX={vix:.1f} | positions={len(client.get_all_positions())}")
