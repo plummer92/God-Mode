@@ -157,6 +157,12 @@ def main():
     while True:
         try:
             run()
+            # Update rosters after each iteration
+            try:
+                import subprocess
+                subprocess.run(["/home/theplummer92/venv/bin/python3", "/home/theplummer92/roster_manager.py"])
+            except Exception as re:
+                log(f"Roster manager error: {re}")
             log("Sleeping 6 hours...")
             time.sleep(6*3600)
         except Exception as e:
