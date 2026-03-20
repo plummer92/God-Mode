@@ -17,8 +17,11 @@ sudo systemctl restart strategy-lab.service
 sudo systemctl restart dashboard.service
 ```
 
+Unit files live in `/etc/systemd/system/`. After creating or editing a unit file, run `sudo systemctl daemon-reload` before starting/enabling.
+
 Check logs:
 ```bash
+journalctl -u sniper.service -n 50 --no-pager
 journalctl -u sniper.service -f
 tail -f /home/theplummer92/sniper.log
 tail -f /home/theplummer92/crypto_raider.log
