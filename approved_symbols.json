@@ -1,0 +1,28 @@
+{
+  "approved": [
+    "NFLX",
+    "META",
+    "AAPL",
+    "AMZN",
+    "TSLA",
+    "AMD",
+    "COIN",
+    "GME",
+    "SPY",
+    "IWM"
+  ],
+  "buy": [
+    "NFLX",
+    "META",
+    "AAPL",
+    "AMZN",
+    "TSLA",
+    "AMD",
+    "COIN",
+    "GME",
+    "SPY",
+    "IWM"
+  ],
+  "sell": [],
+  "updated": "2026-03-17T16:18:14.628934"
+}
