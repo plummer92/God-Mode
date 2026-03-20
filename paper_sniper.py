@@ -139,14 +139,14 @@ def run():
 
             # Check regime
             regime = get_regime()
-            vix    = regime.get("vix", 20)
+            vix = float(regime.get("vix") or 20)
 
             # Manage existing positions
             manage_positions(client)
 
             # Check daily loss limit
             acct   = client.get_account()
-            equity = float(acct.equity)
+            equity = float(acct.equity or 0)
 
             # Get new SELL signals
             signals = get_new_signals(last_check)
@@ -160,7 +160,7 @@ def run():
                         continue
                     seen.add(key)
                     execute_short(client, symbol, float(price), sig_type)
-                last_check = (datetime.utcnow() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+                last_check = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
 
             # Heartbeat every minute
             log(f"heartbeat | paper equity=${equity:.2f} | VIX={vix:.1f} | positions={len(client.get_all_positions())}")
