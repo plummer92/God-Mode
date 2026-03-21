@@ -525,22 +525,6 @@ def run():
                         continue
                     execute_entry(t_client, sym, stype, float(price))
                 last_check = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-            # Regime gate — skip new entries if market is too dangerous
-            if not is_regime_safe():
-                time.sleep(POLL_SECONDS)
-                continue
-
-            # Daily loss limit gate
-            if not check_daily_loss_limit(t_client):
-                time.sleep(POLL_SECONDS)
-                continue
-
-            # Check for new signals
-            signals = get_new_signals(last_check)
-            if signals:
-                for s in signals:
-                    execute_entry(t_client, s[1], s[2], s[3])
-                last_check = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
 
             time.sleep(POLL_SECONDS)
 
