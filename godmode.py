@@ -204,7 +204,9 @@ def save_macro_features(vix: Optional[float], tnx: Optional[float], dxy: Optiona
 # ---------------- SIGNAL LOGIC ----------------
 def analyze_signal(rvol: float, change_pct: float, flow_m: float) -> str:
     """
-    Returns only the label (keep it simple for ML labeling).
+    Returns signal label. Flow and price direction must agree for a valid signal.
+    If flow is positive but price is falling, buyers are getting run over (BULL TRAP).
+    If flow is negative but price is rising, sellers are getting squeezed (BEAR TRAP).
     """
     if rvol > 4.0 and abs(change_pct) < 0.001:
         return "🛡️ ABSORPTION SELL" if flow_m > 0 else "🛡️ ABSORPTION BUY"
@@ -213,11 +215,14 @@ def analyze_signal(rvol: float, change_pct: float, flow_m: float) -> str:
     if rvol > 8.0:
         return "🔥 CLIMAX"
     if rvol > 2.5:
-        # --- NEW WHALE FILTER ---
-        if abs(flow_m) < 5.0:  
+        if abs(flow_m) < 5.0:
             return "Neutral"
-        # ------------------------
-        return "⭐⭐⭐ STRONG BUY FLOW" if flow_m > 0 else "⭐⭐⭐ STRONG SELL FLOW"
+        if flow_m > 0:
+            # Buy flow: only valid if price is actually going up
+            return "⭐⭐⭐ STRONG BUY FLOW" if change_pct >= 0 else "⚠️ BULL TRAP"
+        else:
+            # Sell flow: only valid if price is actually going down
+            return "⭐⭐⭐ STRONG SELL FLOW" if change_pct <= 0 else "⚠️ BEAR TRAP"
     return "Neutral"
 def get_flow_math(symbol: str, price: float, vol: float, open_p: float, close_p: float) -> float:
     """
@@ -390,6 +395,19 @@ def run_god_mode_pro() -> None:
 
             log(f"[{ts}] Scan | regime={regime} | VIX={vix_val} TNX={tnx_val} DXY={dxy_val}")
 
+            # SPY 20-bar MA trend filter — suppresses long signals in downtrends
+            spy_trend_bullish: Optional[bool] = None
+            try:
+                _, spy_closes, _ = get_symbol_frame(batch, "SPY") if batch is not None else (None, None, None)
+                if spy_closes is not None and len(spy_closes) >= 20:
+                    spy_ma20 = float(spy_closes.iloc[-20:].mean())
+                    spy_price = float(spy_closes.iloc[-1])
+                    spy_trend_bullish = spy_price > spy_ma20
+                    trend_str = "BULL" if spy_trend_bullish else "BEAR"
+                    log(f"SPY trend: {trend_str} (${spy_price:.2f} vs MA20 ${spy_ma20:.2f})")
+            except Exception:
+                spy_trend_bullish = None
+
             watch_rows: List[Dict] = []
 
             # ----- per symbol scanning -----
@@ -433,21 +451,27 @@ def run_god_mode_pro() -> None:
 
                         # DB + alert only non-neutral
                         if "Neutral" not in signal_lbl:
-                            save_signal_to_db(
-                                symbol=symbol,
-                                sector=sector,
-                                signal_type=signal_lbl,
-                                price=price,
-                                change_pct=change_pct,
-                                rvol=rvol,
-                                flow_m=flow_m
-                            )
+                            is_buy_signal = "BUY" in signal_lbl and "SELL" not in signal_lbl
+                            trend_blocked = is_buy_signal and spy_trend_bullish is False
 
-                            now_epoch = time.time()
-                            if (now_epoch - last_alert_ts.get(symbol, 0) > 1200) or ("CLIMAX" in signal_lbl):
-                                log(f"🚀 {signal_lbl}: {symbol} | Flow: ${flow_m:+.1f}M | RVOL={rvol:.2f} | Δ={change_pct*100:.2f}%")
-                                post_discord(symbol, signal_lbl, rvol, flow_m)
-                                last_alert_ts[symbol] = now_epoch
+                            if trend_blocked:
+                                log(f"TREND GATE: {signal_lbl} on {symbol} suppressed — SPY below MA20")
+                            else:
+                                save_signal_to_db(
+                                    symbol=symbol,
+                                    sector=sector,
+                                    signal_type=signal_lbl,
+                                    price=price,
+                                    change_pct=change_pct,
+                                    rvol=rvol,
+                                    flow_m=flow_m
+                                )
+
+                                now_epoch = time.time()
+                                if (now_epoch - last_alert_ts.get(symbol, 0) > 1200) or ("CLIMAX" in signal_lbl):
+                                    log(f"🚀 {signal_lbl}: {symbol} | Flow: ${flow_m:+.1f}M | RVOL={rvol:.2f} | Δ={change_pct*100:.2f}%")
+                                    post_discord(symbol, signal_lbl, rvol, flow_m)
+                                    last_alert_ts[symbol] = now_epoch
 
                         # ----- Absorption set -----
                         if is_absorption_candidate(rvol, change_pct, flow_m):

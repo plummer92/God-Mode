@@ -137,11 +137,11 @@ def get_regime_mode() -> str:
     r = get_regime()
     regime = r["regime"]
     vix = r["vix"]
-    if vix >= 35:
+    if vix >= 30:
         log_line(f"\U0001f321\ufe0f REGIME BLOCK: VIX={vix:.1f} >= 30 — too dangerous, standing down")
         return "BLOCKED"
-    if regime == "RISK_OFF_VOLATILITY" and vix >= 30:
-        log_line(f"\U0001f4c9 REGIME SELL-ONLY: {regime} + VIX={vix:.1f} — shorts allowed, longs paused")
+    if vix >= 25:
+        log_line(f"\U0001f4c9 REGIME SELL-ONLY: VIX={vix:.1f} >= 25 — shorts only, longs paused")
         return "SELL_ONLY"
     return "OPEN"
 
