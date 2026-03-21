@@ -247,6 +247,8 @@ def init_db():
                 rvol REAL, flow_m REAL, confidence INTEGER, sector TEXT, change_pct REAL
             )
         ''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_timestamp ON signals(symbol, timestamp)")
         conn.commit()
     except Exception:
         pass

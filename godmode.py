@@ -159,6 +159,9 @@ def init_db() -> None:
     )
     """)
 
+    c.execute("CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_timestamp ON signals(symbol, timestamp)")
+
     conn.commit()
     conn.close()
     log(f"{Fore.GREEN}✅ DB ready: {DB_PATH}")
