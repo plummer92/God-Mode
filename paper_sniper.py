@@ -34,6 +34,9 @@ DB_PATH  = "/home/theplummer92/wolfe_signals.db"
 LOG_FILE = "/home/theplummer92/paper_sniper.log"
 CST      = pytz.timezone("America/Chicago")
 
+_paper_daily_start_equity = 0.0
+_paper_daily_start_date   = None
+
 def log(msg):
     ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -117,6 +120,20 @@ def execute_short(client, symbol, price, signal):
     except Exception as e:
         log(f"SHORT FAIL {symbol}: {e}")
 
+def check_daily_loss_limit(equity):
+    global _paper_daily_start_equity, _paper_daily_start_date
+    today = datetime.now(CST).strftime("%Y-%m-%d")
+    if _paper_daily_start_date != today:
+        _paper_daily_start_equity = equity
+        _paper_daily_start_date   = today
+        log(f"New trading day — paper starting equity: ${equity:.2f}")
+    daily_pnl = equity - _paper_daily_start_equity
+    if daily_pnl <= -DAILY_LOSS_LIMIT:
+        log(f"DAILY LOSS LIMIT HIT: down ${abs(daily_pnl):.2f} (limit ${DAILY_LOSS_LIMIT}) — standing down")
+        return False
+    return True
+
+
 def run():
     log("PAPER SNIPER starting - SHORT only, paper account")
     log(f"Trade size: ${TRADE_NOTIONAL} | TP: {TAKE_PROFIT_PCT:.0%} | SL: {STOP_LOSS_PCT:.0%}")
@@ -147,6 +164,9 @@ def run():
             # Check daily loss limit
             acct   = client.get_account()
             equity = float(acct.equity or 0)
+            if not check_daily_loss_limit(equity):
+                time.sleep(60)
+                continue
 
             # Get new SELL signals
             signals = get_new_signals(last_check)

@@ -517,9 +517,15 @@ def run():
             # Check for new signals
             signals = get_new_signals(last_check)
             if signals:
+                seen = set()
                 for s in signals:
                     sym, stype, price = s[1], s[2], s[3]
                     side = "SELL" if any(x in stype.upper() for x in ("SELL","SHORT","ABSORPTION SELL")) else "BUY"
+                    dedup_key = (s[0][:13], sym, side)  # one trade per hour per symbol per direction
+                    if dedup_key in seen:
+                        log_line(f"SKIP DUPE {sym} {side} (already acted on this hour)")
+                        continue
+                    seen.add(dedup_key)
                     if regime_mode == "SELL_ONLY" and side.upper() not in ("SELL", "SHORT"):
                         log_line(f"📉 SELL-ONLY mode — skipping {side} signal on {sym}")
                         continue
