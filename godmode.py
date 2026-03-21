@@ -174,6 +174,7 @@ def save_signal_to_db(symbol: str, sector: str, signal_type: str,
         confidence += 10
     confidence = min(confidence, 100)
 
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -186,11 +187,14 @@ def save_signal_to_db(symbol: str, sector: str, signal_type: str,
             )
         """, (symbol, signal_type, price, rvol, flow_m, confidence, sector, float(change_pct)))
         conn.commit()
-        conn.close()
     except Exception as e:
         log(f"{Fore.RED}DB Write Error (signals): {e}")
+    finally:
+        if conn:
+            conn.close()
 
 def save_macro_features(vix: Optional[float], tnx: Optional[float], dxy: Optional[float], regime: str) -> None:
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -199,9 +203,11 @@ def save_macro_features(vix: Optional[float], tnx: Optional[float], dxy: Optiona
             VALUES (datetime('now'), ?, ?, ?, ?)
         """, (vix, tnx, dxy, regime))
         conn.commit()
-        conn.close()
     except Exception as e:
         log(f"{Fore.RED}DB Write Error (macro_features): {e}")
+    finally:
+        if conn:
+            conn.close()
 # ---------------- SIGNAL LOGIC ----------------
 def analyze_signal(rvol: float, change_pct: float, flow_m: float) -> str:
     """

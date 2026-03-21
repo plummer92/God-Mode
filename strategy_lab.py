@@ -50,6 +50,7 @@ def init_db():
     conn.commit(); conn.close()
 
 def get_signals(symbol, sig_filter, rvol):
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH)
         ph = " OR ".join(["signal_type LIKE ?" for _ in sig_filter])
@@ -59,8 +60,12 @@ def get_signals(symbol, sig_filter, rvol):
             WHERE symbol=? AND ({ph}) AND rvol>=?
             AND timestamp > datetime('now', '-{LOOKBACK} days')
             ORDER BY timestamp ASC""", params)
-        rows = cur.fetchall(); conn.close(); return rows
-    except: return []
+        return cur.fetchall()
+    except:
+        return []
+    finally:
+        if conn:
+            conn.close()
 
 def simulate(symbol, signals, tp, sl, hold_hours):
     if not signals: return []
@@ -115,39 +120,42 @@ def run():
     all_results = []
     conn = sqlite3.connect(LAB_DB)
     cur  = conn.cursor()
-    for symbol in SYMBOLS:
-        for sf in SIGNAL_FILTERS:
-            fs = "+".join(sf)
-            for rvol in RVOL_THRESHOLDS:
-                sigs = get_signals(symbol, sf, rvol)
-                if not sigs: continue
-                for tp in TP_VALUES:
-                    for sl in SL_VALUES:
-                        if tp <= sl: continue
-                        for hold in HOLD_HOURS:
-                            trades = simulate(symbol, sigs, tp, sl, hold)
-                            if len(trades) < MIN_TRADES: continue
-                            wins = sum(1 for t in trades if t["win"])
-                            wr   = wins/len(trades)
-                            ar   = np.mean([t["ret"] for t in trades])
-                            gw   = sum(t["ret"] for t in trades if t["win"])
-                            gl   = abs(sum(t["ret"] for t in trades if not t["win"]))
-                            pf   = gw/gl if gl > 0 else 99
-                            sc   = score(wr, ar, len(trades), pf)
-                            cur.execute("INSERT INTO results VALUES (null,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                (datetime.now().isoformat(),symbol,fs,rvol,tp,sl,hold,
-                                 len(trades),round(wr,4),round(ar,4),round(pf,4),sc))
-                            all_results.append({"s":symbol,"f":fs,"rvol":rvol,"tp":tp,"sl":sl,
-                                                "hold":hold,"n":len(trades),"wr":wr,"ar":ar,"sc":sc})
+    try:
+        for symbol in SYMBOLS:
+            for sf in SIGNAL_FILTERS:
+                fs = "+".join(sf)
+                for rvol in RVOL_THRESHOLDS:
+                    sigs = get_signals(symbol, sf, rvol)
+                    if not sigs: continue
+                    for tp in TP_VALUES:
+                        for sl in SL_VALUES:
+                            if tp <= sl: continue
+                            for hold in HOLD_HOURS:
+                                trades = simulate(symbol, sigs, tp, sl, hold)
+                                if len(trades) < MIN_TRADES: continue
+                                wins = sum(1 for t in trades if t["win"])
+                                wr   = wins/len(trades)
+                                ar   = np.mean([t["ret"] for t in trades])
+                                gw   = sum(t["ret"] for t in trades if t["win"])
+                                gl   = abs(sum(t["ret"] for t in trades if not t["win"]))
+                                pf   = gw/gl if gl > 0 else 99
+                                sc   = score(wr, ar, len(trades), pf)
+                                cur.execute("INSERT INTO results VALUES (null,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                    (datetime.now().isoformat(),symbol,fs,rvol,tp,sl,hold,
+                                     len(trades),round(wr,4),round(ar,4),round(pf,4),sc))
+                                all_results.append({"s":symbol,"f":fs,"rvol":rvol,"tp":tp,"sl":sl,
+                                                    "hold":hold,"n":len(trades),"wr":wr,"ar":ar,"sc":sc})
+            conn.commit()
+            log(f"  {symbol} done")
+        cur.execute("DELETE FROM leaderboard")
+        all_results.sort(key=lambda x: x["sc"], reverse=True)
+        for i,r in enumerate(all_results[:20],1):
+            cur.execute("INSERT INTO leaderboard VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (i,r["s"],r["f"],r["rvol"],r["tp"],r["sl"],r["hold"],r["n"],
+                 round(r["wr"],4),round(r["ar"],4),r["sc"],datetime.now().isoformat()))
         conn.commit()
-        log(f"  {symbol} done")
-    cur.execute("DELETE FROM leaderboard")
-    all_results.sort(key=lambda x: x["sc"], reverse=True)
-    for i,r in enumerate(all_results[:20],1):
-        cur.execute("INSERT INTO leaderboard VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (i,r["s"],r["f"],r["rvol"],r["tp"],r["sl"],r["hold"],r["n"],
-             round(r["wr"],4),round(r["ar"],4),r["sc"],datetime.now().isoformat()))
-    conn.commit(); conn.close()
+    finally:
+        conn.close()
     log(f"Done. {len(all_results)} strategies found.")
     if all_results:
         b = all_results[0]

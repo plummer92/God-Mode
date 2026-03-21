@@ -48,6 +48,7 @@ def get_client():
     return TradingClient(PAPER_KEY, PAPER_SECRET, paper=True, url_override=PAPER_URL)
 
 def get_new_signals(last_check):
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH)
         cur  = conn.cursor()
@@ -57,11 +58,12 @@ def get_new_signals(last_check):
             AND (signal_type LIKE '%STRONG SELL%' OR signal_type LIKE '%ABSORPTION SELL%')
             ORDER BY timestamp ASC
         """, (last_check,))
-        rows = cur.fetchall()
-        conn.close()
-        return rows
+        return cur.fetchall()
     except:
         return []
+    finally:
+        if conn:
+            conn.close()
 
 def get_regime():
     try:

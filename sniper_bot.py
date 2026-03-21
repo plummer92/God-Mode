@@ -52,20 +52,26 @@ def utc_now_str() -> str:
 TRADE_LOG_DB = "/home/theplummer92/trade_log.db"
 
 def init_trade_log():
-    conn = sqlite3.connect(TRADE_LOG_DB)
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT, side TEXT, direction TEXT,
-        entry_price REAL, exit_price REAL,
-        entry_time TEXT, exit_time TEXT,
-        pnl_pct REAL, pnl_usd REAL,
-        signal_type TEXT, notional REAL,
-        outcome TEXT, vix REAL, regime TEXT
-    )""")
-    conn.commit(); conn.close()
+    conn = None
+    try:
+        conn = sqlite3.connect(TRADE_LOG_DB)
+        cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT, side TEXT, direction TEXT,
+            entry_price REAL, exit_price REAL,
+            entry_time TEXT, exit_time TEXT,
+            pnl_pct REAL, pnl_usd REAL,
+            signal_type TEXT, notional REAL,
+            outcome TEXT, vix REAL, regime TEXT
+        )""")
+        conn.commit()
+    finally:
+        if conn:
+            conn.close()
 
 def log_trade_open(symbol, direction, entry_price, signal_type):
+    conn = None
     try:
         regime_data = get_regime()
         conn = sqlite3.connect(TRADE_LOG_DB)
@@ -76,11 +82,15 @@ def log_trade_open(symbol, direction, entry_price, signal_type):
             (symbol, "buy" if direction=="LONG" else "sell", direction,
              entry_price, utc_now_str(), signal_type, TRADE_NOTIONAL_USD,
              "open", regime_data.get("vix",0), regime_data.get("regime","UNKNOWN")))
-        conn.commit(); conn.close()
+        conn.commit()
     except Exception as e:
         log_line(f"⚠️ Trade log open error: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 def log_trade_close(symbol, exit_price, pnl_pct, outcome):
+    conn = None
     try:
         pnl_usd = TRADE_NOTIONAL_USD * pnl_pct
         conn = sqlite3.connect(TRADE_LOG_DB)
@@ -90,9 +100,12 @@ def log_trade_close(symbol, exit_price, pnl_pct, outcome):
             WHERE symbol=? AND outcome='open'
             ORDER BY id DESC LIMIT 1""",
             (exit_price, utc_now_str(), pnl_pct, pnl_usd, outcome, symbol))
-        conn.commit(); conn.close()
+        conn.commit()
     except Exception as e:
         log_line(f"⚠️ Trade log close error: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 # -------------------- REGIME FILTER --------------------
@@ -182,6 +195,7 @@ def write_sniper_status(
     realized_pnl: float | None = None,
     note: str | None = None,
 ):
+    con = None
     try:
         ts = utc_now_str()
         con = sqlite3.connect(STATUS_DB)
@@ -209,9 +223,11 @@ def write_sniper_status(
             unrealized_pnl, realized_pnl, note
         ))
         con.commit()
-        con.close()
     except Exception as e:
         log_line(f"❌ STATUS WRITE FAIL: {e}")
+    finally:
+        if con:
+            con.close()
 
 
 # -------------------- CLIENT --------------------
@@ -221,6 +237,7 @@ def get_client():
 
 # -------------------- DB INIT --------------------
 def init_db():
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -231,9 +248,11 @@ def init_db():
             )
         ''')
         conn.commit()
-        conn.close()
     except Exception:
         pass
+    finally:
+        if conn:
+            conn.close()
 
 
 # -------------------- APPROVED SYMBOLS --------------------
@@ -323,6 +342,7 @@ def manage_positions(trading_client):
 
 # -------------------- SIGNALS --------------------
 def get_new_signals(last_check_ts: str):
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -334,11 +354,12 @@ def get_new_signals(last_check_ts: str):
             ORDER BY timestamp ASC
         """
         cursor.execute(query, (last_check_ts,))
-        data = cursor.fetchall()
-        conn.close()
-        return data
+        return cursor.fetchall()
     except Exception:
         return []
+    finally:
+        if conn:
+            conn.close()
 
 
 # -------------------- TRADE EXECUTION --------------------
