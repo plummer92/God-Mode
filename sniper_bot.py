@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 import sqlite3
@@ -443,7 +444,7 @@ def run():
                 pid = int(f.read().strip())
             os.kill(pid, 0)
             log_line(f"⛔ CRITICAL: Sniper already running (PID {pid}). Aborting.")
-            return
+            sys.exit(0)
         except Exception:
             log_line("⚠️ Stale lockfile found. Taking over.")
 

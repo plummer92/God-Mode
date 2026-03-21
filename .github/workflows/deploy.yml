@@ -17,6 +17,8 @@ jobs:
           script: |
             cd /home/theplummer92
             git pull origin main
+            sudo cp systemd/*.service /etc/systemd/system/
+            sudo systemctl daemon-reload
             sudo systemctl restart sniper.service
             sudo systemctl restart paper-sniper.service
             sudo systemctl restart strategy-lab.service
