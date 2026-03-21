@@ -14,7 +14,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 TRADE_NOTIONAL_USD = 10       # Trade size per signal
 HARD_STOP_LOSS_PCT = 0.02     # -2.0% hard stop loss
 TAKE_PROFIT_PCT = 0.04        # +4.0% take profit
-DAILY_LOSS_LIMIT_USD = 5.00   # Stop trading if down $5 in one day
+DAILY_LOSS_LIMIT_USD = 3.00   # Stop trading if down $3 in one day
 MAX_OPEN_POSITIONS = 5        # Never hold more than 5 positions at once
 
 # Paths
