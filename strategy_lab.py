@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """strategy_lab.py — runs every 6 hours testing strategy combinations"""
-import sqlite3, time
+import sqlite3, time, os, sys
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import pytz
 
-DB_PATH = "/home/theplummer92/wolfe_signals.db"
-LAB_DB  = "/home/theplummer92/strategy_lab.db"
-LOG     = "/home/theplummer92/strategy_lab.log"
+DB_PATH  = "/home/theplummer92/wolfe_signals.db"
+LAB_DB   = "/home/theplummer92/strategy_lab.db"
+LOG      = "/home/theplummer92/strategy_lab.log"
+LOCKFILE = "/tmp/strategy_lab.lock"
 CST     = pytz.timezone("America/Chicago")
 LOOKBACK = 30
 MIN_TRADES = 10
@@ -153,7 +154,29 @@ def run():
         log(f"BEST: {b['s']} WR={b['wr']:.0%} TP={b['tp']:.0%} SL={b['sl']:.0%} Hold={b['hold']}h Score={b['sc']}")
 
 def main():
+    if os.path.exists(LOCKFILE):
+        try:
+            with open(LOCKFILE) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            log(f"⛔ Already running (PID {pid}). Exiting.")
+            sys.exit(0)
+        except (ProcessLookupError, ValueError, OSError):
+            log("⚠️ Stale lockfile found. Taking over.")
+    with open(LOCKFILE, "w") as f:
+        f.write(str(os.getpid()))
+
     log("Strategy Lab starting...")
+    try:
+        _main_loop()
+    finally:
+        try:
+            os.remove(LOCKFILE)
+        except Exception:
+            pass
+
+
+def _main_loop():
     while True:
         try:
             run()

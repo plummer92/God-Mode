@@ -3,7 +3,7 @@
 paper_sniper.py - Paper trading bot for SHORT signals only
 Uses Alpaca paper account to test short strategies before sizing up on live account.
 """
-import os, sqlite3, time, json
+import os, sys, sqlite3, time, json
 from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
@@ -31,6 +31,7 @@ SHORT_APPROVED = ["IWM","SPY","QQQ","NVDA","TSLA","META","AMZN","GME","AMD","COI
 
 DB_PATH  = "/home/theplummer92/wolfe_signals.db"
 LOG_FILE = "/home/theplummer92/paper_sniper.log"
+LOCKFILE = "/tmp/paper_sniper.lock"
 CST      = pytz.timezone("America/Chicago")
 
 _paper_daily_start_equity = 0.0
@@ -134,6 +135,28 @@ def check_daily_loss_limit(equity):
 
 
 def run():
+    if os.path.exists(LOCKFILE):
+        try:
+            with open(LOCKFILE) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            log(f"⛔ Already running (PID {pid}). Exiting.")
+            sys.exit(0)
+        except (ProcessLookupError, ValueError, OSError):
+            log("⚠️ Stale lockfile found. Taking over.")
+    with open(LOCKFILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    try:
+        _run()
+    finally:
+        try:
+            os.remove(LOCKFILE)
+        except Exception:
+            pass
+
+
+def _run():
     log("PAPER SNIPER starting - SHORT only, paper account")
     log(f"Trade size: ${TRADE_NOTIONAL} | TP: {TAKE_PROFIT_PCT:.0%} | SL: {STOP_LOSS_PCT:.0%}")
     log(f"Short approved: {', '.join(SHORT_APPROVED)}")

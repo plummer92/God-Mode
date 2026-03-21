@@ -22,6 +22,7 @@ Notes:
 """
 
 import os
+import sys
 import time
 import json
 import sqlite3
@@ -322,12 +323,17 @@ def write_regime_snapshot(vix: Optional[float], tnx: Optional[float], dxy: Optio
     except Exception as e:
         log(f"{Fore.RED}Regime snapshot write error: {e}")
 # ---------------- GRACEFUL SHUTDOWN ----------------
-RUNNING = True
+RUNNING  = True
+LOCKFILE = "/tmp/godmode.lock"
 
 def _handle_signal(sig, frame) -> None:
     global RUNNING
     RUNNING = False
     log(f"\n{Fore.YELLOW}🛑 Received signal {sig}. Shutting down cleanly...")
+    try:
+        os.remove(LOCKFILE)
+    except Exception:
+        pass
 
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
@@ -548,5 +554,22 @@ def run_god_mode_pro() -> None:
     log(f"{Fore.YELLOW}✅ GODMODE stopped.")
 
 if __name__ == "__main__":
-    run_god_mode_pro()
+    if os.path.exists(LOCKFILE):
+        try:
+            with open(LOCKFILE) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            log(f"⛔ GODMODE already running (PID {pid}). Exiting.")
+            sys.exit(0)
+        except (ProcessLookupError, ValueError, OSError):
+            log("⚠️ Stale lockfile found. Taking over.")
+    with open(LOCKFILE, "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        run_god_mode_pro()
+    finally:
+        try:
+            os.remove(LOCKFILE)
+        except Exception:
+            pass
 
