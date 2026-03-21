@@ -15,6 +15,7 @@ import sqlite3
 import argparse
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+import pandas as pd
 import yfinance as yf
 
 DB_PATH          = "/home/theplummer92/wolfe_signals.db"
@@ -64,6 +65,8 @@ def get_price_bars(symbol: str, start: datetime, days: int):
                 progress=False,
                 auto_adjust=True,
             )
+            if df is not None and isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
             _price_cache[yf_sym] = df
         except Exception:
             _price_cache[yf_sym] = None
