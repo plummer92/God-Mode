@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import sqlite3
+import requests
 from datetime import datetime, timezone, date, timedelta
 import pytz
 from dotenv import load_dotenv
@@ -32,6 +33,7 @@ cst_tz = pytz.timezone("America/Chicago")
 load_dotenv()
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 
 # -------------------- LOGGING --------------------
@@ -44,6 +46,15 @@ def log_line(msg: str):
     print(full, flush=True)
     with open(SNIPER_LOG, "a", encoding="utf-8") as f:
         f.write(full + "\n")
+
+
+def post_discord(msg: str):
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=5)
+    except Exception as e:
+        log_line(f"Discord alert failed: {e}")
 
 
 def utc_now_str() -> str:
@@ -83,6 +94,10 @@ def log_trade_open(symbol, direction, entry_price, signal_type):
              entry_price, utc_now_str(), signal_type, TRADE_NOTIONAL_USD,
              "open", regime_data.get("vix",0), regime_data.get("regime","UNKNOWN")))
         conn.commit()
+        post_discord(
+            f"**TRADE OPEN** | {direction} {symbol} @ ${entry_price:.2f}"
+            f" | {signal_type} | ${TRADE_NOTIONAL_USD} notional"
+        )
     except Exception as e:
         log_line(f"⚠️ Trade log open error: {e}")
     finally:
@@ -101,6 +116,13 @@ def log_trade_close(symbol, exit_price, pnl_pct, outcome):
             ORDER BY id DESC LIMIT 1""",
             (exit_price, utc_now_str(), pnl_pct, pnl_usd, outcome, symbol))
         conn.commit()
+        pnl_usd = TRADE_NOTIONAL_USD * pnl_pct
+        sign = "+" if pnl_usd >= 0 else ""
+        post_discord(
+            f"**TRADE CLOSE** | {symbol} {outcome.upper().replace('_', ' ')}"
+            f" | {sign}${pnl_usd:.2f} ({sign}{pnl_pct*100:.2f}%)"
+            f" | exit ${exit_price:.2f}"
+        )
     except Exception as e:
         log_line(f"⚠️ Trade log close error: {e}")
     finally:
