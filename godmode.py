@@ -298,24 +298,15 @@ def get_symbol_frame(data, symbol: str):
 # ---------------- REGIME SNAPSHOT ----------------
 def derive_regime(vix: Optional[float], tnx: Optional[float], dxy: Optional[float]) -> str:
     """
-    Simple, explainable regime classifier.
-    You can evolve this later into a learned model.
+    Mirrors sniper_bot's VIX-based regime logic exactly.
+    OPEN / SELL_ONLY / BLOCKED — no other states.
     """
-    # Defaults if missing
     v = vix if vix is not None else 0.0
-    t = tnx if tnx is not None else 0.0
-    d = dxy if dxy is not None else 0.0
-
-    # crude thresholds (tunable)
+    if v >= 30:
+        return "BLOCKED"
     if v >= 25:
-        return "RISK_OFF_VOLATILITY"
-    if d >= 105 and v >= 18:
-        return "RISK_OFF_STRONG_DOLLAR"
-    if v <= 16 and d <= 103:
-        return "RISK_ON"
-    if t >= 5.0 and v >= 18:
-        return "RISK_OFF_RATES"
-    return "NEUTRAL"
+        return "SELL_ONLY"
+    return "OPEN"
 
 def write_regime_snapshot(vix: Optional[float], tnx: Optional[float], dxy: Optional[float], regime: str) -> None:
     payload = {
