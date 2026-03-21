@@ -360,10 +360,27 @@ def run_god_mode_pro() -> None:
 
     # absorption state: symbol -> state dict
     absorption: Dict[str, Dict] = {}
+    _last_prune_date = ""
 
     while RUNNING:
         try:
             ts = now_str()
+
+            # Daily prune: delete signals older than 30 days (runs once per calendar day)
+            today_date = datetime.now().strftime("%Y-%m-%d")
+            if today_date != _last_prune_date:
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    deleted = conn.execute(
+                        "DELETE FROM signals WHERE timestamp < datetime('now', '-30 days')"
+                    ).rowcount
+                    conn.commit()
+                    conn.close()
+                    if deleted:
+                        log(f"{Fore.CYAN}🗑️  Pruned {deleted} signals older than 30 days")
+                except Exception as pe:
+                    log(f"{Fore.RED}Prune error: {pe}")
+                _last_prune_date = today_date
 
             # download batch w/ small retry
             batch = None

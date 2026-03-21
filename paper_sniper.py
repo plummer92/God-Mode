@@ -3,7 +3,7 @@
 paper_sniper.py - Paper trading bot for SHORT signals only
 Uses Alpaca paper account to test short strategies before sizing up on live account.
 """
-import os, sys, sqlite3, time, json
+import os, sys, sqlite3, time, json, requests
 from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
@@ -12,6 +12,16 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 load_dotenv("/home/theplummer92/.env")
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+
+def post_discord(msg: str):
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=5)
+    except Exception as e:
+        log(f"Discord alert failed: {e}")
 
 # Paper account config
 PAPER_KEY    = os.getenv("APCA_PAPER_KEY_ID")
@@ -91,6 +101,8 @@ def manage_positions(client):
                 try:
                     client.close_position(symbol)
                     log(f"CLOSED {symbol} FOR PROFIT")
+                    pnl_usd = TRADE_NOTIONAL * pnl_pct
+                    post_discord(f"📄 **PAPER CLOSE** | {symbol} TAKE PROFIT | +${pnl_usd:.2f} (+{pnl_pct:.2%})")
                 except Exception as e:
                     log(f"CLOSE FAIL {symbol}: {e}")
             elif pnl_pct <= -STOP_LOSS_PCT:
@@ -98,6 +110,8 @@ def manage_positions(client):
                 try:
                     client.close_position(symbol)
                     log(f"STOP LOSS EXECUTED {symbol}")
+                    pnl_usd = TRADE_NOTIONAL * pnl_pct
+                    post_discord(f"📄 **PAPER CLOSE** | {symbol} STOP LOSS | -${abs(pnl_usd):.2f} ({pnl_pct:.2%})")
                 except Exception as e:
                     log(f"STOP LOSS FAIL {symbol}: {e}")
             elif pnl_pct < -0.01:
@@ -126,6 +140,7 @@ def execute_short(client, symbol, price, signal):
             time_in_force=TimeInForce.DAY
         ))
         log(f"SHORT ENTERED: {symbol} ${TRADE_NOTIONAL} | {signal}")
+        post_discord(f"📄 **PAPER SHORT ENTERED** | {symbol} @ ~${price:.2f} | {signal} | ${TRADE_NOTIONAL} notional")
     except Exception as e:
         log(f"SHORT FAIL {symbol}: {e}")
 
@@ -169,6 +184,7 @@ def _run():
     log("PAPER SNIPER starting - SHORT only, paper account")
     log(f"Trade size: ${TRADE_NOTIONAL} | TP: {TAKE_PROFIT_PCT:.0%} | SL: {STOP_LOSS_PCT:.0%}")
     log(f"Short approved: {', '.join(load_short_approved())}")
+    post_discord(f"📄 **PAPER SNIPER ONLINE** | TP {TAKE_PROFIT_PCT:.0%} SL {STOP_LOSS_PCT:.0%} | ${TRADE_NOTIONAL}/trade")
 
     client     = get_client()
     last_check = (datetime.utcnow() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")

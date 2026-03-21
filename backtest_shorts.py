@@ -208,24 +208,77 @@ def run(days: int):
         wr     = len(wins) / len(pnls) * 100 if pnls else 0
         avg_w  = sum(wins)   / len(wins)   if wins   else 0
         avg_l  = sum(losses) / len(losses) if losses else 0
+        pf     = (sum(wins) / abs(sum(losses))) if losses else 99.0
+
+        # Max drawdown (peak-to-trough on cumulative P&L)
+        cum, peak, max_dd = 0.0, 0.0, 0.0
+        for p in pnls:
+            cum += p
+            if cum > peak:
+                peak = cum
+            dd = peak - cum
+            if dd > max_dd:
+                max_dd = dd
+
+        # Consecutive wins/losses
+        best_streak = worst_streak = cur_streak = 0
+        for p in pnls:
+            if p > 0:
+                cur_streak = max(cur_streak + 1, 1)
+            else:
+                cur_streak = min(cur_streak - 1, -1)
+            best_streak  = max(best_streak,  cur_streak)
+            worst_streak = min(worst_streak, cur_streak)
+
+        best_trade  = max(trades, key=lambda t: t["pnl_usd"])
+        worst_trade = min(trades, key=lambda t: t["pnl_usd"])
+
         print(f"\n  {label}")
-        print(f"  {'─'*50}")
-        print(f"  Trades    : {len(trades)}  ({len(wins)}W / {len(losses)}L)")
-        print(f"  Win Rate  : {wr:.1f}%")
-        print(f"  Total P&L : ${total:+.2f}")
-        print(f"  Avg Win   : ${avg_w:+.2f}    Avg Loss: ${avg_l:+.2f}")
+        print(f"  {'─'*55}")
+        print(f"  Trades      : {len(trades)}  ({len(wins)}W / {len(losses)}L)")
+        print(f"  Win Rate    : {wr:.1f}%")
+        print(f"  Total P&L   : ${total:+.2f}")
+        print(f"  Avg Win     : ${avg_w:+.2f}    Avg Loss : ${avg_l:+.2f}")
         if wins and losses and avg_l != 0:
-            print(f"  R/R Ratio : {abs(avg_w/avg_l):.2f}x")
+            print(f"  R/R Ratio   : {abs(avg_w/avg_l):.2f}x     Profit Factor: {pf:.2f}x")
+        print(f"  Max Drawdown: ${max_dd:.2f}")
+        print(f"  Best Streak : {best_streak}W    Worst Streak: {abs(worst_streak)}L")
+        print(f"  Best Trade  : {best_trade['symbol']} ${best_trade['pnl_usd']:+.2f} ({best_trade['ts'][:10]})")
+        print(f"  Worst Trade : {worst_trade['symbol']} ${worst_trade['pnl_usd']:+.2f} ({worst_trade['ts'][:10]})")
+
+        # Outcome breakdown
+        outcomes = {}
+        for t in trades:
+            outcomes[t["outcome"]] = outcomes.get(t["outcome"], 0) + 1
+        print(f"  Outcomes    : " + "  ".join(f"{k}={v}" for k, v in sorted(outcomes.items())))
+
+        # Long vs short split
         longs  = [t for t in trades if t["direction"] == "LONG"]
         shorts = [t for t in trades if t["direction"] == "SHORT"]
         if longs:
             l_pnl = sum(t["pnl_usd"] for t in longs)
             l_wr  = sum(1 for t in longs if t["pnl_usd"] > 0) / len(longs) * 100
-            print(f"  Longs     : {len(longs)} trades | WR {l_wr:.0f}% | P&L ${l_pnl:+.2f}")
+            print(f"  Longs       : {len(longs)} trades | WR {l_wr:.0f}% | P&L ${l_pnl:+.2f}")
         if shorts:
             s_pnl = sum(t["pnl_usd"] for t in shorts)
             s_wr  = sum(1 for t in shorts if t["pnl_usd"] > 0) / len(shorts) * 100
-            print(f"  Shorts    : {len(shorts)} trades | WR {s_wr:.0f}% | P&L ${s_pnl:+.2f}")
+            print(f"  Shorts      : {len(shorts)} trades | WR {s_wr:.0f}% | P&L ${s_pnl:+.2f}")
+
+        # Per-symbol breakdown
+        syms = {}
+        for t in trades:
+            s = t["symbol"]
+            if s not in syms:
+                syms[s] = []
+            syms[s].append(t["pnl_usd"])
+        print(f"\n  Per-symbol breakdown:")
+        print(f"  {'Symbol':<7} {'Trades':>6} {'WR':>6} {'P&L':>8}  {'Avg':>7}")
+        print(f"  {'─'*40}")
+        for sym, sym_pnls in sorted(syms.items(), key=lambda x: -sum(x[1])):
+            sym_wr  = sum(1 for p in sym_pnls if p > 0) / len(sym_pnls) * 100
+            sym_tot = sum(sym_pnls)
+            sym_avg = sym_tot / len(sym_pnls)
+            print(f"  {sym:<7} {len(sym_pnls):>6} {sym_wr:>5.0f}% {sym_tot:>+8.2f}  {sym_avg:>+7.2f}")
 
     print("\n" + "=" * 60)
     print(f"  BACKTEST — LAST {days} DAYS  (${NOTIONAL_USD}/trade, 1 trade/day/symbol)")

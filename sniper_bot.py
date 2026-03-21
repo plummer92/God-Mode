@@ -39,6 +39,10 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 # -------------------- LOGGING --------------------
 _daily_start_balance = 0.0
 _daily_start_date = None
+_daily_loss_alerted = False
+_last_regime_mode = None
+_no_reentry_today: set = set()
+_no_reentry_date: str = ""
 
 def log_line(msg: str):
     ts = datetime.now(cst_tz).strftime("%Y-%m-%d %H:%M:%S")
@@ -175,7 +179,7 @@ def check_daily_loss_limit(trading_client) -> bool:
     Returns True if safe to trade (haven't hit daily loss limit).
     Returns False if daily loss >= DAILY_LOSS_LIMIT_USD.
     """
-    global _daily_start_balance, _daily_start_date
+    global _daily_start_balance, _daily_start_date, _daily_loss_alerted
 
     today = str(date.today())
 
@@ -187,6 +191,7 @@ def check_daily_loss_limit(trading_client) -> bool:
         if _daily_start_date != today:
             _daily_start_balance = equity
             _daily_start_date = today
+            _daily_loss_alerted = False
             log_line(f"📅 New trading day — starting equity: ${equity:.2f}")
 
         daily_pnl = equity - _daily_start_balance
@@ -195,6 +200,12 @@ def check_daily_loss_limit(trading_client) -> bool:
                 f"🚨 DAILY LOSS LIMIT HIT: down ${abs(daily_pnl):.2f} today "
                 f"(limit: ${DAILY_LOSS_LIMIT_USD}) — no more trades today"
             )
+            if not _daily_loss_alerted:
+                post_discord(
+                    f"🚨 **DAILY LOSS LIMIT HIT** | down ${abs(daily_pnl):.2f} today"
+                    f" (limit: ${DAILY_LOSS_LIMIT_USD}) — standing down until tomorrow"
+                )
+                _daily_loss_alerted = True
             return False
 
     except Exception as e:
@@ -354,6 +365,8 @@ def manage_positions(trading_client):
                     trading_client.close_position(symbol)
                     log_line(f"✅ STOP LOSS EXECUTED {symbol} {side}")
                     log_trade_close(symbol, float(p.unrealized_plpc) * float(p.avg_entry_price) + float(p.avg_entry_price), pnl_pct, "stop_loss")
+                    _no_reentry_today.add(symbol)
+                    log_line(f"🚫 {symbol} blocked from re-entry for the rest of today")
                 except Exception as e:
                     log_line(f"❌ STOP LOSS FAIL {symbol}: {e}")
 
@@ -426,6 +439,16 @@ def execute_entry(client, symbol: str, signal: str, price: float):
         return
     if is_sell_signal and alpaca_symbol not in approved["sell"]:
         log_line(f"⛔ SKIP SHORT {alpaca_symbol}: Not in sell-approved list")
+        return
+
+    # 3b. No re-entry after stop loss same day
+    global _no_reentry_today, _no_reentry_date
+    today = str(date.today())
+    if _no_reentry_date != today:
+        _no_reentry_today = set()
+        _no_reentry_date = today
+    if alpaca_symbol in _no_reentry_today:
+        log_line(f"🚫 SKIP {alpaca_symbol}: stopped out earlier today, no re-entry until tomorrow")
         return
 
     # 4. Get current positions
@@ -510,6 +533,11 @@ def run():
     log_line(f"📈 LONG approved:  {', '.join(approved['buy'])}")
     log_line(f"📉 SHORT approved: {', '.join(approved['sell'])}")
     write_sniper_status(status="OK", heartbeat_seq=0, in_position=0, note="boot")
+    post_discord(
+        f"🦅 **SNIPER ONLINE** | {BOT_VERSION}"
+        f" | TP {TAKE_PROFIT_PCT:.0%} SL {HARD_STOP_LOSS_PCT:.0%}"
+        f" | max {MAX_OPEN_POSITIONS} pos | daily limit ${DAILY_LOSS_LIMIT_USD}"
+    )
 
     try:
         while True:
@@ -533,6 +561,14 @@ def run():
 
             # Regime gate — sell-only when VIX 25-30, fully blocked above 30
             regime_mode = get_regime_mode()
+            global _last_regime_mode
+            if _last_regime_mode is not None and regime_mode != _last_regime_mode:
+                regime_info = get_regime()
+                post_discord(
+                    f"⚠️ **REGIME CHANGE**: {_last_regime_mode} → {regime_mode}"
+                    f" | VIX={regime_info['vix']:.1f}"
+                )
+            _last_regime_mode = regime_mode
             if regime_mode == "BLOCKED":
                 time.sleep(POLL_SECONDS)
                 continue
