@@ -26,8 +26,15 @@ MAX_POSITIONS    = 5
 DAILY_LOSS_LIMIT = 25.0
 POLL_SECONDS     = 10
 
-# Best short symbols from strategy lab
-SHORT_APPROVED = ["IWM","SPY","QQQ","NVDA","TSLA","META","AMZN","GME","AMD","COIN"]
+APPROVED_PATH = "/home/theplummer92/approved_symbols.json"
+
+def load_short_approved():
+    try:
+        with open(APPROVED_PATH) as f:
+            data = json.load(f)
+        return [s.upper() for s in data.get("sell", data.get("short", []))]
+    except Exception:
+        return ["IWM","SPY","QQQ","NVDA","TSLA","META","AMZN","GME","AMD","COIN"]
 
 DB_PATH  = "/home/theplummer92/wolfe_signals.db"
 LOG_FILE = "/home/theplummer92/paper_sniper.log"
@@ -108,7 +115,7 @@ def execute_short(client, symbol, price, signal):
         if len(positions) >= MAX_POSITIONS:
             log(f"SKIP {symbol}: max positions reached")
             return
-        if symbol not in SHORT_APPROVED:
+        if symbol not in load_short_approved():
             log(f"SKIP {symbol}: not in short approved list")
             return
 
@@ -161,7 +168,7 @@ def run():
 def _run():
     log("PAPER SNIPER starting - SHORT only, paper account")
     log(f"Trade size: ${TRADE_NOTIONAL} | TP: {TAKE_PROFIT_PCT:.0%} | SL: {STOP_LOSS_PCT:.0%}")
-    log(f"Short approved: {', '.join(SHORT_APPROVED)}")
+    log(f"Short approved: {', '.join(load_short_approved())}")
 
     client     = get_client()
     last_check = (datetime.utcnow() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
