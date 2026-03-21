@@ -2,9 +2,9 @@
 """
 backtest_shorts.py — Simulate last week's signals with shorts alongside longs.
 
-Reads wolfe_signals.db, replays every STRONG BUY + STRONG SELL signal from the
-past 7 days, applies the same TP/SL rules as the live sniper, and prints a
-side-by-side comparison of longs-only vs longs+shorts.
+Reads wolfe_signals.db for signals, fetches real 5-min OHLCV from yfinance
+for exit simulation, and prints a side-by-side comparison of
+longs-only vs longs+shorts.
 
 Usage:
     python3 backtest_shorts.py            # last 7 days
@@ -14,18 +14,22 @@ Usage:
 import sqlite3
 import argparse
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+import yfinance as yf
 
 DB_PATH          = "/home/theplummer92/wolfe_signals.db"
 TAKE_PROFIT_PCT  = 0.04   # +4%
 STOP_LOSS_PCT    = 0.02   # -2%
 NOTIONAL_USD     = 10.0   # per trade
+MAX_HOLD_MINS    = 60     # max hold time in minutes (12 x 5m bars)
 
 # Same approved lists as sniper_bot.py defaults
-BUY_APPROVED  = {"NFLX","META","AAPL","AMZN","BTC/USD","ETH/USD","SOL/USD",
+BUY_APPROVED  = {"NFLX","META","AAPL","AMZN","BTC-USD","ETH-USD","SOL-USD",
                  "TSLA","AMD","COIN","GME","SPY","IWM","QQQ"}
 SELL_APPROVED = {"AMD","COIN","IWM","TSLA","NVDA","SPY","AMZN","QQQ","META","NFLX"}
 
-MAX_HOLD_BARS = 12   # max 5-min bars to hold before forced exit (~1 hour)
+# Cache yfinance data per symbol to avoid repeated downloads
+_price_cache = {}
 
 
 def fetch_signals(days: int):
@@ -47,50 +51,82 @@ def fetch_signals(days: int):
     return rows
 
 
-def fetch_price_after(symbol: str, after_ts: str, bars: int = MAX_HOLD_BARS):
-    """
-    Pull up to `bars` subsequent price rows for the symbol after the signal.
-    Returns list of (timestamp, price) tuples sorted ascending.
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT timestamp, price FROM signals
-        WHERE symbol = ?
-          AND timestamp > ?
-        ORDER BY timestamp ASC
-        LIMIT ?
-    """, (symbol, after_ts, bars))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def get_price_bars(symbol: str, start: datetime, days: int):
+    """Download 5m bars for symbol covering the backtest window. Cached."""
+    yf_sym = symbol.replace("/", "-")
+    if yf_sym not in _price_cache:
+        try:
+            df = yf.download(
+                yf_sym,
+                start=(start - timedelta(days=1)).strftime("%Y-%m-%d"),
+                period=f"{days + 2}d",
+                interval="5m",
+                progress=False,
+                auto_adjust=True,
+            )
+            _price_cache[yf_sym] = df
+        except Exception:
+            _price_cache[yf_sym] = None
+    return _price_cache[yf_sym]
 
 
-def simulate_trade(entry_price: float, direction: str, future_prices: list):
+def simulate_trade(symbol: str, entry_price: float, entry_ts: str,
+                   direction: str, bars_df):
     """
-    Walk future_prices and apply TP/SL.
+    Walk 5m bars after entry_ts and apply TP/SL.
     Returns (exit_price, pnl_pct, outcome).
     """
-    for _, p in future_prices:
-        p = float(p)
+    if bars_df is None or bars_df.empty:
+        return entry_price, 0.0, "no_data"
+
+    try:
+        entry_dt = datetime.strptime(entry_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        return entry_price, 0.0, "no_data"
+
+    deadline = entry_dt + timedelta(minutes=MAX_HOLD_MINS)
+
+    for idx in bars_df.index:
+        # Normalise index to UTC
+        try:
+            bar_ts = idx.to_pydatetime()
+            if bar_ts.tzinfo is None:
+                bar_ts = bar_ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+        if bar_ts <= entry_dt:
+            continue
+        if bar_ts > deadline:
+            break
+
+        try:
+            close = float(bars_df.loc[idx, "Close"])
+        except Exception:
+            continue
+
         if direction == "LONG":
-            chg = (p - entry_price) / entry_price
-        else:  # SHORT
-            chg = (entry_price - p) / entry_price
+            chg = (close - entry_price) / entry_price
+        else:
+            chg = (entry_price - close) / entry_price
 
         if chg >= TAKE_PROFIT_PCT:
-            return p, chg, "take_profit"
+            return close, chg, "take_profit"
         if chg <= -STOP_LOSS_PCT:
-            return p, chg, "stop_loss"
+            return close, chg, "stop_loss"
 
-    # No exit triggered — use last known price
-    if future_prices:
-        last_p = float(future_prices[-1][1])
-        if direction == "LONG":
-            chg = (last_p - entry_price) / entry_price
-        else:
-            chg = (entry_price - last_p) / entry_price
-        return last_p, chg, "expired"
+    # Time expired — use last bar price within window
+    window = bars_df[(bars_df.index > entry_dt) & (bars_df.index <= deadline)]
+    if not window.empty:
+        try:
+            last_p = float(window.iloc[-1]["Close"])
+            if direction == "LONG":
+                chg = (last_p - entry_price) / entry_price
+            else:
+                chg = (entry_price - last_p) / entry_price
+            return last_p, chg, "expired"
+        except Exception:
+            pass
 
     return entry_price, 0.0, "no_data"
 
@@ -101,29 +137,50 @@ def run(days: int):
         print(f"No signals found in the last {days} days in {DB_PATH}")
         return
 
-    # Deduplicate: one trade per hour per symbol per direction
+    start_dt = datetime.now(timezone.utc) - timedelta(days=days)
+
+    # Pre-download price data for all symbols we'll need
+    all_symbols = set()
+    for _, symbol, sig_type, _ in signals:
+        sym = symbol.upper()
+        is_buy  = "BUY"  in sig_type.upper()
+        is_sell = "SELL" in sig_type.upper()
+        if is_buy and sym in BUY_APPROVED:
+            all_symbols.add(sym)
+        elif is_sell and sym in SELL_APPROVED:
+            all_symbols.add(sym)
+
+    print(f"  Downloading price data for {len(all_symbols)} symbols...", flush=True)
+    for sym in sorted(all_symbols):
+        get_price_bars(sym, start_dt, days)
+        print(f"    {sym} OK", flush=True)
+
+    # Deduplicate: one trade per calendar date per symbol per direction
+    # (stricter than hourly — prevents re-entering the same trend all day)
     seen = set()
-    trades_long_only   = []
-    trades_long_short  = []
+    trades_long_only  = []
+    trades_long_short = []
 
     for ts, symbol, sig_type, price in signals:
-        sym = symbol.replace("-", "/").upper()
+        sym = symbol.upper()
         is_buy  = "BUY"  in sig_type.upper()
         is_sell = "SELL" in sig_type.upper()
         direction = "LONG" if is_buy else "SHORT"
 
-        hour_key = (ts[:13], sym, direction)
-        if hour_key in seen:
+        # Dedup: one per day per symbol per direction
+        day_key = (ts[:10], sym, direction)
+        if day_key in seen:
             continue
-        seen.add(hour_key)
 
         entry = float(price)
-        future = fetch_price_after(sym, ts)
-        if not future:
-            # Also try original Yahoo format
-            future = fetch_price_after(symbol, ts)
+        bars  = get_price_bars(sym, start_dt, days)
+        exit_p, pnl_pct, outcome = simulate_trade(sym, entry, ts, direction, bars)
 
-        exit_p, pnl_pct, outcome = simulate_trade(entry, direction, future)
+        # Skip no_data trades — they add noise without signal
+        if outcome == "no_data":
+            continue
+
+        seen.add(day_key)
         pnl_usd = NOTIONAL_USD * pnl_pct
 
         trade = {
@@ -132,11 +189,9 @@ def run(days: int):
             "pnl_pct": pnl_pct, "pnl_usd": pnl_usd, "outcome": outcome,
         }
 
-        # Longs-only scenario: only BUY signals on buy-approved
         if is_buy and sym in BUY_APPROVED:
             trades_long_only.append(trade)
 
-        # Longs+shorts scenario: BUY on buy-approved + SELL on sell-approved
         if is_buy and sym in BUY_APPROVED:
             trades_long_short.append(trade)
         elif is_sell and sym in SELL_APPROVED:
@@ -161,8 +216,6 @@ def run(days: int):
         print(f"  Avg Win   : ${avg_w:+.2f}    Avg Loss: ${avg_l:+.2f}")
         if wins and losses and avg_l != 0:
             print(f"  R/R Ratio : {abs(avg_w/avg_l):.2f}x")
-
-        # Breakdown by direction
         longs  = [t for t in trades if t["direction"] == "LONG"]
         shorts = [t for t in trades if t["direction"] == "SHORT"]
         if longs:
@@ -174,22 +227,21 @@ def run(days: int):
             s_wr  = sum(1 for t in shorts if t["pnl_usd"] > 0) / len(shorts) * 100
             print(f"  Shorts    : {len(shorts)} trades | WR {s_wr:.0f}% | P&L ${s_pnl:+.2f}")
 
-    print("=" * 60)
-    print(f"  BACKTEST — LAST {days} DAYS  (${NOTIONAL_USD}/trade)")
-    print(f"  TP: +{TAKE_PROFIT_PCT*100:.0f}%  |  SL: -{STOP_LOSS_PCT*100:.0f}%  |  Max hold: {MAX_HOLD_BARS} bars")
+    print("\n" + "=" * 60)
+    print(f"  BACKTEST — LAST {days} DAYS  (${NOTIONAL_USD}/trade, 1 trade/day/symbol)")
+    print(f"  TP: +{TAKE_PROFIT_PCT*100:.0f}%  |  SL: -{STOP_LOSS_PCT*100:.0f}%  |  Max hold: {MAX_HOLD_MINS}min")
     print("=" * 60)
 
     summarise(trades_long_only,  "SCENARIO A — Longs only")
     summarise(trades_long_short, "SCENARIO B — Longs + Shorts")
 
-    # Extra detail: all short trades in scenario B
     shorts_only = [t for t in trades_long_short if t["direction"] == "SHORT"]
     if shorts_only:
         print(f"\n  Short trade detail:")
-        print(f"  {'Symbol':<8} {'Entry':>8} {'Exit':>8} {'P&L':>8} {'Outcome':<12} {'Signal'}")
-        print(f"  {'─'*70}")
-        for t in shorts_only:
-            print(f"  {t['symbol']:<8} ${t['entry']:>7.2f} ${t['exit']:>7.2f} "
+        print(f"  {'Date':<11} {'Symbol':<6} {'Entry':>8} {'Exit':>8} {'P&L':>8} {'Outcome':<12} {'Signal'}")
+        print(f"  {'─'*75}")
+        for t in sorted(shorts_only, key=lambda x: x["ts"]):
+            print(f"  {t['ts'][:10]}  {t['symbol']:<6} ${t['entry']:>7.2f} ${t['exit']:>7.2f} "
                   f"${t['pnl_usd']:>+7.2f}  {t['outcome']:<12} {t['signal']}")
 
     print("=" * 60)
