@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-paper_sniper.py - Paper trading bot for SHORT signals
-Uses Alpaca paper account to simulate IBKR short trades
-Tracks performance so we have real data when we switch to live IBKR
+paper_sniper.py - Paper trading bot for SHORT signals only
+Uses Alpaca paper account to test short strategies before sizing up on live account.
 """
 import os, sqlite3, time, json
 from datetime import datetime, timedelta

@@ -5,23 +5,9 @@ import sqlite3
 from datetime import datetime, timezone, date, timedelta
 import pytz
 from dotenv import load_dotenv
-# BROKER SWITCHER
-import os as _os
-_BROKER = _os.getenv("BROKER", "alpaca").lower()
-if _BROKER == "ibkr":
-    from ibkr_client import IBKROrderRequest
-    class OrderSide:
-        BUY = "BUY"
-        SELL = "SELL"
-    class TimeInForce:
-        DAY = "DAY"
-        GTC = "GTC"
-    def MarketOrderRequest(symbol, notional, side, time_in_force):
-        return IBKROrderRequest(symbol=symbol, notional=notional, side=side, time_in_force=time_in_force)
-else:
-    from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 # -------------------- CONFIG --------------------
 TRADE_NOTIONAL_USD = 10       # Trade size per signal
@@ -229,12 +215,6 @@ def write_sniper_status(
 
 # -------------------- CLIENT --------------------
 def get_client():
-    if _BROKER == "ibkr":
-        from ibkr_client import IBKRClient
-        client = IBKRClient()
-        if not client.is_authenticated():
-            raise RuntimeError("IBKR gateway not authenticated")
-        return client
     return TradingClient(API_KEY, SECRET_KEY, paper=False)
 
 
