@@ -22,7 +22,7 @@ DB_PATH          = "/home/theplummer92/wolfe_signals.db"
 TAKE_PROFIT_PCT  = 0.04   # +4%
 STOP_LOSS_PCT    = 0.02   # -2%
 NOTIONAL_USD     = 10.0   # per trade
-MAX_HOLD_MINS    = 60     # max hold time in minutes (12 x 5m bars)
+MAX_HOLD_MINS    = 240    # max hold time in minutes (4 hours, matches strategy_lab)
 
 # Same approved lists as sniper_bot.py defaults
 BUY_APPROVED  = {"NFLX","META","AAPL","AMZN","BTC-USD","ETH-USD","SOL-USD",
@@ -67,6 +67,8 @@ def get_price_bars(symbol: str, start: datetime, days: int):
             )
             if df is not None and isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
+            if df is not None and not df.empty:
+                df = df[~df.index.duplicated(keep='first')]
             _price_cache[yf_sym] = df
         except Exception:
             _price_cache[yf_sym] = None
