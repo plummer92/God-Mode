@@ -72,7 +72,7 @@ def get_new_signals(last_check):
         cur.execute("""
             SELECT timestamp, symbol, signal_type, price FROM signals
             WHERE timestamp > ?
-            AND (signal_type LIKE '%STRONG SELL%' OR signal_type LIKE '%ABSORPTION SELL%')
+            AND (signal_type LIKE '%STRONG SELL%' OR signal_type LIKE '%ABSORPTION SELL%' OR (signal_type LIKE '%CLIMAX%' AND rvol >= 5.0))
             ORDER BY timestamp ASC
         """, (last_check,))
         return cur.fetchall()
