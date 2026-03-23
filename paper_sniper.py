@@ -133,9 +133,10 @@ def execute_short(client, symbol, price, signal):
             log(f"SKIP {symbol}: not in short approved list")
             return
 
+        qty = max(1, int(TRADE_NOTIONAL / price))
         client.submit_order(MarketOrderRequest(
             symbol=symbol,
-            notional=TRADE_NOTIONAL,
+            qty=qty,
             side=OrderSide.SELL,
             time_in_force=TimeInForce.DAY
         ))
