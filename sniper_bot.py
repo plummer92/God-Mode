@@ -12,7 +12,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # -------------------- CONFIG --------------------
-TRADE_NOTIONAL_USD = 10       # Trade size per signal
+TRADE_NOTIONAL_USD = 25       # Trade size per signal
 HARD_STOP_LOSS_PCT = 0.02     # -2.0% hard stop loss
 TAKE_PROFIT_PCT = 0.04        # +4.0% take profit
 DAILY_LOSS_LIMIT_USD = 3.00   # Stop trading if down $3 in one day
@@ -486,12 +486,21 @@ def execute_entry(client, symbol: str, signal: str, price: float):
 
     try:
         log_line(f"🚀 SNIPING {alpaca_symbol} {direction} @ ~${float(price):.2f} | {signal}")
-        client.submit_order(MarketOrderRequest(
-            symbol=alpaca_symbol,
-            notional=TRADE_NOTIONAL_USD,
-            side=side,
-            time_in_force=tif,
-        ))
+        if side == OrderSide.SELL:
+            qty = max(1, int(TRADE_NOTIONAL_USD / float(price)))
+            client.submit_order(MarketOrderRequest(
+                symbol=alpaca_symbol,
+                qty=qty,
+                side=side,
+                time_in_force=tif,
+            ))
+        else:
+            client.submit_order(MarketOrderRequest(
+                symbol=alpaca_symbol,
+                notional=TRADE_NOTIONAL_USD,
+                side=side,
+                time_in_force=tif,
+            ))
         log_line(f"✅ ORDER SENT: {alpaca_symbol} ${TRADE_NOTIONAL_USD} {direction}")
         log_trade_open(alpaca_symbol, direction, price, signal)
     except Exception as e:
