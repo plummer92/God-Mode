@@ -7,7 +7,7 @@ Type=simple
 User=theplummer92
 WorkingDirectory=/home/theplummer92
 ExecStart=/home/theplummer92/venv/bin/python3 /home/theplummer92/strategy_lab.py
-Restart=on-failure
+Restart=always
 RestartSec=10
 
 [Install]
