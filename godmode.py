@@ -77,6 +77,20 @@ ASSETS: Dict[str, List[str]] = {
     "COMMODITIES": ["CL=F", "NG=F", "GC=F", "SI=F", "HG=F", "ZC=F", "ZW=F"],
     "MACRO": ["^TNX", "DX-Y.NYB", "^VIX"],  # used both as "assets" and for regime features
 }
+
+# Merge hunter-discovered symbols (symbol_hunt_top20.json) into a HUNTER bucket,
+# skipping any already covered by the static lists above.
+_HUNT_PATH = os.path.join(BASE_DIR, "symbol_hunt_top20.json")
+try:
+    with open(_HUNT_PATH) as _f:
+        _hunt = json.load(_f)
+    _existing = {t for group in ASSETS.values() for t in group}
+    _new = [s for s in _hunt.get("top_sell", []) if s not in _existing]
+    if _new:
+        ASSETS["HUNTER"] = _new
+except FileNotFoundError:
+    pass  # hunter hasn't run yet; no-op
+
 ALL_TICKERS: List[str] = [t for group in ASSETS.values() for t in group]
 # ---------------- CSV HEADERS ----------------
 MARKET_HEADER = ["Timestamp", "Sector", "Ticker", "Price", "Change_Pct", "RVOL", "Money_Flow_M", "Signal"]
