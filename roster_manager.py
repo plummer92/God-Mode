@@ -19,7 +19,82 @@ CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
 # Demotion thresholds
 DEMOTION_NO_WIN_DAYS    = 14   # closed trades in this window but 0 wins → demote
 DEMOTION_MIN_WIN_RATE   = 0.60 # rolling avg over last N strategy_lab results
-DEMOTION_RESULTS_WINDOW = 20   # how many recent results to average
+DEMOTION_RESULTS_WINDOW = 20
+
+# Freshness decay score
+FRESHNESS_INITIAL     = 100.0  # score assigned to newly rostered symbols
+FRESHNESS_DECAY_RATE  = 0.95   # multiplied per day (half-life ~13.5 days)
+FRESHNESS_WIN_BOOST   = 8.0    # added per winning trade
+FRESHNESS_LOSS_HIT    = 3.0    # subtracted per losing trade
+FRESHNESS_MIN_ACTIVE  = 40.0   # below this → demote to cooling_off
+FRESHNESS_PROMOTE_THR = 80.0   # above this → eligible for 1.5x trade size multiplier   # how many recent results to average
+
+
+def compute_freshness_scores(symbols, current_data):
+    """
+    Returns {symbol: score} where score reflects recent performance health.
+
+    Decay: each day without activity multiplies the score by FRESHNESS_DECAY_RATE.
+    Boost: each winning closed trade adds FRESHNESS_WIN_BOOST.
+    Hit:   each losing closed trade subtracts FRESHNESS_LOSS_HIT.
+    New symbols start at FRESHNESS_INITIAL.
+    Score is clamped to [0, 100].
+
+    Also returns a size_multiplier dict:
+      score >= FRESHNESS_PROMOTE_THR → 1.5x trade size
+      score >= FRESHNESS_MIN_ACTIVE  → 1.0x
+      score <  FRESHNESS_MIN_ACTIVE  → symbol should be demoted
+    """
+    now           = datetime.utcnow()
+    stored_scores = current_data.get("freshness_scores", {})
+    scores        = {}
+
+    try:
+        conn = sqlite3.connect(TRADE_DB_PATH)
+        cur  = conn.cursor()
+
+        for sym in symbols:
+            entry     = stored_scores.get(sym, {})
+            score     = float(entry.get("score", FRESHNESS_INITIAL))
+            last_calc = entry.get("updated", now.isoformat())
+
+            # Apply time decay since last calculation
+            try:
+                last_dt   = datetime.fromisoformat(last_calc)
+                days_gone = max(0.0, (now - last_dt).total_seconds() / 86400)
+            except ValueError:
+                days_gone = 0.0
+            score *= FRESHNESS_DECAY_RATE ** days_gone
+
+            # Apply boosts/hits from closed trades since last calculation
+            cur.execute(
+                "SELECT outcome FROM trades "
+                "WHERE symbol=? AND exit_time IS NOT NULL AND exit_time > ?",
+                (sym, last_calc)
+            )
+            for (outcome,) in cur.fetchall():
+                if outcome == "take_profit":
+                    score += FRESHNESS_WIN_BOOST
+                elif outcome == "stop_loss":
+                    score -= FRESHNESS_LOSS_HIT
+
+            score = max(0.0, min(100.0, score))
+            scores[sym] = {"score": round(score, 2), "updated": now.isoformat()}
+
+        conn.close()
+    except Exception as e:
+        print(f"Warning: freshness score computation failed: {e}")
+        for sym in symbols:
+            if sym not in scores:
+                scores[sym] = {"score": FRESHNESS_INITIAL, "updated": now.isoformat()}
+
+    return scores
+
+
+def freshness_size_multiplier(score):
+    if score >= FRESHNESS_PROMOTE_THR:
+        return 1.5
+    return 1.0
 
 
 def fetch_best_per_symbol():
@@ -146,7 +221,21 @@ def build_roster(rows, current_data):
     sell_list = sell_candidates[:MAX_SHORTS]
     active    = set(buy_list + sell_list)
 
-    # Check active roster for demotion criteria
+    # Compute freshness scores for all candidates
+    all_candidates = set(buy_list + sell_list)
+    fresh = compute_freshness_scores(all_candidates, current_data)
+
+    # Freshness-based demotion (score too low)
+    stale = {sym for sym, entry in fresh.items()
+             if entry["score"] < FRESHNESS_MIN_ACTIVE}
+    if stale:
+        print(f"Demoting (low freshness): { {s: round(fresh[s]['score'],1) for s in stale} }")
+        buy_list  = [s for s in buy_list  if s not in stale]
+        sell_list = [s for s in sell_list if s not in stale]
+        current_cooling |= stale
+
+    # Check active roster for win/win-rate demotion criteria
+    active = set(buy_list + sell_list)
     demote = check_demotion(active)
     if demote:
         print(f"Demoting to cooling_off: {demote}")
@@ -158,14 +247,27 @@ def build_roster(rows, current_data):
     promoted = set(buy_list + sell_list)
     current_cooling -= promoted
 
+    # Build size multipliers for active symbols
+    size_multipliers = {
+        sym: freshness_size_multiplier(fresh[sym]["score"])
+        for sym in promoted
+        if sym in fresh
+    }
+
+    # Persist freshness scores for all tracked symbols (roster + cooling_off)
+    all_tracked = promoted | current_cooling
+    stored_fresh = compute_freshness_scores(all_tracked, current_data)
+
     approved = sorted(set(buy_list + sell_list + CRYPTO_SYMBOLS))
 
     return {
-        "buy":         buy_list,
-        "sell":        sell_list,
-        "approved":    approved,
-        "cooling_off": sorted(current_cooling),
-        "updated":     datetime.utcnow().isoformat(),
+        "buy":              buy_list,
+        "sell":             sell_list,
+        "approved":         approved,
+        "cooling_off":      sorted(current_cooling),
+        "freshness_scores": {s: stored_fresh[s] for s in stored_fresh},
+        "size_multipliers": size_multipliers,
+        "updated":          datetime.utcnow().isoformat(),
     }
 
 
