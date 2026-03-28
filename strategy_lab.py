@@ -26,7 +26,7 @@ SIGNAL_FILTERS  = [
     ["STRONG BUY","STRONG SELL","ABSORPTION"],
 ]
 SYMBOLS = ["NFLX","META","AAPL","AMZN","TSLA","AMD","COIN","GME","SPY","IWM",
-           "NVDA","IBM","UNH","NET","SNOW","PINS","WYNN","OXY","HOOD","ZS","QQQ","MSFT"]
+           "NVDA","QQQ","MSFT"]
 
 def log(msg):
     ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
