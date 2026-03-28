@@ -85,7 +85,7 @@ def init_trade_log():
         if conn:
             conn.close()
 
-def log_trade_open(symbol, direction, entry_price, signal_type):
+def log_trade_open(symbol, direction, entry_price, signal_type, notional):
     conn = None
     try:
         regime_data = get_regime()
@@ -95,12 +95,12 @@ def log_trade_open(symbol, direction, entry_price, signal_type):
             (symbol, side, direction, entry_price, entry_time, signal_type, notional, outcome, vix, regime)
             VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (symbol, "buy" if direction=="LONG" else "sell", direction,
-             entry_price, utc_now_str(), signal_type, TRADE_NOTIONAL_USD,
+             entry_price, utc_now_str(), signal_type, notional,
              "open", regime_data.get("vix",0), regime_data.get("regime","UNKNOWN")))
         conn.commit()
         post_discord(
             f"**TRADE OPEN** | {direction} {symbol} @ ${entry_price:.2f}"
-            f" | {signal_type} | ${TRADE_NOTIONAL_USD} notional"
+            f" | {signal_type} | ${notional:.2f} notional"
         )
     except Exception as e:
         log_line(f"⚠️ Trade log open error: {e}")
@@ -309,14 +309,17 @@ def get_approved_symbols() -> dict:
         # If JSON has buy/sell split, use it. Otherwise apply backtest-based defaults.
         if "buy" in data and "sell" in data:
             return {
-                "buy":  [s.upper() for s in data["buy"]],
-                "sell": [s.upper() for s in data["sell"]],
+                "buy":              [s.upper() for s in data["buy"]],
+                "sell":             [s.upper() for s in data["sell"]],
+                "size_multipliers": {s.upper(): v for s, v in
+                                     data.get("size_multipliers", {}).items()},
             }
     except Exception:
         pass
 
     # Backtest-optimised defaults
     return {
+        "size_multipliers": {},
         "buy": [
             "NFLX", "META", "AAPL", "AMZN",
             "BTC/USD", "ETH/USD", "SOL/USD",
@@ -484,10 +487,14 @@ def execute_entry(client, symbol: str, signal: str, price: float):
     direction = "LONG"         if is_buy_signal  else "SHORT"
     tif       = TimeInForce.DAY
 
+    multiplier    = approved.get("size_multipliers", {}).get(alpaca_symbol, 1.0)
+    trade_notional = TRADE_NOTIONAL_USD * multiplier
+
     try:
-        log_line(f"🚀 SNIPING {alpaca_symbol} {direction} @ ~${float(price):.2f} | {signal}")
+        log_line(f"🚀 SNIPING {alpaca_symbol} {direction} @ ~${float(price):.2f} | {signal}"
+                 + (f" | size {multiplier}x (${trade_notional:.2f})" if multiplier != 1.0 else ""))
         if side == OrderSide.SELL:
-            qty = max(1, int(TRADE_NOTIONAL_USD / float(price)))
+            qty = max(1, int(trade_notional / float(price)))
             client.submit_order(MarketOrderRequest(
                 symbol=alpaca_symbol,
                 qty=qty,
@@ -497,12 +504,12 @@ def execute_entry(client, symbol: str, signal: str, price: float):
         else:
             client.submit_order(MarketOrderRequest(
                 symbol=alpaca_symbol,
-                notional=TRADE_NOTIONAL_USD,
+                notional=trade_notional,
                 side=side,
                 time_in_force=tif,
             ))
-        log_line(f"✅ ORDER SENT: {alpaca_symbol} ${TRADE_NOTIONAL_USD} {direction}")
-        log_trade_open(alpaca_symbol, direction, price, signal)
+        log_line(f"✅ ORDER SENT: {alpaca_symbol} ${trade_notional:.2f} {direction}")
+        log_trade_open(alpaca_symbol, direction, price, signal, trade_notional)
     except Exception as e:
         log_line(f"❌ ORDER FAIL {alpaca_symbol}: {e}")
 
