@@ -19,10 +19,12 @@ COOLING_RESCAN_DAYS  = 7    # re-scan cooling_off symbols not seen in this many 
 VIX_CHANGE_THRESHOLD = 5.0  # VIX move of this magnitude = market condition change
 SECTOR_ROTATION_PCT  = 0.05 # 5% spread between best/worst sector ETF 5d return
 
-RVOL_THRESHOLD = 1.5
-FLOW_THRESHOLD = 0.00003
+RVOL_THRESHOLD      = 1.5   # standard hunt threshold
+RVOL_FULL_SCAN      = 3.0   # higher bar for full-universe scans
+FLOW_THRESHOLD      = 0.00003
 
-SP500_UNIVERSE = [
+# Fallback static universe (used if Wikipedia fetch fails)
+_STATIC_UNIVERSE = [
     "AAPL","MSFT","NVDA","AMD","INTC","QCOM","AVGO","TXN","MU","AMAT",
     "LRCX","KLAC","MRVL","SNPS","CDNS","FTNT","PANW","CRWD","ZS","OKTA",
     "NET","DDOG","SNOW","MDB","TEAM","HUBS","PAYC","NOW","CRM",
@@ -39,8 +41,59 @@ SP500_UNIVERSE = [
     "SPY","QQQ","IWM","XLF","XLK","XLE","XLV","XLI","ARKK","SOXS",
     "MSTR","RIOT","MARA","HUT","CLSK","WULF","IREN",
 ]
-SP500_UNIVERSE = list(dict.fromkeys(SP500_UNIVERSE))
-print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Symbol Hunter v3 — {len(SP500_UNIVERSE)} symbols")
+
+
+def fetch_full_universe():
+    """
+    Fetches S&P 500 tickers from Wikipedia and supplements with a Russell 1000
+    extended list. Falls back to the static universe if the fetch fails.
+    Returns a deduplicated list of ticker strings.
+    """
+    tickers = set()
+
+    # S&P 500 via Wikipedia
+    try:
+        sp500_df = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            attrs={"id": "constituents"}
+        )[0]
+        sp500 = sp500_df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        tickers.update(sp500)
+        print(f"  Wikipedia S&P 500: {len(sp500)} tickers fetched")
+    except Exception as e:
+        print(f"  Warning: S&P 500 Wikipedia fetch failed ({e}), using static list")
+        tickers.update(_STATIC_UNIVERSE)
+
+    # Russell 1000 extension (symbols beyond typical S&P 500 coverage)
+    russell_extra = [
+        # Mid-cap tech
+        "RBLX","U","DKNG","HOOD","SOFI","AFRM","UPST","LMND","ROOT","OPEN",
+        "COIN","MSTR","RIOT","MARA","CLSK","WULF","IREN","HUT","BTBT","CIFR",
+        # Mid-cap finance
+        "IBKR","SCHW","SSNC","FNF","FAF","VCTR","WTFC","CATY","PACW","WAL",
+        # Mid-cap healthcare
+        "INSP","TMDX","NVCR","BEAM","EDIT","NTLA","CRSP","FATE","BLUE","SAGE",
+        # Mid-cap consumer/retail
+        "XPEV","NIO","LI","RIVN","LCID","WKHS","RIDE","GOEV","FSR","NKLA",
+        # Mid-cap energy
+        "SM","PDCE","CTRA","MTDR","VTLE","PR","ESTE","REX","CPE","SBOW",
+        # Mid-cap industrials
+        "SPCE","RKT","JOBY","ACHR","LILM","EVTL","BLADE","SURF","SKYH","EDBL",
+        # Biotech
+        "SAVA","ACAD","EXEL","FOLD","MRTX","KRTX","ALNY","PTGX","ARWR","MDGL",
+        # Other high-RVOL names
+        "AMC","BBBY","EXPR","CLOV","WISH","SKLZ","BARK","DATS","STPK","AJAX",
+        "GME","BB","KOSS","NAKD","SNDL","TLRY","ACB","CGC","CRON","APHA",
+    ]
+    tickers.update(russell_extra)
+
+    # Clean up bad ticker formats
+    clean = sorted(t.strip().upper() for t in tickers if t and "." not in t)
+    return clean
+
+
+SP500_UNIVERSE = list(dict.fromkeys(_STATIC_UNIVERSE))
+print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Symbol Hunter v4 — {len(SP500_UNIVERSE)} symbols (static), full universe on demand")
 
 def hunt_symbol(ticker):
     try:
@@ -215,9 +268,108 @@ def evaluate_cooling_off():
         print(f"\n  Queued for strategy_lab retest: {requeued}")
 
 
+def hunt_symbol_full(ticker):
+    """Like hunt_symbol but uses RVOL_FULL_SCAN (3x) threshold — for broad universe scans."""
+    try:
+        end   = datetime.today()
+        start = end - timedelta(days=LOOKBACK_DAYS)
+        df = yf.download(ticker, start=start, end=end,
+                         interval="1h", progress=False, auto_adjust=False)
+        if df is None or len(df) < 30:
+            return None
+        df.columns = df.columns.get_level_values(0)
+        df = df.dropna(subset=["Close", "Volume"])
+        if len(df) < 30:
+            return None
+        df = df.copy()
+        df["rvol"]   = df["Volume"] / df["Volume"].rolling(20).mean()
+        pc           = df["Close"].pct_change()
+        flow         = pc * df["Volume"]
+        flow_ma      = flow.rolling(5).mean()
+        df["flow_m"] = flow_ma / (df["Volume"].rolling(5).mean() * df["Close"] + 1e-9)
+        df["change"] = pc
+        df = df.dropna(subset=["rvol", "flow_m", "change"])
+
+        results = []
+        for i in range(20, len(df) - 1):
+            rvol   = float(df["rvol"].iloc[i])
+            flow_m = float(df["flow_m"].iloc[i])
+            change = float(df["change"].iloc[i])
+            close  = float(df["Close"].iloc[i])
+
+            # Stricter RVOL bar for full-universe scan
+            if not (rvol >= RVOL_FULL_SCAN and
+                    flow_m <= -FLOW_THRESHOLD and
+                    change <= -0.003):
+                continue
+
+            entry = close
+            exit_ = float(df["Close"].iloc[i + 1])
+            ret   = (entry - exit_) / entry
+
+            hi = float(df["High"].iloc[i + 1])
+            lo = float(df["Low"].iloc[i + 1])
+            if (hi - entry) / entry >= 0.02:
+                ret = -0.02
+            elif (entry - lo) / entry >= 0.04:
+                ret = 0.04
+
+            results.append({"ret": ret, "win": ret > 0})
+
+        if len(results) < MIN_TRADES:
+            return None
+
+        win_rate = sum(1 for r in results if r["win"]) / len(results)
+        avg_ret  = np.mean([r["ret"] for r in results])
+
+        return {
+            "symbol":     ticker,
+            "n_signals":  len(results),
+            "win_rate":   round(win_rate, 4),
+            "avg_return": round(avg_ret, 4),
+            "rvol_bar":   RVOL_FULL_SCAN,
+        }
+    except Exception:
+        return None
+
+
+def run_full_universe_scan():
+    """
+    Scans the full S&P 500 + Russell 1000 universe (fetched fresh from Wikipedia)
+    using the 3x RVOL bar. Prints results and returns a list of qualifying symbols.
+    """
+    universe = fetch_full_universe()
+    print(f"\n--- Full Universe Scan ({len(universe)} symbols, RVOL >= {RVOL_FULL_SCAN}x) ---")
+    results = []
+    total   = len(universe)
+    for i, ticker in enumerate(universe, 1):
+        print(f"  [{i:4d}/{total}] {ticker:<8}", end="", flush=True)
+        r = hunt_symbol_full(ticker)
+        if r:
+            q = r["win_rate"] >= MIN_WIN_RATE and r["avg_return"] >= MIN_AVG_RETURN
+            print(f"  WR={r['win_rate']:.0%}  AvgRet={r['avg_return']:.2%}  N={r['n_signals']}"
+                  + (" ✅" if q else ""))
+            results.append(r)
+        else:
+            print("  —")
+
+    qualifiers = [r for r in results
+                  if r["win_rate"] >= MIN_WIN_RATE and r["avg_return"] >= MIN_AVG_RETURN]
+    qualifiers.sort(key=lambda x: (x["win_rate"], x["avg_return"]), reverse=True)
+    print(f"\n  Full-scan qualifiers: {[r['symbol'] for r in qualifiers[:20]]}")
+    return qualifiers
+
+
 def main():
+    import sys
+    full_scan = "--full" in sys.argv
+
     # Re-evaluate cooling_off symbols before running the main hunt
     evaluate_cooling_off()
+
+    if full_scan:
+        run_full_universe_scan()
+        return
 
     results = []
     total   = len(SP500_UNIVERSE)
