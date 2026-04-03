@@ -2,7 +2,7 @@
 """
 WOLFE GODMODE (V7.0)
 Purpose:
-- Scan a watchlist every N seconds using yfinance (5m bars)
+- Scan a watchlist every N seconds using Alpaca Data API (5m bars, stocks/ETFs) and yfinance (crypto/futures/macro)
 - Compute RVOL + simple "money flow" proxy
 - Emit signals to:
     1) market_log.csv (all rows)
@@ -28,12 +28,18 @@ import json
 import sqlite3
 import csv
 import signal
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
+import requests
 import yfinance as yf
 from dotenv import load_dotenv
 from colorama import Fore, Back, Style, init
+
+_TRADING_DEV = "/home/theplummer92/trading-dev"
+if _TRADING_DEV not in __import__("sys").path:
+    __import__("sys").path.insert(0, _TRADING_DEV)
+from alpaca_data import get_stock_minute_bars
 
 # ---------------- INIT ----------------
 init(autoreset=True)
@@ -55,6 +61,13 @@ MIN_BARS = int(os.getenv("MIN_BARS", "50"))                     # RVOL baseline 
 
 # ---------------- ALERTS ----------------
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
+STOCK_DATA_FEED = os.getenv("ALPACA_STOCK_DATA_FEED", "iex")
+
+# ---------------- ALPACA NEWS ----------------
+APCA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
+APCA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
+NEWS_CACHE_TTL = 600  # 10 minutes per symbol
+_news_cache: Dict[str, tuple] = {}  # symbol -> (epoch_checked, news_flag)
 
 # ---------------- ABSORPTION -> RESOLUTION PARAMS ----------------
 # "absorption" = high RVOL + tiny move + big $flow
@@ -102,6 +115,45 @@ def log(msg: str) -> None:
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# ---------------- ALPACA NEWS FLAG ----------------
+def fetch_news_flag(symbol: str) -> str:
+    """
+    Returns "NEWS_DRIVEN" if a news article exists for symbol in the last 2 hours,
+    "CLEAN" if none. Results cached per symbol for NEWS_CACHE_TTL seconds.
+    Only queries stocks/ETFs — crypto and futures symbols are skipped (returns "CLEAN").
+    """
+    # skip non-stock symbols (crypto, futures, macro)
+    if not _is_alpaca_stock(symbol):
+        return "CLEAN"
+
+    now_epoch = time.time()
+    cached = _news_cache.get(symbol)
+    if cached and (now_epoch - cached[0]) < NEWS_CACHE_TTL:
+        return cached[1]
+
+    if not APCA_KEY or not APCA_SECRET:
+        return "CLEAN"
+
+    try:
+        start_iso = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        resp = requests.get(
+            "https://data.alpaca.markets/v1beta1/news",
+            params={"symbols": symbol, "start": start_iso, "limit": 5},
+            headers={"APCA-API-KEY-ID": APCA_KEY, "APCA-API-SECRET-KEY": APCA_SECRET},
+            timeout=6,
+        )
+        if resp.status_code == 200:
+            articles = resp.json().get("news", [])
+            flag = "NEWS_DRIVEN" if articles else "CLEAN"
+        else:
+            flag = "CLEAN"
+    except Exception:
+        flag = "CLEAN"
+
+    _news_cache[symbol] = (now_epoch, flag)
+    return flag
+
 
 # ---------------- UTIL: CSV HELPERS ----------------
 def _ensure_csv(path: str, header: List[str]) -> None:
@@ -205,12 +257,20 @@ def init_db() -> None:
     c.execute("CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_timestamp ON signals(symbol, timestamp)")
 
+    # Add news_flag column if not present (safe on existing DBs)
+    try:
+        c.execute("ALTER TABLE signals ADD COLUMN news_flag TEXT DEFAULT 'CLEAN'")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
+
     conn.commit()
     conn.close()
     log(f"{Fore.GREEN}✅ DB ready: {DB_PATH}")
 
 def save_signal_to_db(symbol: str, sector: str, signal_type: str,
-                      price: float, change_pct: float, rvol: float, flow_m: float) -> None:
+                      price: float, change_pct: float, rvol: float, flow_m: float,
+                      news_flag: str = "CLEAN") -> None:
     confidence = 50
     if "ABSORPTION" in signal_type:
         confidence += 30
@@ -227,11 +287,11 @@ def save_signal_to_db(symbol: str, sector: str, signal_type: str,
         c.execute("""
             INSERT INTO signals (
                 timestamp, symbol, signal_type, price, rvol, flow_m,
-                confidence, sector, change_pct
+                confidence, sector, change_pct, news_flag
             ) VALUES (
-                datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?
+                datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
-        """, (symbol, signal_type, price, rvol, flow_m, confidence, sector, float(change_pct)))
+        """, (symbol, signal_type, price, rvol, flow_m, confidence, sector, float(change_pct), news_flag))
         conn.commit()
     except Exception as e:
         log(f"{Fore.RED}DB Write Error (signals): {e}")
@@ -293,60 +353,119 @@ def is_absorption_candidate(rvol: float, change_pct: float, flow_m: float) -> bo
     return (rvol >= ABS_RVOL_MIN) and (abs(change_pct) <= ABS_MOVE_MAX) and (abs(flow_m) >= ABS_FLOW_MIN_M)
 
 # ---------------- DISCORD (OPTIONAL) ----------------
-def post_discord(symbol: str, signal_lbl: str, rvol: float, flow_m: float) -> None:
+def post_discord(symbol: str, signal_lbl: str, rvol: float, flow_m: float, news_flag: str = "CLEAN") -> None:
     if not DISCORD_WEBHOOK:
         return
     if "Neutral" in signal_lbl:
         return
 
     emoji = "🟢" if flow_m > 0 else "🔴"
-    msg = f"🚨 **WHALE ALERT** `{symbol}`\n**{signal_lbl}**\nRVOL: `{rvol:.2f}x` | Flow: {emoji} `{flow_m:+.1f}M`"
+    news_label = "📰 NEWS-DRIVEN spike" if news_flag == "NEWS_DRIVEN" else "✨ CLEAN RVOL spike"
+    msg = (
+        f"🚨 **WHALE ALERT** `{symbol}`\n"
+        f"**{signal_lbl}**\n"
+        f"RVOL: `{rvol:.2f}x` | Flow: {emoji} `{flow_m:+.1f}M`\n"
+        f"{news_label}"
+    )
     try:
-        import requests
         requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=6)
     except Exception:
         pass
 
 # ---------------- DATA FETCHING ----------------
-def _download_batch(tickers: List[str]):
-    return yf.download(
-        tickers,
-        period="5d",
-        interval="5m",
-        progress=False,
-        group_by="column",
-        threads=True,
-    )
+def _is_alpaca_stock(symbol: str) -> bool:
+    """True if symbol is a plain equity/ETF fetchable via Alpaca StockBars."""
+    t = symbol.strip().upper()
+    return ("/" not in t and "-USD" not in t and "=" not in t
+            and "." not in t and not t.startswith("^"))
 
-def _download_one(symbol: str):
-    return yf.download(
-        symbol,
-        period="5d",
-        interval="5m",
-        progress=False,
-        group_by="column",
-        threads=False,
-    )
 
-def get_symbol_frame(data, symbol: str):
-    """
-    Handles yfinance returning either:
-      - MultiIndex columns for batches: data["Close"][symbol]
-      - Single symbol frame: data["Close"]
-    """
+def _get_yf_series(data, symbol: str):
+    """Extract (opens, closes, volumes) from a yfinance batch download result."""
     try:
-        opens = data["Open"][symbol].dropna()
+        opens  = data["Open"][symbol].dropna()
         closes = data["Close"][symbol].dropna()
-        vols = data["Volume"][symbol].dropna()
+        vols   = data["Volume"][symbol].dropna()
         return opens, closes, vols
     except Exception:
         try:
-            opens = data["Open"].dropna()
+            opens  = data["Open"].dropna()
             closes = data["Close"].dropna()
-            vols = data["Volume"].dropna()
+            vols   = data["Volume"].dropna()
             return opens, closes, vols
         except Exception:
             return None, None, None
+
+
+def _download_batch(tickers: List[str]) -> Dict[str, tuple]:
+    """
+    Fetch 5-minute bars for all tickers.
+    Stocks/ETFs -> Alpaca StockBars (no rate-limit risk, real-time).
+    Crypto/futures/macro -> yfinance (Alpaca doesn't carry these).
+    Returns dict: symbol -> (opens Series, closes Series, volumes Series).
+    """
+    result: Dict[str, tuple] = {}
+    stock_tickers = [t for t in tickers if _is_alpaca_stock(t)]
+    yf_tickers    = [t for t in tickers if not _is_alpaca_stock(t)]
+
+    if stock_tickers:
+        try:
+            now   = datetime.now(timezone.utc)
+            start = now - timedelta(days=6)
+            frames = get_stock_minute_bars(stock_tickers, start=start, end=now,
+                                           minutes=5, feed=STOCK_DATA_FEED)
+            for sym, df in frames.items():
+                if df is not None and not df.empty:
+                    result[sym.upper()] = (df["Open"], df["Close"], df["Volume"])
+        except Exception as e:
+            log(f"{Fore.YELLOW}⚠️ Alpaca batch fetch error: {e}")
+
+    if yf_tickers:
+        try:
+            raw = yf.download(
+                yf_tickers, period="5d", interval="5m",
+                progress=False, group_by="column", threads=True,
+            )
+            for sym in yf_tickers:
+                o, c, v = _get_yf_series(raw, sym)
+                if o is not None:
+                    result[sym] = (o, c, v)
+        except Exception:
+            pass
+
+    return result
+
+
+def _download_one(symbol: str) -> Dict[str, tuple]:
+    """Single-symbol fetch fallback. Returns same dict format as _download_batch."""
+    if _is_alpaca_stock(symbol):
+        try:
+            now   = datetime.now(timezone.utc)
+            start = now - timedelta(days=6)
+            frames = get_stock_minute_bars([symbol], start=start, end=now,
+                                           minutes=5, feed=STOCK_DATA_FEED)
+            df = frames.get(symbol.upper())
+            if df is not None and not df.empty:
+                return {symbol: (df["Open"], df["Close"], df["Volume"])}
+        except Exception as e:
+            log(f"{Fore.YELLOW}⚠️ Alpaca single fetch {symbol}: {e}")
+    try:
+        raw = yf.download(symbol, period="5d", interval="5m",
+                          progress=False, group_by="column", threads=False)
+        o, c, v = _get_yf_series(raw, symbol)
+        if o is not None:
+            return {symbol: (o, c, v)}
+    except Exception:
+        pass
+    return {}
+
+
+def get_symbol_frame(data: Dict[str, tuple], symbol: str):
+    """Extract (opens, closes, volumes) from the bar dict. Returns (None, None, None) on miss."""
+    t = data.get(symbol) or data.get(symbol.upper())
+    if t is None:
+        return None, None, None
+    return t
 
 # ---------------- REGIME SNAPSHOT ----------------
 def derive_regime(vix: Optional[float], tnx: Optional[float], dxy: Optional[float]) -> str:
@@ -525,6 +644,7 @@ def run_god_mode_pro() -> None:
                             if trend_blocked:
                                 log(f"TREND GATE: {signal_lbl} on {symbol} suppressed — SPY below MA20")
                             else:
+                                news_flag = fetch_news_flag(symbol)
                                 save_signal_to_db(
                                     symbol=symbol,
                                     sector=sector,
@@ -532,13 +652,15 @@ def run_god_mode_pro() -> None:
                                     price=price,
                                     change_pct=change_pct,
                                     rvol=rvol,
-                                    flow_m=flow_m
+                                    flow_m=flow_m,
+                                    news_flag=news_flag,
                                 )
 
                                 now_epoch = time.time()
                                 if (now_epoch - last_alert_ts.get(symbol, 0) > 1200) or ("CLIMAX" in signal_lbl):
-                                    log(f"🚀 {signal_lbl}: {symbol} | Flow: ${flow_m:+.1f}M | RVOL={rvol:.2f} | Δ={change_pct*100:.2f}%")
-                                    post_discord(symbol, signal_lbl, rvol, flow_m)
+                                    news_tag = "[NEWS]" if news_flag == "NEWS_DRIVEN" else "[CLEAN]"
+                                    log(f"🚀 {signal_lbl}: {symbol} {news_tag} | Flow: ${flow_m:+.1f}M | RVOL={rvol:.2f} | Δ={change_pct*100:.2f}%")
+                                    post_discord(symbol, signal_lbl, rvol, flow_m, news_flag)
                                     last_alert_ts[symbol] = now_epoch
 
                         # ----- Absorption set -----
