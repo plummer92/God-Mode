@@ -1,13 +1,14 @@
 #!/home/theplummer92/venv/bin/python3
 import sqlite3
 import json
+import os
 from datetime import datetime, timedelta
 
-DB_PATH        = "/home/theplummer92/strategy_lab.db"
-TRADE_DB_PATH  = "/home/theplummer92/trade_log.db"
-OUT_PATH       = "/home/theplummer92/approved_symbols.json"
+DB_PATH        = os.environ.get("STRATEGY_LAB_DB_PATH", "/home/theplummer92/strategy_lab.db")
+TRADE_DB_PATH  = os.environ.get("TRADE_DB_PATH", "/home/theplummer92/trade_log.db")
+OUT_PATH       = os.environ.get("APPROVED_SYMBOLS_PATH", "/home/theplummer92/approved_symbols.json")
 
-MIN_TRADES    = 25
+MIN_TRADES    = 20
 MIN_WIN_RATE  = 0.60
 MIN_SCORE     = 200
 
@@ -17,9 +18,10 @@ MAX_SHORTS    = 5
 CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
 
 # Demotion thresholds
-DEMOTION_NO_WIN_DAYS    = 14   # closed trades in this window but 0 wins → demote
+DEMOTION_NO_WIN_DAYS    = 21   # closed trades in this window but 0 wins → demote
 DEMOTION_MIN_WIN_RATE   = 0.60 # rolling avg over last N strategy_lab results
 DEMOTION_RESULTS_WINDOW = 20
+MIN_TRADES_FOR_DEMOTION = 15   # require enough recent live closes before any demotion can fire
 
 # Freshness decay score
 FRESHNESS_INITIAL     = 100.0  # score assigned to newly rostered symbols
@@ -28,6 +30,21 @@ FRESHNESS_WIN_BOOST   = 8.0    # added per winning trade
 FRESHNESS_LOSS_HIT    = 3.0    # subtracted per losing trade
 FRESHNESS_MIN_ACTIVE  = 40.0   # below this → demote to cooling_off
 FRESHNESS_PROMOTE_THR = 80.0   # above this → eligible for 1.5x trade size multiplier   # how many recent results to average
+
+
+def log_roster_decision(action, symbol, reason, **fields):
+    extras = " ".join(f"{key}={value}" for key, value in sorted(fields.items()))
+    suffix = f" {extras}" if extras else ""
+    print(f"[roster-decision] action={action} symbol={symbol} reason={reason}{suffix}")
+
+
+def append_reason(reason_map, symbol, reason):
+    if not reason:
+        return
+    if symbol in reason_map and reason_map[symbol]:
+        reason_map[symbol] = f"{reason_map[symbol]}|{reason}"
+    else:
+        reason_map[symbol] = reason
 
 
 def compute_freshness_scores(symbols, current_data):
@@ -131,6 +148,42 @@ def fetch_best_per_symbol():
     return rows
 
 
+def fetch_latest_rows_for_symbols(symbols):
+    if not symbols:
+        return []
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    placeholders = ",".join("?" for _ in symbols)
+    query = f"""
+    WITH ranked AS (
+        SELECT
+            symbol,
+            signal_filter,
+            rvol,
+            win_rate,
+            n_trades,
+            avg_return,
+            score,
+            tested_at,
+            ROW_NUMBER() OVER (
+                PARTITION BY symbol
+                ORDER BY tested_at DESC, score DESC, win_rate DESC, n_trades DESC
+            ) AS rn
+        FROM results
+        WHERE symbol IN ({placeholders})
+    )
+    SELECT symbol, signal_filter, rvol, win_rate, n_trades, avg_return, score, tested_at
+    FROM ranked
+    WHERE rn = 1
+    """
+    rows = cur.execute(query, tuple(symbols)).fetchall()
+    conn.close()
+    return rows
+
+
 def check_demotion(symbols):
     """
     Returns {symbol: reason} for any rostered symbol that should be demoted.
@@ -140,11 +193,14 @@ def check_demotion(symbols):
          none of them are wins (outcome = 'take_profit').
       2. Average win_rate across the last DEMOTION_RESULTS_WINDOW strategy_lab
          results is below DEMOTION_MIN_WIN_RATE.
+    Both checks require at least MIN_TRADES_FOR_DEMOTION recent live closed
+    trades before a demotion is allowed, to avoid reacting to tiny samples.
     """
     demote = {}
     cutoff = (datetime.utcnow() - timedelta(days=DEMOTION_NO_WIN_DAYS)).isoformat()
+    recent_closed = {}
 
-    # Check 1: recent closed trades with no wins
+    # Recent live sample gate + Check 1: recent closed trades with no wins
     try:
         conn = sqlite3.connect(TRADE_DB_PATH)
         cur  = conn.cursor()
@@ -155,6 +211,16 @@ def check_demotion(symbols):
                 (sym, cutoff)
             )
             closed = cur.fetchone()[0]
+            recent_closed[sym] = closed
+            if closed < MIN_TRADES_FOR_DEMOTION:
+                log_roster_decision(
+                    "skipped_demotion_low_sample",
+                    sym,
+                    "insufficient_live_trades_for_demotion",
+                    closed_trades=closed,
+                    min_required=MIN_TRADES_FOR_DEMOTION,
+                )
+                continue
             if closed > 0:
                 cur.execute(
                     "SELECT COUNT(*) FROM trades "
@@ -174,6 +240,16 @@ def check_demotion(symbols):
         conn2 = sqlite3.connect(DB_PATH)
         cur2  = conn2.cursor()
         for sym in symbols:
+            closed = recent_closed.get(sym, 0)
+            if closed < MIN_TRADES_FOR_DEMOTION:
+                log_roster_decision(
+                    "skipped_demotion_low_sample",
+                    sym,
+                    "insufficient_live_trades_for_win_rate_decay",
+                    closed_trades=closed,
+                    min_required=MIN_TRADES_FOR_DEMOTION,
+                )
+                continue
             cur2.execute(
                 "SELECT win_rate FROM results WHERE symbol=? "
                 "ORDER BY tested_at DESC LIMIT ?",
@@ -192,22 +268,28 @@ def check_demotion(symbols):
     return demote
 
 
-def build_roster(rows, current_data):
+def build_roster(rows, current_data, cooling_rows=None):
+    previous_buy = current_data.get("buy", [])
+    previous_sell = current_data.get("sell", [])
+    previous_active = set(previous_buy + previous_sell)
     current_cooling = set(current_data.get("cooling_off", []))
+    original_cooling = set(current_cooling)
+    pending_retest = set(current_data.get("pending_retest", []))
 
     buy_candidates  = []
     sell_candidates = []
     seen_buy  = set()
     seen_sell = set()
+    eligible_symbols = set()
+    evaluated_cooling = {
+        row["symbol"].upper()
+        for row in (cooling_rows or [])
+    }
 
     for row in rows:
         symbol = row["symbol"].upper()
         signal = (row["signal_filter"] or "").upper()
-
-        # Don't re-promote cooling_off symbols through the normal path;
-        # they need explicit re-evaluation via Symbol_hunter first.
-        if symbol in current_cooling:
-            continue
+        eligible_symbols.add(symbol)
 
         if "BUY" in signal and symbol not in seen_buy:
             buy_candidates.append(symbol)
@@ -219,33 +301,74 @@ def build_roster(rows, current_data):
 
     buy_list  = buy_candidates[:MAX_LONGS]
     sell_list = sell_candidates[:MAX_SHORTS]
-    active    = set(buy_list + sell_list)
+    selected = set(buy_list + sell_list)
+    reviewed_symbols = selected | previous_active | current_cooling
 
-    # Compute freshness scores for all candidates
-    all_candidates = set(buy_list + sell_list)
-    fresh = compute_freshness_scores(all_candidates, current_data)
+    fresh = compute_freshness_scores(reviewed_symbols, current_data)
+    demote = {}
 
-    # Freshness-based demotion (score too low)
-    stale = {sym for sym, entry in fresh.items()
-             if entry["score"] < FRESHNESS_MIN_ACTIVE}
-    if stale:
-        print(f"Demoting (low freshness): { {s: round(fresh[s]['score'],1) for s in stale} }")
-        buy_list  = [s for s in buy_list  if s not in stale]
-        sell_list = [s for s in sell_list if s not in stale]
-        current_cooling |= stale
+    for sym in sorted(previous_active - eligible_symbols):
+        append_reason(demote, sym, "failed_strategy_thresholds")
 
-    # Check active roster for win/win-rate demotion criteria
-    active = set(buy_list + sell_list)
-    demote = check_demotion(active)
-    if demote:
-        print(f"Demoting to cooling_off: {demote}")
-        buy_list  = [s for s in buy_list  if s not in demote]
-        sell_list = [s for s in sell_list if s not in demote]
-        current_cooling |= set(demote.keys())
+    for sym, entry in fresh.items():
+        if entry["score"] < FRESHNESS_MIN_ACTIVE:
+            append_reason(demote, sym, f"low_freshness_{entry['score']:.2f}")
+
+    for sym, reason in check_demotion(reviewed_symbols).items():
+        append_reason(demote, sym, reason)
+
+    demoted_symbols = set(demote)
+    if demoted_symbols:
+        buy_list = [s for s in buy_list if s not in demoted_symbols]
+        sell_list = [s for s in sell_list if s not in demoted_symbols]
+        current_cooling |= demoted_symbols
+        pending_retest -= demoted_symbols
+        for sym in sorted(demoted_symbols):
+            fields = {}
+            if sym in fresh:
+                fields["freshness"] = fresh[sym]["score"]
+            action = "demoted_to_cooling_off"
+            if sym in original_cooling:
+                action = "skipped_from_approval"
+            log_roster_decision(action, sym, demote[sym], **fields)
 
     # Symbols that made it back onto the roster are cleared from cooling_off
     promoted = set(buy_list + sell_list)
+    restored = promoted & current_cooling
     current_cooling -= promoted
+    pending_retest -= promoted
+
+    for sym in sorted(restored):
+        fields = {}
+        if sym in fresh:
+            fields["freshness"] = fresh[sym]["score"]
+        log_roster_decision("restored_from_cooling_off", sym, "eligible_again", **fields)
+
+    for sym in sorted(promoted - restored - previous_active):
+        fields = {}
+        if sym in fresh:
+            fields["freshness"] = fresh[sym]["score"]
+        log_roster_decision("newly_promoted", sym, "qualified_strategy_results", **fields)
+
+    for sym in sorted((promoted - restored) & previous_active):
+        fields = {}
+        if sym in fresh:
+            fields["freshness"] = fresh[sym]["score"]
+        log_roster_decision("kept_approved", sym, "eligible_active", **fields)
+
+    skipped_symbols = (eligible_symbols | previous_active | current_cooling) - promoted - demoted_symbols
+    for sym in sorted(skipped_symbols):
+        if sym in current_cooling:
+            reason = "cooling_off_ineligible"
+            if sym in eligible_symbols:
+                reason = "cooling_off_not_restored"
+            elif sym not in evaluated_cooling:
+                reason = "cooling_off_no_strategy_data"
+        elif sym in eligible_symbols:
+            reason = "roster_capacity"
+        else:
+            reason = "not_selected"
+        log_roster_decision("skipped_from_approval", sym, reason)
 
     # Build size multipliers for active symbols
     size_multipliers = {
@@ -259,8 +382,7 @@ def build_roster(rows, current_data):
     stored_fresh = compute_freshness_scores(all_tracked, current_data)
 
     approved = sorted(set(buy_list + sell_list + CRYPTO_SYMBOLS))
-
-    return {
+    payload = {
         "buy":              buy_list,
         "sell":             sell_list,
         "approved":         approved,
@@ -269,6 +391,18 @@ def build_roster(rows, current_data):
         "size_multipliers": size_multipliers,
         "updated":          datetime.utcnow().isoformat(),
     }
+    if "cooling_off_history" in current_data:
+        payload["cooling_off_history"] = current_data["cooling_off_history"]
+    if pending_retest or "pending_retest" in current_data:
+        payload["pending_retest"] = sorted(pending_retest)
+
+    print(
+        "[roster-summary] "
+        f"buy_count={len(buy_list)} sell_count={len(sell_list)} "
+        f"approved_count={len(approved)} cooling_off_count={len(current_cooling)} "
+        f"pending_retest_count={len(pending_retest)}"
+    )
+    return payload
 
 
 def main():
@@ -278,8 +412,9 @@ def main():
     except (FileNotFoundError, json.JSONDecodeError):
         current_data = {}
 
-    rows    = fetch_best_per_symbol()
-    payload = build_roster(rows, current_data)
+    rows = fetch_best_per_symbol()
+    cooling_rows = fetch_latest_rows_for_symbols(current_data.get("cooling_off", []))
+    payload = build_roster(rows, current_data, cooling_rows)
 
     with open(OUT_PATH, "w") as f:
         json.dump(payload, f, indent=2)

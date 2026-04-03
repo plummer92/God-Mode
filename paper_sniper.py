@@ -29,7 +29,7 @@ PAPER_SECRET = os.getenv("APCA_PAPER_SECRET_KEY")
 PAPER_URL    = os.getenv("APCA_PAPER_BASE_URL", "https://paper-api.alpaca.markets")
 
 # Strategy config - based on strategy lab results
-TRADE_NOTIONAL   = 50.0   # $50 per trade (simulating $500 IBKR account)
+TRADE_NOTIONAL   = 50.0   # $50 per trade for paper short testing
 TAKE_PROFIT_PCT  = 0.04
 STOP_LOSS_PCT    = 0.02
 MAX_POSITIONS    = 5

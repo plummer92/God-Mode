@@ -77,21 +77,9 @@ ASSETS: Dict[str, List[str]] = {
     "COMMODITIES": ["CL=F", "NG=F", "GC=F", "SI=F", "HG=F", "ZC=F", "ZW=F"],
     "MACRO": ["^TNX", "DX-Y.NYB", "^VIX"],  # used both as "assets" and for regime features
 }
-
-# Merge hunter-discovered symbols (symbol_hunt_top20.json) into a HUNTER bucket,
-# skipping any already covered by the static lists above.
-_HUNT_PATH = os.path.join(BASE_DIR, "symbol_hunt_top20.json")
-try:
-    with open(_HUNT_PATH) as _f:
-        _hunt = json.load(_f)
-    _existing = {t for group in ASSETS.values() for t in group}
-    _new = [s for s in _hunt.get("top_sell", []) if s not in _existing]
-    if _new:
-        ASSETS["HUNTER"] = _new
-except FileNotFoundError:
-    pass  # hunter hasn't run yet; no-op
-
-ALL_TICKERS: List[str] = [t for group in ASSETS.values() for t in group]
+HUNTER_SYMBOLS_PATH = os.path.join(BASE_DIR, "symbol_hunt_top20.json")
+_last_hunter_watch_symbols: List[str] = []
+_last_hunter_watch_mtime: float | None = None
 # ---------------- CSV HEADERS ----------------
 MARKET_HEADER = ["Timestamp", "Sector", "Ticker", "Price", "Change_Pct", "RVOL", "Money_Flow_M", "Signal"]
 
@@ -138,6 +126,47 @@ def _write_rows(path: str, header: List[str], rows: List[Dict]) -> None:
 
 def ensure_market_log_header() -> None:
     _ensure_csv(CSV_FILENAME, MARKET_HEADER)
+
+
+def _load_dynamic_assets() -> Dict[str, List[str]]:
+    global _last_hunter_watch_symbols, _last_hunter_watch_mtime
+
+    assets = {sector: list(symbols) for sector, symbols in ASSETS.items() if sector != "HUNTER"}
+    hunter_symbols: List[str] = []
+    current_mtime: float | None = None
+
+    try:
+        current_mtime = os.path.getmtime(HUNTER_SYMBOLS_PATH)
+        with open(HUNTER_SYMBOLS_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        top_sell = payload.get("top_sell", []) if isinstance(payload, dict) else []
+        existing = {ticker for group in assets.values() for ticker in group}
+        hunter_symbols = [
+            str(symbol).strip().upper()
+            for symbol in top_sell
+            if str(symbol).strip() and str(symbol).strip().upper() not in existing
+        ]
+    except FileNotFoundError:
+        hunter_symbols = []
+    except Exception as e:
+        log(f"{Fore.YELLOW}⚠️ Hunter symbol refresh failed: {e}")
+        hunter_symbols = list(_last_hunter_watch_symbols)
+
+    if hunter_symbols:
+        assets["HUNTER"] = hunter_symbols
+
+    if hunter_symbols != _last_hunter_watch_symbols:
+        added = sorted(set(hunter_symbols) - set(_last_hunter_watch_symbols))
+        removed = sorted(set(_last_hunter_watch_symbols) - set(hunter_symbols))
+        log(
+            f"{Fore.CYAN}🔄 Hunter watchlist refresh: "
+            f"count {len(_last_hunter_watch_symbols)} -> {len(hunter_symbols)}"
+            + (f" | added={','.join(added)}" if added else "")
+            + (f" | removed={','.join(removed)}" if removed else "")
+        )
+        _last_hunter_watch_symbols = list(hunter_symbols)
+    _last_hunter_watch_mtime = current_mtime
+    return assets
 
 # ---------------- DATABASE ----------------
 def init_db() -> None:
@@ -379,6 +408,8 @@ def run_god_mode_pro() -> None:
     while RUNNING:
         try:
             ts = now_str()
+            assets = _load_dynamic_assets()
+            all_tickers = [ticker for group in assets.values() for ticker in group]
 
             # Daily prune: delete signals older than 30 days (runs once per calendar day)
             today_date = datetime.now().strftime("%Y-%m-%d")
@@ -400,7 +431,7 @@ def run_god_mode_pro() -> None:
             batch = None
             for attempt in range(2):
                 try:
-                    batch = _download_batch(ALL_TICKERS)
+                    batch = _download_batch(all_tickers)
                     break
                 except Exception:
                     batch = None
@@ -448,7 +479,7 @@ def run_god_mode_pro() -> None:
             watch_rows: List[Dict] = []
 
             # ----- per symbol scanning -----
-            for sector, tickers in ASSETS.items():
+            for sector, tickers in assets.items():
                 for symbol in tickers:
                     try:
                         data = batch
@@ -612,4 +643,3 @@ if __name__ == "__main__":
             os.remove(LOCKFILE)
         except Exception:
             pass
-
