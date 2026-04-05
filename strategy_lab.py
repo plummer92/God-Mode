@@ -718,13 +718,6 @@ def get_price_bars(symbol, start, end, provider=DATA_PROVIDER, allow_fallback=Tr
                 _log_bar_skip_once(symbol, f"Alpaca fetch failed: {exc}")
                 df = None
 
-        if df is None and allow_fallback:
-            try:
-                df = _fetch_yahoo_hourly_bars(symbol, start, end)
-            except Exception as exc:
-                log(f"Skipping {str(symbol).strip().upper()} Yahoo fallback bars: fetch failed: {exc}")
-                df = None
-
     if df is None:
         df = pd.DataFrame()
     _price_cache[cache_key] = df

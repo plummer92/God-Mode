@@ -22,8 +22,8 @@ from market_context import (
 
 # -------------------- CONFIG --------------------
 TRADE_NOTIONAL_USD = 25       # Trade size per signal
-HARD_STOP_LOSS_PCT = 0.01     # -1.0% hard stop loss
-TAKE_PROFIT_PCT = 0.015       # +1.5% take profit
+HARD_STOP_LOSS_PCT = 0.02     # -2.0% hard stop loss
+TAKE_PROFIT_PCT = 0.02        # +2.0% take profit
 BREAK_EVEN_ARM_PCT = 0.0075   # Arm break-even protection after +0.75% unrealized PnL
 DAILY_LOSS_LIMIT_USD = 60.00  # Stop trading if down $60 in one day
 MAX_OPEN_POSITIONS = 5        # Never hold more than 5 positions at once

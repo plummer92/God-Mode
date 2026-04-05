@@ -319,6 +319,66 @@ h1, h2, h3, [data-testid="stTabs"] button {
   font-size: 0.73rem;
   line-height: 1.55;
 }
+.decision-card {
+  background: linear-gradient(180deg, #04130c 0%, #000d00 100%);
+  border: 1px solid #20583a;
+  border-radius: 8px;
+  padding: 0.95rem 1rem;
+  min-height: 240px;
+  box-shadow: 0 0 18px #00ff4110 inset;
+  margin-bottom: 0.8rem;
+}
+.decision-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.8rem;
+}
+.decision-symbol {
+  color: #e8fff1;
+  font-family: 'Orbitron', monospace;
+  font-size: 1.1rem;
+  letter-spacing: 0.08em;
+}
+.decision-setup {
+  color: #89d9a9;
+  font-size: 0.72rem;
+  margin-top: 0.15rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.decision-score {
+  color: #73ff9c;
+  font-family: 'Orbitron', monospace;
+  font-size: 1rem;
+  white-space: nowrap;
+}
+.decision-meta {
+  color: #77c697;
+  font-size: 0.7rem;
+  margin-top: 0.5rem;
+  line-height: 1.5;
+}
+.decision-reason {
+  color: #d9ffea;
+  font-size: 0.76rem;
+  line-height: 1.55;
+  margin-top: 0.75rem;
+}
+.decision-chip {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 0.22rem 0.62rem;
+  margin: 0.18rem 0.28rem 0 0;
+  font-size: 0.63rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  border: 1px solid;
+}
+.decision-chip-good { color: #7effae; background: #0b2315; border-color: #2f8f5c; }
+.decision-chip-warn { color: #ffd78a; background: #241a08; border-color: #94722b; }
+.decision-chip-bad { color: #ff9f9f; background: #240909; border-color: #8f3434; }
+.decision-chip-neutral { color: #9ed7ff; background: #091823; border-color: #2c6288; }
 @keyframes ticker-scroll {
   0% { transform: translateX(0); }
   100% { transform: translateX(-100%); }
@@ -751,6 +811,316 @@ def enrich_flow_audit_table(records: tuple[tuple, ...], columns: tuple[str, ...]
         )
     )
     return df
+
+
+def safe_float(value) -> float | None:
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def parse_signal_timestamp(value) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = pd.to_datetime(value, utc=True)
+        if pd.isna(parsed):
+            return None
+        return parsed.to_pydatetime()
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def build_signal_recency_lookup(records: tuple[tuple, ...], columns: tuple[str, ...]) -> dict[str, dict]:
+    if not records:
+        return {}
+    df = pd.DataFrame(records, columns=list(columns))
+    if df.empty or "symbol" not in df.columns:
+        return {}
+    if "timestamp" in df.columns:
+        df["parsed_timestamp"] = df["timestamp"].map(parse_signal_timestamp)
+        df = df.sort_values(by="parsed_timestamp", ascending=False, na_position="last")
+    lookup: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        symbol = str(row.get("symbol", "")).upper()
+        if not symbol or symbol in lookup:
+            continue
+        signal_dt = row.get("parsed_timestamp")
+        age_minutes = None
+        if signal_dt is not None:
+            age_minutes = max(0, int((utc_now() - signal_dt).total_seconds() // 60))
+        lookup[symbol] = {
+            "timestamp": row.get("timestamp"),
+            "signal_type": row.get("signal_type"),
+            "age_minutes": age_minutes,
+            "rvol": safe_float(row.get("rvol")),
+            "change_pct": safe_float(row.get("change_pct")),
+        }
+    return lookup
+
+
+def derive_setup_type(row: pd.Series, signal_meta: dict | None) -> str:
+    bias = str(row.get("bias", "") or "").upper()
+    signal_type = str((signal_meta or {}).get("signal_type") or row.get("signal_type") or "SETUP").replace("_", " ")
+    if bias in {"LONG", "SHORT", "EVENT", "CAUTION"}:
+        return f"{bias} | {signal_type}"
+    return signal_type
+
+
+def derive_strategy_alignment_flag(bias: str, symbol: str, approved_map: dict) -> str | None:
+    approved_buy = {str(item).upper() for item in approved_map.get("buy", [])}
+    approved_sell = {str(item).upper() for item in approved_map.get("sell", [])}
+    if bias == "LONG" and symbol in approved_buy:
+        return "STRATEGY ALIGNED"
+    if bias == "SHORT" and symbol in approved_sell:
+        return "STRATEGY ALIGNED"
+    return None
+
+
+def derive_quality_label(opportunity: dict) -> str:
+    score = safe_float(opportunity.get("score"))
+    flow_score = safe_float(opportunity.get("flow_score"))
+    freshness = str(opportunity.get("flow_freshness") or "")
+    source_quality = str(opportunity.get("flow_source_quality") or "")
+    signal_age_minutes = opportunity.get("signal_age_minutes")
+    aligned = bool(opportunity.get("strategy_alignment_flag"))
+    risky = bool(opportunity.get("risk_flag"))
+    if (
+        score is not None and score >= 8.0
+        and flow_score is not None and flow_score >= 8.0
+        and freshness == "FRESH"
+        and source_quality == "HIGH"
+        and aligned
+        and not risky
+    ):
+        return "HIGH PROBABILITY"
+    if score is not None and score >= 7.0 and not risky and (
+        flow_score is None or flow_score >= 4.0 or signal_age_minutes is not None and signal_age_minutes <= 90
+    ):
+        return "GOOD SETUP"
+    if risky or freshness == "STALE" or source_quality == "LOW":
+        return "LOW QUALITY"
+    return "WATCHLIST"
+
+
+def derive_risk_flag(opportunity: dict) -> str | None:
+    bias = str(opportunity.get("bias") or "")
+    divergence = str(opportunity.get("flow_divergence") or "")
+    verdict = str(opportunity.get("flow_verdict") or "")
+    freshness = str(opportunity.get("flow_freshness") or "")
+    source_quality = str(opportunity.get("flow_source_quality") or "")
+    signal_age_minutes = opportunity.get("signal_age_minutes")
+    rvol = safe_float(opportunity.get("rvol"))
+    if "Distribution risk" in verdict or divergence not in {"", "—"}:
+        return "FLOW DIVERGENCE"
+    if bias == "CAUTION" or (rvol is not None and rvol >= 2.5):
+        return "RISKY / VOLATILE"
+    if freshness == "STALE" or source_quality == "LOW" or (signal_age_minutes is not None and signal_age_minutes >= 360):
+        return "STALE / LOW INFO"
+    return None
+
+
+def derive_reason_text(opportunity: dict) -> str:
+    fragments: list[str] = []
+    score = safe_float(opportunity.get("score"))
+    if score is not None:
+        fragments.append(f"discovery score {score:.1f}")
+    signal_type = opportunity.get("signal_type")
+    signal_age_minutes = opportunity.get("signal_age_minutes")
+    if signal_type and signal_age_minutes is not None:
+        fragments.append(f"{str(signal_type).replace('_', ' ')} {signal_age_minutes}m ago")
+    elif signal_type:
+        fragments.append(str(signal_type).replace("_", " "))
+    flow_verdict = str(opportunity.get("flow_verdict") or "")
+    if flow_verdict and flow_verdict != "Mixed":
+        fragments.append(flow_verdict.lower())
+    elif safe_float(opportunity.get("flow_score")) is not None:
+        fragments.append(f"flow score {float(opportunity['flow_score']):.1f}")
+    if opportunity.get("strategy_alignment_flag"):
+        fragments.append("approved by current strategy list")
+    return ", ".join(fragments[:4]).capitalize() if fragments else "Supported by current discovery context."
+
+
+def derive_opportunity_tags(opportunity: dict) -> list[tuple[str, str]]:
+    tags: list[tuple[str, str]] = []
+    quality_label = str(opportunity.get("quality_label") or "")
+    if quality_label == "HIGH PROBABILITY":
+        tags.append((quality_label, "good"))
+    elif quality_label == "GOOD SETUP":
+        tags.append((quality_label, "neutral"))
+    elif quality_label == "LOW QUALITY":
+        tags.append((quality_label, "bad"))
+
+    if opportunity.get("strategy_alignment_flag"):
+        tags.append((str(opportunity["strategy_alignment_flag"]), "good"))
+
+    signal_age_minutes = opportunity.get("signal_age_minutes")
+    if signal_age_minutes is not None and signal_age_minutes <= 90:
+        tags.append(("FRESH SIGNAL", "good"))
+
+    flow_score = safe_float(opportunity.get("flow_score"))
+    if flow_score is not None and flow_score >= 8.0:
+        tags.append(("MOMENTUM", "good"))
+
+    risk_flag = opportunity.get("risk_flag")
+    if risk_flag:
+        tags.append((str(risk_flag), "bad" if "DIVERGENCE" in str(risk_flag) else "warn"))
+    return tags[:4]
+
+
+@st.cache_data(show_spinner=False)
+def build_top_opportunities(
+    snapshot_records: tuple[tuple, ...],
+    snapshot_columns: tuple[str, ...],
+    flow_records: tuple[tuple, ...],
+    flow_columns: tuple[str, ...],
+    signal_records: tuple[tuple, ...],
+    signal_columns: tuple[str, ...],
+    approved_buy: tuple[str, ...],
+    approved_sell: tuple[str, ...],
+    limit: int = 6,
+) -> pd.DataFrame:
+    if not snapshot_records:
+        return pd.DataFrame()
+
+    snapshot_df = pd.DataFrame(snapshot_records, columns=list(snapshot_columns))
+    if snapshot_df.empty or "symbol" not in snapshot_df.columns:
+        return pd.DataFrame()
+    snapshot_df["symbol"] = snapshot_df["symbol"].astype(str).str.upper()
+
+    flow_lookup: dict[str, dict] = {}
+    if flow_records:
+        flow_df = pd.DataFrame(flow_records, columns=list(flow_columns))
+        if not flow_df.empty and "symbol" in flow_df.columns:
+            flow_df["symbol"] = flow_df["symbol"].astype(str).str.upper()
+            flow_lookup = flow_df.set_index("symbol").to_dict(orient="index")
+
+    signal_lookup = build_signal_recency_lookup(signal_records, signal_columns)
+    approved_map = {"buy": list(approved_buy), "sell": list(approved_sell)}
+    opportunities: list[dict] = []
+
+    for _, row in snapshot_df.iterrows():
+        symbol = str(row.get("symbol", "")).upper()
+        if not symbol:
+            continue
+        flow_row = flow_lookup.get(symbol, {})
+        signal_meta = signal_lookup.get(symbol, {})
+        bias = str(row.get("bias", "") or "").upper()
+        score = safe_float(row.get("score"))
+        rvol = safe_float(row.get("rvol"))
+        signal_age_minutes = signal_meta.get("age_minutes")
+        strategy_alignment_flag = derive_strategy_alignment_flag(bias, symbol, approved_map)
+        opportunity = {
+            "symbol": symbol,
+            "bias": bias,
+            "setup_type": derive_setup_type(row, signal_meta),
+            "score": score,
+            "rvol": rvol,
+            "signal_type": signal_meta.get("signal_type") or row.get("signal_type"),
+            "signal_timestamp": signal_meta.get("timestamp"),
+            "signal_age_minutes": signal_age_minutes,
+            "snapshot_change_pct": safe_float(row.get("change_pct")),
+            "flow_score": safe_float(flow_row.get("derived_flow_score")),
+            "flow_verdict": flow_row.get("verdict_final_audit_verdict"),
+            "flow_divergence": flow_row.get("verdict_divergence_flag"),
+            "flow_etf_confirmation": flow_row.get("verdict_etf_confirmation_flag"),
+            "flow_freshness": flow_row.get("observed_freshness_flag"),
+            "flow_source_quality": flow_row.get("observed_source_quality_flag"),
+            "strategy_alignment_flag": strategy_alignment_flag,
+        }
+        opportunity["risk_flag"] = derive_risk_flag(opportunity)
+        opportunity["quality_label"] = derive_quality_label(opportunity)
+        opportunity["reason_text"] = derive_reason_text(opportunity)
+        opportunity["tags"] = derive_opportunity_tags(opportunity)
+
+        ranking_score = (score or 0.0) * 1.6
+        flow_score = opportunity["flow_score"]
+        if flow_score is not None:
+            ranking_score += flow_score * 0.9
+        if rvol is not None:
+            ranking_score += min(max(rvol - 1.0, 0.0), 2.0) * 2.5
+        # Ranking stays explainable: reward strong discovery score, fresh signals,
+        # flow confirmation, and approved-list alignment; penalize stale or risky rows.
+        if signal_age_minutes is not None:
+            if signal_age_minutes <= 30:
+                ranking_score += 6.0
+            elif signal_age_minutes <= 120:
+                ranking_score += 3.0
+            elif signal_age_minutes >= 360:
+                ranking_score -= 4.0
+        if opportunity["flow_freshness"] == "FRESH":
+            ranking_score += 4.0
+        elif opportunity["flow_freshness"] == "STALE":
+            ranking_score -= 5.0
+        if opportunity["flow_source_quality"] == "HIGH":
+            ranking_score += 3.0
+        elif opportunity["flow_source_quality"] == "LOW":
+            ranking_score -= 3.0
+        if opportunity["flow_etf_confirmation"] == "CONFIRMED":
+            ranking_score += 2.0
+        elif opportunity["flow_etf_confirmation"] == "CONFLICT":
+            ranking_score -= 2.0
+        if strategy_alignment_flag:
+            ranking_score += 5.0
+        if "STRONG" in str(opportunity["signal_type"]).upper() or "ABSORPTION" in str(opportunity["signal_type"]).upper():
+            ranking_score += 2.0
+        if opportunity["risk_flag"]:
+            ranking_score -= 6.0 if "DIVERGENCE" in opportunity["risk_flag"] else 3.5
+        if bias == "CAUTION":
+            ranking_score -= 3.0
+
+        opportunity["ranking_score"] = round(ranking_score, 2)
+        opportunities.append(opportunity)
+
+    if not opportunities:
+        return pd.DataFrame()
+
+    ranked = pd.DataFrame(opportunities)
+    ranked = ranked.sort_values(
+        by=["ranking_score", "score", "flow_score"],
+        ascending=[False, False, False],
+        na_position="last",
+    ).head(int(limit))
+    return ranked.reset_index(drop=True)
+
+
+def render_decision_card(opportunity: dict, rank: int) -> None:
+    score = "—" if opportunity.get("score") is None else f"{float(opportunity['score']):.1f}"
+    recency = "No recent signal timestamp"
+    _age = opportunity.get("signal_age_minutes")
+    if _age is not None and pd.notna(_age):
+        recency = f"Signal age {int(_age)}m"
+    elif opportunity.get("flow_freshness"):
+        recency = f"Flow {opportunity['flow_freshness']}"
+    risk_flag = opportunity.get("risk_flag") or "CLEAR"
+    strategy_flag = opportunity.get("strategy_alignment_flag") or "NOT FLAGGED"
+    tags = "".join(
+        f'<span class="decision-chip decision-chip-{tone}">{label}</span>'
+        for label, tone in opportunity.get("tags", [])
+    )
+    st.markdown(
+        f'<div class="decision-card">'
+        f'<div class="decision-head">'
+        f'<div><div class="decision-symbol">#{rank} {opportunity.get("symbol", "—")}</div>'
+        f'<div class="decision-setup">{opportunity.get("setup_type", "—")}</div></div>'
+        f'<div class="decision-score">SCORE {score}</div>'
+        f'</div>'
+        f'<div class="decision-meta">Recency: {recency}<br>'
+        f'Quality: {opportunity.get("quality_label", "—")}<br>'
+        f'Strategy: {strategy_flag}<br>'
+        f'Risk: {risk_flag}</div>'
+        f'<div class="decision-reason">{opportunity.get("reason_text", "—")}</div>'
+        f'<div style="margin-top:0.7rem;">{tags}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def render_timed_dataframe(timer: RenderTimer, df: pd.DataFrame, **kwargs) -> None:
@@ -1191,6 +1561,19 @@ if not flow_audit_df.empty:
     )
 else:
     flow_audit_df = pd.DataFrame()
+top_opportunities_df = perf.measure(
+    "dataframe_transform",
+    build_top_opportunities,
+    tuple(market_snapshot_rows.itertuples(index=False, name=None)) if not market_snapshot_rows.empty else (),
+    tuple(market_snapshot_rows.columns) if not market_snapshot_rows.empty else (),
+    tuple(flow_audit_df.itertuples(index=False, name=None)) if not flow_audit_df.empty else (),
+    tuple(flow_audit_df.columns) if not flow_audit_df.empty else (),
+    tuple(recent_signals.itertuples(index=False, name=None)) if not recent_signals.empty else (),
+    tuple(recent_signals.columns) if not recent_signals.empty else (),
+    tuple(str(symbol).upper() for symbol in approved.get("buy", [])) if isinstance(approved, dict) else (),
+    tuple(str(symbol).upper() for symbol in approved.get("sell", [])) if isinstance(approved, dict) else (),
+    6,
+)
 
 now_cst = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S CST")
 final_regime = market_context.get("final_regime") or snapshot.get("regime") or "UNKNOWN"
@@ -1517,6 +1900,23 @@ with tabs[3]:
             f'Log: {MARKET_SNAPSHOT_LOG}</div></div>',
             unsafe_allow_html=True,
         )
+
+    st.markdown('<p class="section-header">Decision Layer</p>', unsafe_allow_html=True)
+    if top_opportunities_df.empty:
+        st.info("No ranked opportunities available from the current discovery snapshot.")
+    else:
+        lead = top_opportunities_df.iloc[0].to_dict()
+        lead_strategy_flag = lead.get("strategy_alignment_flag") or "not strategy-flagged"
+        lead_risk_flag = lead.get("risk_flag") or "no immediate risk flag"
+        render_banner(
+            f"Top opportunity now: {lead.get('symbol', '—')} | {lead.get('quality_label', '—')} | "
+            f"{lead.get('reason_text', '—')} | {lead_strategy_flag} | {lead_risk_flag}",
+            "good" if str(lead.get("quality_label")) != "LOW QUALITY" else "warn",
+        )
+        decision_cols = st.columns(2)
+        for index, (_, row) in enumerate(top_opportunities_df.iterrows()):
+            with decision_cols[index % 2]:
+                render_decision_card(row.to_dict(), index + 1)
 
     left, right = st.columns([3, 2])
     with left:
