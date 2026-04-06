@@ -1439,7 +1439,22 @@ def hydrate_pending_closes_from_trade_log(trading_client, open_positions):
         broker_position = open_by_symbol.get(symbol)
 
         if not exit_order_id:
-            continue
+            # On restart with no stored exit_order_id, probe the broker for an
+            # active close order and persist it so future restarts can track it.
+            if broker_position is not None and abs(position_qty(broker_position)) > 0.0:
+                order, status, _ = find_active_close_order(
+                    trading_client, symbol, position=broker_position
+                )
+                recovered_id = extract_order_id(order)
+                if recovered_id:
+                    update_trade_exit_order_id(symbol, recovered_id)
+                    exit_order_id = recovered_id
+                    log_line(
+                        f"🔍 RECOVERED EXIT ORDER {symbol}: stored order_id={recovered_id} "
+                        f"(status={status}) after restart with no persisted exit_order_id"
+                    )
+            if not exit_order_id:
+                continue
 
         if broker_position is None or abs(position_qty(broker_position)) <= 0.0:
             log_line(f"✅ POSITION GONE AT BROKER {symbol}: marking closed")
