@@ -11,8 +11,10 @@ import pytz
 import yfinance as yf
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest, CryptoLatestQuoteRequest
 from Symbol_hunter import classify_sector
 from market_context import (
     get_market_context,
@@ -2088,16 +2090,59 @@ def parse_signal_timestamp(signal_ts: str | None) -> datetime | None:
 
 
 def fetch_live_validation_price(symbol: str) -> tuple[float | None, str | None]:
-    if get_alpaca_latest_price is None:
-        return None, None
+    """
+    Fetch a real-time quote via yfinance to validate signals.
+    This bypasses Alpaca's 15-minute delay on the free plan.
+    """
     try:
-        live_price = get_alpaca_latest_price(symbol)
-        if live_price is None:
-            return None, None
-        return float(live_price), "alpaca_latest_trade"
-    except Exception as e:
-        log_line(f"⚠️ Live price validation failed for {symbol}: {e}")
+        # Translate Alpaca symbol format (BTC/USD) back to Yahoo (BTC-USD)
+        yahoo_symbol = symbol.replace("/", "-").upper()
+        ticker = yf.Ticker(yahoo_symbol)
+
+        # Try to use fast_info if available (yfinance >= 0.2.0)
+        if hasattr(ticker, "fast_info"):
+            price = ticker.fast_info.get("last_price")
+            if price:
+                return float(price), "yfinance_fast"
+
+        # Fallback to history (latest 1m bar)
+        history = ticker.history(period="1d", interval="1m")
+        if not history.empty:
+            price = history["Close"].iloc[-1]
+            return float(price), "yfinance_history_1m"
+
         return None, None
+    except Exception as e:
+        log_line(f"⚠️ Live price validation failed for {symbol} via yfinance: {e}")
+        return None, None
+
+
+stock_data_client = None
+crypto_data_client = None
+
+
+def get_latest_quote(symbol: str, is_crypto: bool) -> tuple[float | None, float | None]:
+    global stock_data_client, crypto_data_client
+    try:
+        if is_crypto:
+            if crypto_data_client is None:
+                crypto_data_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY)
+            req = CryptoLatestQuoteRequest(symbol_or_symbols=[symbol])
+            res = crypto_data_client.get_crypto_latest_quote(req)
+            quote = res.get(symbol)
+            if quote:
+                return float(quote.bid_price), float(quote.ask_price)
+        else:
+            if stock_data_client is None:
+                stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+            req = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+            res = stock_data_client.get_stock_latest_quote(req)
+            quote = res.get(symbol)
+            if quote:
+                return float(quote.bid_price), float(quote.ask_price)
+    except Exception as e:
+        log_line(f"⚠️ Quote fetch failed for {symbol}: {e}")
+    return None, None
 
 
 def validate_entry_signal(symbol: str, direction: str, signal_price: float,
@@ -2390,7 +2435,17 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
         return
 
     try:
-        log_line(f"🚀 SNIPING {alpaca_symbol} {direction} @ ~${float(price):.2f} | {signal}"
+        bid, ask = get_latest_quote(alpaca_symbol, is_crypto)
+        if ask is None:
+            log_line(f"⚠️ Could not fetch quote for {alpaca_symbol}; falling back to signal price for limit")
+            limit_price = float(price) * (1.001 if side == OrderSide.BUY else 0.999)
+        else:
+            if side == OrderSide.BUY:
+                limit_price = ask * 1.001
+            else:
+                limit_price = (bid if bid is not None else ask) * 0.999
+
+        log_line(f"🚀 SNIPING {alpaca_symbol} {direction} @ Limit ${limit_price:.4f} (signal ~${float(price):.2f}) | {signal}"
                  + (
                      f" | conf={confidence_value if confidence_value is not None else 'n/a'}"
                      f" conf_mult={confidence_multiplier:.2f}x"
@@ -2404,22 +2459,19 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
                      f" sector_gross=${current_sector_gross:.2f}->{proposed_sector_gross:.2f}"
                      f" gross=${current_gross_exposure:.2f}->{proposed_gross_exposure:.2f}"
                  ))
-        if side == OrderSide.SELL:
-            qty = int(size_plan["final_shares"])
-            order = client.submit_order(MarketOrderRequest(
-                symbol=alpaca_symbol,
-                qty=qty,
-                side=side,
-                time_in_force=tif,
-            ))
-        else:
-            order = client.submit_order(MarketOrderRequest(
-                symbol=alpaca_symbol,
-                notional=float(size_plan["final_notional"]),
-                side=side,
-                time_in_force=tif,
-            ))
-        log_line(f"✅ ORDER SENT: {alpaca_symbol} ${size_plan['final_notional']:.2f} {direction} "
+
+        qty = size_plan["final_shares"]
+        if side == OrderSide.SELL and not is_crypto:
+            qty = int(qty)
+
+        order = client.submit_order(LimitOrderRequest(
+            symbol=alpaca_symbol,
+            qty=qty,
+            limit_price=round(limit_price, 4),
+            side=side,
+            time_in_force=tif,
+        ))
+        log_line(f"✅ ORDER SENT: {alpaca_symbol} {qty} units @ ${limit_price:.4f} {direction} "
                  f"(order_id={order.id})")
         entry_order_id = extract_order_id(order)
         if signal_key:
