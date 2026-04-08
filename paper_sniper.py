@@ -19,8 +19,9 @@ from alpaca.trading.requests import MarketOrderRequest
 load_dotenv("/home/theplummer92/.env")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-PAPER_KEY = os.getenv("APCA_PAPER_KEY_ID")
-PAPER_SECRET = os.getenv("APCA_PAPER_SECRET_KEY")
+# Use dedicated wild-experiment account keys if configured, else fall back to standard paper keys
+PAPER_KEY = os.getenv("APCA_WILD_PAPER_KEY_ID") or os.getenv("APCA_PAPER_KEY_ID")
+PAPER_SECRET = os.getenv("APCA_WILD_PAPER_SECRET_KEY") or os.getenv("APCA_PAPER_SECRET_KEY")
 PAPER_URL = os.getenv("APCA_PAPER_BASE_URL", "https://paper-api.alpaca.markets")
 
 TRADE_NOTIONAL = 500.0

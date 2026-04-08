@@ -1182,6 +1182,54 @@ def get_order_snapshot(client, order_id: str):
         return None, None, None
 
 
+def fetch_fill_price_from_broker(trading_client, symbol: str, exit_order_id=None, open_trade=None):
+    """
+    Attempt to recover the actual fill price for a closed position from Alpaca order history.
+    Returns (fill_price, price_source) or (None, None) if not found.
+
+    Strategy:
+    1. If we have an exit_order_id, fetch that order directly.
+    2. Otherwise, scan recent closed orders for the symbol and find a filled
+       order on the expected close side (sell for LONG, buy for SHORT).
+    """
+    # Strategy 1: direct order lookup
+    if exit_order_id:
+        try:
+            _, status, fill_price = get_order_snapshot(trading_client, str(exit_order_id))
+            if fill_price is not None:
+                return fill_price, "order_fill"
+        except Exception:
+            pass
+
+    # Strategy 2: scan recent closed orders for a matching fill
+    try:
+        direction = str(open_trade["direction"]).upper() if open_trade is not None else None
+        expected_close_side = "sell" if direction == "LONG" else ("buy" if direction == "SHORT" else None)
+        orders = trading_client.get_orders(
+            filter=GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                symbols=[str(symbol).upper()],
+                limit=10,
+            )
+        )
+        for order in orders or []:
+            if str(getattr(order, "symbol", "")).upper() != str(symbol).upper():
+                continue
+            order_status = str(getattr(order, "status", "")).lower()
+            if order_status != "filled":
+                continue
+            order_side = str(getattr(order, "side", "")).lower()
+            if expected_close_side and order_side != expected_close_side:
+                continue
+            fill_price = getattr(order, "filled_avg_price", None)
+            if fill_price is not None:
+                return float(fill_price), "order_history_fill"
+    except Exception as e:
+        log_line(f"⚠️ fetch_fill_price_from_broker {symbol}: could not scan order history: {e}")
+
+    return None, None
+
+
 def safe_float(value, default=None):
     try:
         if value is None:
@@ -1491,27 +1539,36 @@ def hydrate_pending_closes_from_trade_log(trading_client, open_positions):
                 # between restarts. Mark closed now to prevent the trade staying stuck
                 # open in DB indefinitely (root cause of the CLOSE STATUS UNKNOWN bug).
                 if broker_position is None or abs(position_qty(broker_position)) <= 0.0:
+                    fill_price, price_source = fetch_fill_price_from_broker(
+                        trading_client, symbol, open_trade=trade
+                    )
                     log_line(
                         f"✅ RECONCILED CLOSED {symbol}: position gone at broker, "
-                        f"no exit_order_id persisted — marking closed (fill price unknown)"
+                        f"no exit_order_id persisted — fill={'${:.4f}'.format(fill_price) if fill_price else 'unknown'}"
                     )
                     log_trade_close(
-                        symbol, None, "closed",
-                        fill_confirmed=False,
-                        price_source="reconciliation_no_exit_id",
+                        symbol, fill_price, "closed",
+                        fill_confirmed=(fill_price is not None),
+                        price_source=price_source or "reconciliation_no_exit_id",
                     )
                 continue
 
         if broker_position is None or abs(position_qty(broker_position)) <= 0.0:
-            log_line(f"✅ POSITION GONE AT BROKER {symbol}: marking closed")
+            fill_price, price_source = fetch_fill_price_from_broker(
+                trading_client, symbol, exit_order_id=exit_order_id, open_trade=trade
+            )
+            log_line(
+                f"✅ POSITION GONE AT BROKER {symbol}: marking closed"
+                + (f" @ ${fill_price:.4f}" if fill_price else " (fill price unknown)")
+            )
             log_trade_close(
                 symbol,
-                None,
+                fill_price,
                 "closed",
                 exit_order_id=exit_order_id,
                 exit_decision_price=decision_price,
-                fill_confirmed=False,
-                price_source="reconciliation",
+                fill_confirmed=(fill_price is not None),
+                price_source=price_source or "reconciliation",
             )
             continue
 
@@ -1549,15 +1606,22 @@ def reconcile_pending_closes(trading_client, open_positions):
         broker_position = open_by_symbol.get(symbol)
 
         if broker_position is None or abs(position_qty(broker_position)) <= 0.0:
-            log_line(f"✅ POSITION GONE AT BROKER {symbol}: marking closed")
+            open_trade = get_open_trade(symbol)
+            fill_price, price_source = fetch_fill_price_from_broker(
+                trading_client, symbol, exit_order_id=order_id, open_trade=open_trade
+            )
+            log_line(
+                f"✅ POSITION GONE AT BROKER {symbol}: marking closed"
+                + (f" @ ${fill_price:.4f}" if fill_price else " (fill price unknown)")
+            )
             log_trade_close(
                 symbol,
-                None,
+                fill_price,
                 outcome,
                 exit_order_id=order_id,
                 exit_decision_price=state.get("decision_price"),
-                fill_confirmed=False,
-                price_source="reconciliation",
+                fill_confirmed=(fill_price is not None),
+                price_source=price_source or "reconciliation",
             )
             _pending_closes.pop(symbol, None)
             continue
@@ -2102,6 +2166,43 @@ def eod_risk_management(trading_client):
                     f"✅ EOD force-close orders submitted for {len(positions)} position(s). "
                     f"No overnight holds."
                 )
+
+                # Verification pass — wait 30s then retry anything still open
+                log_line("⏳ EOD FORCE CLOSE: waiting 30s to verify all positions closed...")
+                time.sleep(30)
+                try:
+                    remaining = trading_client.get_all_positions()
+                    if remaining:
+                        log_line(
+                            f"⚠️ EOD FORCE CLOSE RETRY: {len(remaining)} position(s) still open after 30s — retrying"
+                        )
+                        post_discord(
+                            f"⚠️ EOD RETRY: {len(remaining)} position(s) still open after 30s — re-submitting closes"
+                        )
+                        for p in remaining:
+                            sym = p.symbol
+                            side = "SHORT" if float(p.qty) < 0 else "LONG"
+                            log_line(f"🔴 EOD FORCE CLOSE RETRY {sym} {side}")
+                            try:
+                                current_price = float(getattr(p, "current_price"))
+                            except Exception:
+                                current_price = None
+                            submit_close_attempt(
+                                trading_client, sym, "eod_force_close", decision_price=current_price
+                            )
+                        # Final check after another 30s
+                        time.sleep(30)
+                        still_open = trading_client.get_all_positions()
+                        if still_open:
+                            syms = ", ".join(p.symbol for p in still_open)
+                            log_line(f"🚨 EOD FORCE CLOSE FAILED: {syms} still open after retry — manual intervention required")
+                            post_discord(f"🚨 EOD CLOSE FAILED after retry: {syms} still open. Manual intervention required!")
+                        else:
+                            log_line("✅ EOD FORCE CLOSE: all positions confirmed closed after retry")
+                    else:
+                        log_line("✅ EOD FORCE CLOSE: all positions confirmed closed")
+                except Exception as e:
+                    log_line(f"⚠️ EOD force-close verification error: {e}")
             else:
                 log_line("✅ EOD FORCE CLOSE (3:45pm): no open positions — already flat")
         except Exception as e:
