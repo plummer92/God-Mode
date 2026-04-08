@@ -98,6 +98,8 @@ _daily_risk_state_loaded = False
 _last_final_regime = None
 _no_reentry_today: set = set()
 _no_reentry_date: str = ""
+_eod_cutdown_done_date: str = ""   # date when 3:30pm pre-close cut ran
+_eod_close_done_date: str = ""     # date when 3:45pm forced close ran
 _pending_closes: dict = {}
 _halt_mode = False
 _halt_mode_date = None
@@ -2021,6 +2023,92 @@ def manage_positions(trading_client):
         log_line(f"⚠️ Position management error: {e}")
 
 
+# -------------------- END-OF-DAY RISK RULES --------------------
+EOD_CUTDOWN_HOUR = 15    # 3:30pm ET — cut losers > 1% before close
+EOD_CUTDOWN_MINUTE = 30
+EOD_CLOSE_HOUR = 15      # 3:45pm ET — force-close ALL positions
+EOD_CLOSE_MINUTE = 45
+EOD_PRECLOSE_LOSS_PCT = -0.01  # -1% threshold for 3:30 rule
+
+
+def eod_risk_management(trading_client):
+    """
+    Two end-of-day safety rules:
+      1. 3:30pm ET: close any position down more than 1% unrealized (pre-close cut).
+      2. 3:45pm ET: close ALL remaining open positions (force close — no overnight holds).
+    Each rule fires at most once per calendar day.
+    """
+    global _eod_cutdown_done_date, _eod_close_done_date
+
+    now_et = datetime.now(et_tz)
+    if now_et.weekday() >= 5:
+        return  # weekend — market closed
+
+    today_str = now_et.strftime("%Y-%m-%d")
+
+    cutdown_time = now_et.replace(hour=EOD_CUTDOWN_HOUR, minute=EOD_CUTDOWN_MINUTE, second=0, microsecond=0)
+    close_time   = now_et.replace(hour=EOD_CLOSE_HOUR,   minute=EOD_CLOSE_MINUTE,   second=0, microsecond=0)
+
+    # Rule 1 — 3:30pm: cut losers > 1%
+    if now_et >= cutdown_time and _eod_cutdown_done_date != today_str:
+        try:
+            positions = trading_client.get_all_positions()
+            losers = [p for p in positions if float(p.unrealized_plpc) < EOD_PRECLOSE_LOSS_PCT]
+            if losers:
+                msg = (
+                    f"⚠️ **EOD PRE-CLOSE CUT** (3:30pm rule) — closing {len(losers)} loser(s) "
+                    f"down >{abs(EOD_PRECLOSE_LOSS_PCT):.0%} before the bell"
+                )
+                log_line(msg)
+                post_discord(msg)
+                for p in losers:
+                    sym = p.symbol
+                    pnl_pct = float(p.unrealized_plpc)
+                    side = "SHORT" if float(p.qty) < 0 else "LONG"
+                    log_line(f"🔔 EOD CUT {sym} {side} {pnl_pct:.2%} — closing before 3:45pm forced exit")
+                    try:
+                        current_price = float(getattr(p, "current_price"))
+                    except Exception:
+                        current_price = None
+                    submit_close_attempt(trading_client, sym, "eod_preclose_cut", decision_price=current_price)
+            else:
+                log_line("✅ EOD PRE-CLOSE CHECK (3:30pm): no positions down >1% — nothing to cut")
+        except Exception as e:
+            log_line(f"⚠️ EOD pre-close cut error: {e}")
+        _eod_cutdown_done_date = today_str
+
+    # Rule 2 — 3:45pm: force-close everything
+    if now_et >= close_time and _eod_close_done_date != today_str:
+        try:
+            positions = trading_client.get_all_positions()
+            if positions:
+                msg = (
+                    f"🔴 **EOD FORCE CLOSE** (3:45pm rule) — closing ALL {len(positions)} position(s) "
+                    f"to avoid overnight risk"
+                )
+                log_line(msg)
+                post_discord(msg)
+                for p in positions:
+                    sym = p.symbol
+                    pnl_pct = float(p.unrealized_plpc)
+                    side = "SHORT" if float(p.qty) < 0 else "LONG"
+                    log_line(f"🔴 EOD FORCE CLOSE {sym} {side} {pnl_pct:.2%}")
+                    try:
+                        current_price = float(getattr(p, "current_price"))
+                    except Exception:
+                        current_price = None
+                    submit_close_attempt(trading_client, sym, "eod_force_close", decision_price=current_price)
+                post_discord(
+                    f"✅ EOD force-close orders submitted for {len(positions)} position(s). "
+                    f"No overnight holds."
+                )
+            else:
+                log_line("✅ EOD FORCE CLOSE (3:45pm): no open positions — already flat")
+        except Exception as e:
+            log_line(f"⚠️ EOD force-close error: {e}")
+        _eod_close_done_date = today_str
+
+
 # -------------------- SIGNALS --------------------
 def get_new_signals(last_check_ts: str):
     conn = None
@@ -2724,6 +2812,9 @@ def run():
 
             # Position management runs every cycle regardless of regime
             manage_positions(t_client)
+
+            # End-of-day risk rules: 3:30pm cut losers, 3:45pm force-close all
+            eod_risk_management(t_client)
 
             # Daily loss halt gate comes before signal evaluation.
             if not check_daily_loss_limit(t_client):
