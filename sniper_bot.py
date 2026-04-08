@@ -1110,12 +1110,11 @@ def build_position_size_plan(symbol: str, direction: str, is_crypto: bool,
         short_rounding_changed = final_shares < raw_candidate_shares
         final_notional = final_shares * price
         if final_shares < 1:
-            one_share_too_expensive = price > intended_notional or risk_candidate_shares < 1.0
-            skip_reason = (
-                "1 share exceeds short sizing guardrails"
-                if one_share_too_expensive
-                else "short sizing resolved below 1 share"
-            )
+            # For shorts using whole shares, minimum is always 1 share — never block
+            # just because 1 share exceeds the base notional (e.g. IWM at $251 > $20 notional).
+            final_shares = 1.0
+            final_notional = price
+            short_rounding_changed = True
     else:
         final_shares = raw_candidate_shares
         final_notional = min(intended_notional, risk_based_notional)
@@ -1348,6 +1347,33 @@ def submit_close_attempt(trading_client, symbol: str, outcome: str, decision_pri
     except Exception as e:
         log_line(f"⚠️ Could not refresh broker position for {symbol} before close submit: {e}")
 
+    # Fix: before submitting a new close, check Alpaca for an existing open close
+    # order. After a restart where exit_order_id wasn't persisted, _pending_closes
+    # is empty but a close order may already be working. Submitting a second one
+    # would create a duplicate — check first.
+    if broker_position is not None and abs(position_qty(broker_position)) > 0.0:
+        pre_check_order, pre_check_status, _ = find_active_close_order(
+            trading_client, symbol, position=broker_position,
+            preferred_order_id=preferred_order_id,
+        )
+        if pre_check_order is not None and pre_check_status in PENDING_CLOSE_ORDER_STATUSES:
+            existing_id = extract_order_id(pre_check_order)
+            if existing_id:
+                update_trade_exit_order_id(symbol, existing_id)
+            _pending_closes[symbol] = build_pending_close_state(
+                symbol, outcome,
+                decision_price=decision_price,
+                order_id=existing_id,
+                submitted_at=order_submitted_ts(pre_check_order) or now,
+                retry_after=now + CLOSE_RETRY_COOLDOWN_S,
+                last_log_ts=0,
+            )
+            log_line(
+                f"⏳ CLOSE GUARDED {symbol}: existing {pre_check_status} close order "
+                f"{existing_id} already working — tracking instead of re-submitting"
+            )
+            return
+
     try:
         close_resp = trading_client.delete(
             f"/positions/{symbol}",
@@ -1357,6 +1383,10 @@ def submit_close_attempt(trading_client, symbol: str, outcome: str, decision_pri
             },
         )
         exit_order_id = extract_order_id(close_resp)
+        # Persist exit_order_id IMMEDIATELY — before any further processing so a
+        # restart between submit and the rest of this block cannot lose the ID.
+        if exit_order_id:
+            update_trade_exit_order_id(symbol, exit_order_id)
         update_trade_exit_decision(symbol, outcome, decision_price)
         if not exit_order_id:
             active_order, _, _ = find_active_close_order(
@@ -1366,6 +1396,8 @@ def submit_close_attempt(trading_client, symbol: str, outcome: str, decision_pri
                 preferred_order_id=preferred_order_id,
             )
             exit_order_id = extract_order_id(active_order)
+            if exit_order_id:
+                update_trade_exit_order_id(symbol, exit_order_id)
         _pending_closes[symbol] = build_pending_close_state(
             symbol,
             outcome,
@@ -1377,7 +1409,6 @@ def submit_close_attempt(trading_client, symbol: str, outcome: str, decision_pri
             last_log_ts=now,
         )
         if exit_order_id:
-            update_trade_exit_order_id(symbol, exit_order_id)
             log_line(f"📤 CLOSE SUBMITTED {symbol} ({outcome}) order_id={exit_order_id}")
         else:
             log_line(f"📤 CLOSE SUBMITTED {symbol} ({outcome}) with no order id returned")
@@ -1454,6 +1485,19 @@ def hydrate_pending_closes_from_trade_log(trading_client, open_positions):
                         f"(status={status}) after restart with no persisted exit_order_id"
                     )
             if not exit_order_id:
+                # No exit_order_id recovered AND position is gone — the close filled
+                # between restarts. Mark closed now to prevent the trade staying stuck
+                # open in DB indefinitely (root cause of the CLOSE STATUS UNKNOWN bug).
+                if broker_position is None or abs(position_qty(broker_position)) <= 0.0:
+                    log_line(
+                        f"✅ RECONCILED CLOSED {symbol}: position gone at broker, "
+                        f"no exit_order_id persisted — marking closed (fill price unknown)"
+                    )
+                    log_trade_close(
+                        symbol, None, "closed",
+                        fill_confirmed=False,
+                        price_source="reconciliation_no_exit_id",
+                    )
                 continue
 
         if broker_position is None or abs(position_qty(broker_position)) <= 0.0:
@@ -1842,6 +1886,8 @@ def get_approved_symbols() -> dict:
                 "sell":             [s.upper() for s in data["sell"]],
                 "size_multipliers": {s.upper(): v for s, v in
                                      data.get("size_multipliers", {}).items()},
+                "sectors":          {s.upper(): v for s, v in
+                                     data.get("sectors", {}).items()},
             }
             _approved_symbols_mtime = current_mtime
             return _approved_symbols_cache
@@ -2276,6 +2322,44 @@ def get_fill_price(client, order_id: str, signal_price: float, symbol: str):
     return signal_price, False, "signal_estimate"
 
 
+# -------------------- SHORT RISK RULES --------------------
+BROAD_MARKET_ETFS = {"SPY", "QQQ", "IWM"}
+MAX_SECTOR_SHORTS = 2
+
+
+def _open_short_symbols(positions) -> set:
+    """Return the set of symbols currently held as shorts."""
+    return {p.symbol for p in positions if position_qty(p) < 0}
+
+
+def check_broad_market_short_limit(symbol: str, open_shorts: set) -> str | None:
+    """
+    Block if we already have a broad-market ETF short open and this symbol is
+    also a broad-market ETF.  SPY/QQQ/IWM are too correlated to hold > 1 at once.
+    Returns a block reason string, or None if OK to proceed.
+    """
+    if symbol not in BROAD_MARKET_ETFS:
+        return None
+    already_open = open_shorts & BROAD_MARKET_ETFS
+    if already_open:
+        return f"broad-market ETF short already open: {sorted(already_open)}"
+    return None
+
+
+def check_sector_short_limit(symbol: str, open_shorts: set, sectors: dict) -> str | None:
+    """
+    Block if there are already MAX_SECTOR_SHORTS open shorts in the same sector.
+    Returns a block reason string, or None if OK to proceed.
+    """
+    my_sector = sectors.get(symbol)
+    if not my_sector:
+        return None  # unknown sector — don't block
+    sector_count = sum(1 for s in open_shorts if sectors.get(s) == my_sector)
+    if sector_count >= MAX_SECTOR_SHORTS:
+        return f"sector concentration limit: {sector_count} open {my_sector} shorts"
+    return None
+
+
 # -------------------- TRADE EXECUTION --------------------
 def execute_entry(client, symbol: str, signal: str, price: float, confidence=None,
                   signal_key: str | None = None, signal_ts: str | None = None,
@@ -2357,6 +2441,23 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
         if should_log_skip(f"already-held:{alpaca_symbol}", interval_s=60):
             log_line(f"🛡️ SKIP {alpaca_symbol}: Already have an open position")
         return
+
+    # 4a. Short-specific concentration rules
+    if is_sell_signal:
+        open_shorts = _open_short_symbols(positions)
+        sectors = approved.get("sectors", {})
+
+        reason = check_broad_market_short_limit(alpaca_symbol, open_shorts)
+        if reason:
+            if should_log_skip(f"broad-etf-limit:{alpaca_symbol}", interval_s=60):
+                log_line(f"🚫 SKIP SHORT {alpaca_symbol}: {reason}")
+            return
+
+        reason = check_sector_short_limit(alpaca_symbol, open_shorts, sectors)
+        if reason:
+            if should_log_skip(f"sector-limit:{alpaca_symbol}", interval_s=60):
+                log_line(f"🚫 SKIP SHORT {alpaca_symbol}: {reason}")
+            return
 
     # 5. Max positions check
     if len(positions) >= MAX_OPEN_POSITIONS:
@@ -2453,12 +2554,12 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
         bid, ask = get_latest_quote(alpaca_symbol, is_crypto)
         if ask is None:
             log_line(f"⚠️ Could not fetch quote for {alpaca_symbol}; falling back to signal price for limit")
-            limit_price = float(price) * (1.001 if side == OrderSide.BUY else 0.999)
+            limit_price = round(float(price) * (1.001 if side == OrderSide.BUY else 0.999), 2)
         else:
             if side == OrderSide.BUY:
-                limit_price = ask * 1.001
+                limit_price = round(ask * 1.001, 2)
             else:
-                limit_price = (bid if bid is not None else ask) * 0.999
+                limit_price = round((bid if bid is not None else ask) * 0.999, 2)
 
         log_line(f"🚀 SNIPING {alpaca_symbol} {direction} @ Limit ${limit_price:.4f} (signal ~${float(price):.2f}) | {signal}"
                  + (
@@ -2482,7 +2583,7 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
         order = client.submit_order(LimitOrderRequest(
             symbol=alpaca_symbol,
             qty=qty,
-            limit_price=round(limit_price, 4),
+            limit_price=round(limit_price, 2),
             side=side,
             time_in_force=tif,
         ))
@@ -2552,7 +2653,22 @@ def run():
     load_daily_risk_state()
     t_client = get_client()
 
-    last_check = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+    # Startup reconciliation: immediately compare open DB trades against live Alpaca
+    # positions before entering the main loop. Prevents stuck positions after restarts
+    # where exit_order_id may not have been persisted.
+    try:
+        startup_positions = trading_client_positions(t_client)
+        hydrate_pending_closes_from_trade_log(t_client, startup_positions)
+        log_line(
+            f"🔍 STARTUP RECONCILE: {len(startup_positions)} Alpaca positions "
+            f"checked against open DB trades"
+        )
+    except Exception as _startup_reconcile_err:
+        log_line(f"⚠️ Startup reconciliation failed: {_startup_reconcile_err}")
+
+    # Look back 90 min on startup so signals fired during restarts are not missed.
+    # The processed_signals idempotency check prevents double-trading.
+    last_check = (datetime.utcnow() - timedelta(minutes=90)).strftime("%Y-%m-%d %H:%M:%S")
     last_hb = 0
 
     log_line(f"🦅 {BOT_VERSION} ACTIVE")
@@ -2638,10 +2754,11 @@ def run():
                         if should_log_skip(f"idempotent:{sym}:{direction}", interval_s=300):
                             log_line(f"SKIP IDEMPOTENT {sym} {direction} ({signal_key})")
                         continue
-                    dedup_key = (signal_ts[:13], sym, direction)  # one trade per hour per symbol per direction
+                    _min_bucket = (int(signal_ts[14:16]) // 15) * 15 if len(signal_ts) >= 16 else 0
+                    dedup_key = (f"{signal_ts[:13]}:{_min_bucket:02d}", sym, direction)  # one trade per 15 min per symbol per direction
                     if dedup_key in seen:
                         if should_log_skip(f"dupe:{sym}:{direction}", interval_s=300):
-                            log_line(f"SKIP DUPE {sym} {direction} (already acted on this hour)")
+                            log_line(f"SKIP DUPE {sym} {direction} (already acted on this 15-min window)")
                         continue
                     seen.add(dedup_key)
                     if regime_mode == "SELL_ONLY" and direction != "SHORT":
