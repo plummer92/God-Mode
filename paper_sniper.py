@@ -105,11 +105,12 @@ def parse_signal_timestamp(signal_ts: str):
     return None
 
 
-def parse_signal_direction(signal_text: str):
+def parse_signal_direction(signal_text: str, flow_m: float | None = None, change_pct: float | None = None):
     text = str(signal_text or "").upper()
     short_terms = (
         "ABSORPTION SELL",
         "STRONG SELL",
+        "BULL TRAP",
         "BEAR",
         "SELL",
         "SHORT",
@@ -117,6 +118,8 @@ def parse_signal_direction(signal_text: str):
     long_terms = (
         "ABSORPTION BUY",
         "STRONG BUY",
+        "BEAR TRAP",
+        "CLIMAX",
         "BULL",
         "BUY",
         "LONG",
@@ -129,6 +132,13 @@ def parse_signal_direction(signal_text: str):
         return "SHORT"
     if has_long:
         return "LONG"
+    if "ABSORPTION WALL" in text and flow_m is not None:
+        return "SHORT" if float(flow_m) > 0 else "LONG"
+    if "FAKE-OUT" in text and change_pct is not None:
+        if float(change_pct) > 0:
+            return "SHORT"
+        if float(change_pct) < 0:
+            return "LONG"
     return None
 
 
@@ -193,7 +203,7 @@ def get_new_signals(last_check):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT rowid, timestamp, symbol, signal_type, price
+            SELECT rowid, timestamp, symbol, signal_type, price, flow_m, change_pct
             FROM signals
             WHERE timestamp > ?
             ORDER BY timestamp ASC
@@ -389,8 +399,8 @@ def _run():
 
             signals = get_new_signals(last_check)
             if signals and can_open_new_positions_now():
-                for rowid, signal_ts, symbol, signal_type, price in signals:
-                    direction = parse_signal_direction(signal_type)
+                for rowid, signal_ts, symbol, signal_type, price, flow_m, change_pct in signals:
+                    direction = parse_signal_direction(signal_type, flow_m=flow_m, change_pct=change_pct)
                     if direction is None:
                         log(f"SKIP {symbol}: unknown direction for signal '{signal_type}'")
                         continue
