@@ -2498,7 +2498,15 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
             )
         return
 
-    # 3b. No re-entry after stop loss same day
+    # 3b. Short price cap — don't short stocks above $250 (blocks SPY/QQQ/IWM etc.)
+    MAX_SHORT_PRICE_USD = 250.0
+    if is_sell_signal and not is_crypto and price > MAX_SHORT_PRICE_USD:
+        log_line(
+            f"⛔ SKIP SHORT {alpaca_symbol}: price ${price:.2f} exceeds max short price ${MAX_SHORT_PRICE_USD:.0f}"
+        )
+        return
+
+    # 3c. No re-entry after stop loss same day
     global _no_reentry_today, _no_reentry_date
     today = str(date.today())
     if _no_reentry_date != today:
