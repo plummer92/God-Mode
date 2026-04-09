@@ -132,7 +132,16 @@ def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS leaderboard (
         rank INTEGER, symbol TEXT, signal_filter TEXT, rvol REAL,
         tp REAL, sl REAL, hold_hours INTEGER, n_trades INTEGER,
-        win_rate REAL, avg_return REAL, score REAL, updated_at TEXT)""")
+        win_rate REAL, avg_return REAL, score REAL, updated_at TEXT,
+        oos_win_rate REAL, oos_trades INTEGER, overfit INTEGER DEFAULT 0)""")
+    # Add walk-forward columns to existing DBs safely
+    for col, typedef in [("oos_win_rate", "REAL"), ("oos_trades", "INTEGER"),
+                         ("overfit", "INTEGER DEFAULT 0")]:
+        try:
+            cur.execute(f"ALTER TABLE leaderboard ADD COLUMN {col} {typedef}")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
     cur.execute("""CREATE TABLE IF NOT EXISTS discovery_ideas (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         discovered_at TEXT,
@@ -799,6 +808,8 @@ def compute_results(
     all_results = []
     evaluated_symbols = set()
     run_end = run_end or datetime.now(timezone.utc)
+    # Out-of-sample cutoff: signals in the last 14 days are held out for validation
+    oos_cutoff = (run_end - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
     for symbol in symbols:
         symbol_rows = 0
         for sf in signal_filters:
@@ -808,6 +819,9 @@ def compute_results(
                 if not sigs:
                     continue
                 sigs = _dedupe_signals(sigs)
+                # Split: in-sample = older than 14 days, OOS = last 14 days
+                is_sigs  = [s for s in sigs if s[0] < oos_cutoff]
+                oos_sigs = [s for s in sigs if s[0] >= oos_cutoff]
                 for tp in tp_values:
                     for sl in sl_values:
                         if tp <= sl:
@@ -833,9 +847,25 @@ def compute_results(
                             gl   = abs(sum(t["ret"] for t in trades if not t["win"]))
                             pf   = gw/gl if gl > 0 else 99
                             sc   = score(wr, ar, len(trades), pf)
+                            # OOS validation
+                            oos_trades_list = simulate(
+                                symbol,
+                                oos_sigs,
+                                tp,
+                                sl,
+                                hold,
+                                provider=provider,
+                                lookback_days=lookback_days,
+                                allow_fallback=allow_fallback,
+                                run_end=run_end,
+                            ) if oos_sigs else []
+                            oos_n  = len(oos_trades_list)
+                            oos_wr = (sum(1 for t in oos_trades_list if t["win"]) / oos_n
+                                      if oos_n > 0 else 0.0)
                             all_results.append({
                                 "s": symbol, "f": fs, "rvol": rvol, "tp": tp, "sl": sl,
-                                "hold": hold, "n": len(trades), "wr": wr, "ar": ar, "pf": pf, "sc": sc
+                                "hold": hold, "n": len(trades), "wr": wr, "ar": ar, "pf": pf,
+                                "sc": sc, "oos_n": oos_n, "oos_wr": oos_wr,
                             })
                             symbol_rows += 1
         if symbol_rows:
@@ -877,16 +907,23 @@ def run():
         )
         cur.execute("DELETE FROM leaderboard")
         all_results.sort(key=lambda x: x["sc"], reverse=True)
+        # Walk-forward gate: only promote to leaderboard if OOS validates
+        # oos_win_rate >= 60% AND oos_trades >= 10.
+        # Mark as OVERFIT if oos_win_rate < 50% (regardless of in-sample score).
+        oos_passed = [
+            r for r in all_results
+            if r.get("oos_n", 0) >= 10 and r.get("oos_wr", 0.0) >= 0.60
+        ]
         # Dedupe by symbol — keep only the best-scoring row per symbol
         seen_symbols = set()
         deduped = []
-        for r in all_results:
+        for r in oos_passed:
             if r["s"] not in seen_symbols:
                 seen_symbols.add(r["s"])
                 deduped.append(r)
         updated_at = datetime.now().isoformat()
         cur.executemany(
-            "INSERT INTO leaderboard VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO leaderboard VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 (
                     i,
@@ -901,10 +938,30 @@ def run():
                     round(r["ar"], 4),
                     r["sc"],
                     updated_at,
+                    round(r.get("oos_wr", 0.0), 4),
+                    r.get("oos_n", 0),
+                    0,  # overfit=0 for leaderboard entries (they passed OOS gate)
                 )
                 for i, r in enumerate(deduped[:20], 1)
             ],
         )
+        # Log OVERFIT symbols: in-sample looked good but OOS win rate < 50%
+        overfit_symbols = {
+            r["s"] for r in all_results
+            if r.get("oos_n", 0) >= 10 and r.get("oos_wr", 0.0) < 0.50
+        }
+        if overfit_symbols:
+            log(f"⚠️ OVERFIT symbols (OOS win rate < 50%): {', '.join(sorted(overfit_symbols))}")
+            # Insert overfit markers into leaderboard for roster_manager to read
+            cur.executemany(
+                "INSERT INTO leaderboard VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (999, sym, "OVERFIT", 0.0, 0.0, 0.0, 0, 0, 0.0, 0.0, 0.0,
+                     updated_at, 0.0, 0, 1)
+                    for sym in sorted(overfit_symbols)
+                    if sym not in seen_symbols  # don't double-insert symbols that passed
+                ],
+            )
         conn.commit()
     finally:
         conn.close()
