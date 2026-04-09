@@ -31,6 +31,7 @@ import signal
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
+import pytz
 import requests
 import yfinance as yf
 from dotenv import load_dotenv
@@ -80,6 +81,39 @@ RESOLVE_UP_PCT = float(os.getenv("RESOLVE_UP_PCT", "0.002"))      # +0.20%
 RESOLVE_DN_PCT = float(os.getenv("RESOLVE_DN_PCT", "0.002"))      # -0.20%
 RESOLVE_MIN_RVOL = float(os.getenv("RESOLVE_MIN_RVOL", "1.5"))
 RESOLVE_WINDOW_SCANS = int(os.getenv("RESOLVE_WINDOW_SCANS", "18"))  # 18 scans * 5m = 90m
+
+# ---------------- RVOL TIERS ----------------
+# Large-cap / high-liquidity symbols get a lower RVOL threshold (more liquid = lower baseline vol)
+_RVOL_LARGE_CAP = frozenset(["SPY", "QQQ", "IWM", "AMZN", "META", "NVDA", "MSFT", "AAPL"])
+RVOL_THRESH_LARGE_CAP = 2.0
+RVOL_THRESH_SMALL_MID = 3.0
+RVOL_VIX_ADDON = 1.0  # added to all thresholds when VIX > 25
+
+def get_rvol_threshold(symbol: str, vix: Optional[float] = None) -> float:
+    """Return the minimum RVOL required to emit a STRONG signal for this symbol."""
+    base = RVOL_THRESH_LARGE_CAP if symbol.upper() in _RVOL_LARGE_CAP else RVOL_THRESH_SMALL_MID
+    if vix is not None and vix > 25:
+        base += RVOL_VIX_ADDON
+    return base
+
+# ---------------- SESSION TAGS ----------------
+_et_tz = pytz.timezone("America/New_York")
+
+def get_time_session() -> str:
+    """Return the current ET trading session label."""
+    now_et = datetime.now(_et_tz)
+    t = now_et.hour * 60 + now_et.minute
+    if t < 9 * 60 + 35:
+        return "PRE"
+    if t < 10 * 60 + 30:
+        return "PRIME"
+    if t < 11 * 60:
+        return "NORMAL"
+    if t < 13 * 60 + 30:
+        return "CHOP"
+    if t < 15 * 60 + 30:
+        return "NORMAL"
+    return "EOD"
 
 # ---------------- ASSET LIST ----------------
 # ---------------- ASSET LIST ----------------
@@ -264,13 +298,20 @@ def init_db() -> None:
     except Exception:
         pass  # column already exists
 
+    # Add time_session column if not present
+    try:
+        c.execute("ALTER TABLE signals ADD COLUMN time_session TEXT")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
+
     conn.commit()
     conn.close()
     log(f"{Fore.GREEN}✅ DB ready: {DB_PATH}")
 
 def save_signal_to_db(symbol: str, sector: str, signal_type: str,
                       price: float, change_pct: float, rvol: float, flow_m: float,
-                      news_flag: str = "CLEAN") -> None:
+                      news_flag: str = "CLEAN", time_session: str = "UNKNOWN") -> None:
     confidence = 50
     if "ABSORPTION" in signal_type:
         confidence += 30
@@ -287,11 +328,12 @@ def save_signal_to_db(symbol: str, sector: str, signal_type: str,
         c.execute("""
             INSERT INTO signals (
                 timestamp, symbol, signal_type, price, rvol, flow_m,
-                confidence, sector, change_pct, news_flag
+                confidence, sector, change_pct, news_flag, time_session
             ) VALUES (
-                datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?
+                datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
-        """, (symbol, signal_type, price, rvol, flow_m, confidence, sector, float(change_pct), news_flag))
+        """, (symbol, signal_type, price, rvol, flow_m, confidence, sector,
+              float(change_pct), news_flag, time_session))
         conn.commit()
     except Exception as e:
         log(f"{Fore.RED}DB Write Error (signals): {e}")
@@ -315,19 +357,24 @@ def save_macro_features(vix: Optional[float], tnx: Optional[float], dxy: Optiona
         if conn:
             conn.close()
 # ---------------- SIGNAL LOGIC ----------------
-def analyze_signal(rvol: float, change_pct: float, flow_m: float) -> str:
+def analyze_signal(rvol: float, change_pct: float, flow_m: float,
+                   symbol: str = "", vix: Optional[float] = None) -> str:
     """
     Returns signal label. Flow and price direction must agree for a valid signal.
     If flow is positive but price is falling, buyers are getting run over (BULL TRAP).
     If flow is negative but price is rising, sellers are getting squeezed (BEAR TRAP).
+
+    RVOL threshold for STRONG signals is tier-based per symbol (see get_rvol_threshold).
+    VIX > 25 adds +1.0 to all thresholds to reduce noise in high-volatility regimes.
     """
+    rvol_threshold = get_rvol_threshold(symbol, vix)
     if rvol > 4.0 and abs(change_pct) < 0.001:
         return "🛡️ ABSORPTION SELL" if flow_m > 0 else "🛡️ ABSORPTION BUY"
     if rvol < 1.0 and abs(change_pct) > 0.005:
         return "⚠️ FAKE-OUT (Low Vol)"
     if rvol > 8.0:
         return "🔥 CLIMAX"
-    if rvol > 2.5:
+    if rvol > rvol_threshold:
         if abs(flow_m) < 5.0:
             return "Neutral"
         if flow_m > 0:
@@ -622,7 +669,8 @@ def run_god_mode_pro() -> None:
                         change_pct = (price - open_p) / open_p if open_p else 0.0
                         flow_m = float(get_flow_math(symbol, price, vol, open_p, price) / 1_000_000)
 
-                        signal_lbl = analyze_signal(rvol, change_pct, flow_m)
+                        signal_lbl = analyze_signal(rvol, change_pct, flow_m,
+                                                    symbol=symbol, vix=vix_val)
 
                         # market log (everything)
                         _append_row(CSV_FILENAME, MARKET_HEADER, {
@@ -645,6 +693,7 @@ def run_god_mode_pro() -> None:
                                 log(f"TREND GATE: {signal_lbl} on {symbol} suppressed — SPY below MA20")
                             else:
                                 news_flag = fetch_news_flag(symbol)
+                                session = get_time_session()
                                 save_signal_to_db(
                                     symbol=symbol,
                                     sector=sector,
@@ -654,6 +703,7 @@ def run_god_mode_pro() -> None:
                                     rvol=rvol,
                                     flow_m=flow_m,
                                     news_flag=news_flag,
+                                    time_session=session,
                                 )
 
                                 now_epoch = time.time()

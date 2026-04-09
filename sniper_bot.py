@@ -2217,7 +2217,8 @@ def get_new_signals(last_check_ts: str):
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         query = """
-            SELECT rowid, timestamp, symbol, signal_type, price, confidence
+            SELECT rowid, timestamp, symbol, signal_type, price, confidence,
+                   COALESCE(news_flag, 'CLEAN') AS news_flag
             FROM signals
             WHERE timestamp > ?
             AND (signal_type LIKE '%STRONG%' OR signal_type LIKE '%ABSORPTION%')
@@ -2672,6 +2673,29 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
         except Exception:
             pass
 
+    # 6b. Time-session entry filters (stocks only)
+    if not is_crypto:
+        _now_et = datetime.now(et_tz)
+        _t = _now_et.hour * 60 + _now_et.minute
+
+        # Opening chaos window: 9:30–9:35am ET — too much noise, skip all entries
+        if 9 * 60 + 30 <= _t < 9 * 60 + 35:
+            if should_log_skip(f"opening-chaos:{alpaca_symbol}", interval_s=60):
+                log_line(f"⏰ SKIP {alpaca_symbol}: Opening chaos window (9:30–9:35am) — no entries")
+            return
+
+        # CHOP session: 11:00am–1:30pm ET — block new shorts (low follow-through)
+        if is_sell_signal and 11 * 60 <= _t < 13 * 60 + 30:
+            if should_log_skip(f"chop-no-short:{alpaca_symbol}", interval_s=300):
+                log_line(f"⏰ SKIP SHORT {alpaca_symbol}: CHOP session (11am–1:30pm) — no new shorts")
+            return
+
+        # EOD: after 3:30pm ET — block new shorts (EOD rules close soon anyway)
+        if is_sell_signal and _t >= 15 * 60 + 30:
+            if should_log_skip(f"eod-no-short:{alpaca_symbol}", interval_s=300):
+                log_line(f"⏰ SKIP SHORT {alpaca_symbol}: EOD (after 3:30pm) — no new shorts")
+            return
+
     # 7. Execute
     side      = OrderSide.BUY  if is_buy_signal  else OrderSide.SELL
     tif       = TimeInForce.DAY
@@ -2942,9 +2966,29 @@ def run():
             # Check for new signals
             signals = get_new_signals(last_check)
             if signals:
-                seen = set()
+                # Dedup pass: one trade per 15-min window per symbol per direction.
+                # Within a window, prefer NEWS_DRIVEN over CLEAN.
+                # best_per_slot maps dedup_key -> signal tuple
+                best_per_slot: dict = {}
                 for s in signals:
-                    signal_rowid, signal_ts, sym, stype, price, confidence = s
+                    signal_rowid, signal_ts, sym, stype, price, confidence, news_flag = s
+                    direction = parse_signal_direction(stype)
+                    if direction is None:
+                        continue
+                    if is_signal_processed(make_signal_key(s)):
+                        continue
+                    _min_bucket = (int(signal_ts[14:16]) // 15) * 15 if len(signal_ts) >= 16 else 0
+                    dedup_key = (f"{signal_ts[:13]}:{_min_bucket:02d}", sym, direction)
+                    if dedup_key in best_per_slot:
+                        # Upgrade to NEWS_DRIVEN if the stored slot was CLEAN
+                        prev = best_per_slot[dedup_key]
+                        if news_flag == "NEWS_DRIVEN" and prev[6] != "NEWS_DRIVEN":
+                            best_per_slot[dedup_key] = s
+                    else:
+                        best_per_slot[dedup_key] = s
+
+                for dedup_key, s in best_per_slot.items():
+                    signal_rowid, signal_ts, sym, stype, price, confidence, news_flag = s
                     direction = parse_signal_direction(stype)
                     if direction is None:
                         log_line(f"⛔ SKIP {sym}: Unknown signal direction for '{stype}'")
@@ -2954,13 +2998,15 @@ def run():
                         if should_log_skip(f"idempotent:{sym}:{direction}", interval_s=300):
                             log_line(f"SKIP IDEMPOTENT {sym} {direction} ({signal_key})")
                         continue
-                    _min_bucket = (int(signal_ts[14:16]) // 15) * 15 if len(signal_ts) >= 16 else 0
-                    dedup_key = (f"{signal_ts[:13]}:{_min_bucket:02d}", sym, direction)  # one trade per 15 min per symbol per direction
-                    if dedup_key in seen:
-                        if should_log_skip(f"dupe:{sym}:{direction}", interval_s=300):
-                            log_line(f"SKIP DUPE {sym} {direction} (already acted on this 15-min window)")
-                        continue
-                    seen.add(dedup_key)
+
+                    # NEWS_DRIVEN confidence bonus: +10 over CLEAN signals
+                    effective_confidence = confidence
+                    if news_flag == "NEWS_DRIVEN" and confidence is not None:
+                        try:
+                            effective_confidence = min(100, int(confidence) + 10)
+                        except (TypeError, ValueError):
+                            pass
+
                     if regime_mode == "SELL_ONLY" and direction != "SHORT":
                         if should_log_skip(f"sell-only:{sym}:{direction}", interval_s=300):
                             log_line(f"📉 SELL-ONLY mode — skipping {direction} signal on {sym}")
@@ -2978,7 +3024,7 @@ def run():
                         sym,
                         stype,
                         float(price),
-                        confidence=confidence,
+                        confidence=effective_confidence,
                         signal_key=signal_key,
                         signal_ts=signal_ts,
                         market_context=market_context,

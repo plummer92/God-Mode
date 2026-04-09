@@ -114,6 +114,20 @@ def freshness_size_multiplier(score):
     return 1.0
 
 
+def get_overfit_symbols():
+    """Return set of symbols marked OVERFIT in strategy_lab leaderboard."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT symbol FROM leaderboard WHERE overfit=1")
+        result = {row[0].upper() for row in cur.fetchall()}
+        conn.close()
+        return result
+    except Exception as e:
+        print(f"Warning: could not fetch overfit symbols: {e}")
+        return set()
+
+
 def fetch_best_per_symbol():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -412,8 +426,15 @@ def main():
     except (FileNotFoundError, json.JSONDecodeError):
         current_data = {}
 
+    overfit_symbols = get_overfit_symbols()
+    if overfit_symbols:
+        print(f"[roster] Excluding {len(overfit_symbols)} OVERFIT symbols: {sorted(overfit_symbols)}")
+
     rows = fetch_best_per_symbol()
-    cooling_rows = fetch_latest_rows_for_symbols(current_data.get("cooling_off", []))
+    rows = [r for r in rows if r["symbol"].upper() not in overfit_symbols]
+
+    cooling_off_list = [s for s in current_data.get("cooling_off", []) if s.upper() not in overfit_symbols]
+    cooling_rows = fetch_latest_rows_for_symbols(cooling_off_list)
     payload = build_roster(rows, current_data, cooling_rows)
 
     with open(OUT_PATH, "w") as f:
