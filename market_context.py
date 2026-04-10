@@ -62,6 +62,23 @@ def _safe_float(value):
         return None
 
 
+def _patch_snapshot(snapshot_path: str, updates: dict) -> None:
+    """Merge `updates` into the existing snapshot JSON without overwriting other fields."""
+    try:
+        try:
+            with open(snapshot_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        data.update(updates)
+        with open(snapshot_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
 def _load_snapshot(snapshot_path: str) -> dict:
     try:
         with open(snapshot_path, "r", encoding="utf-8") as f:
@@ -94,6 +111,8 @@ def _base_context(snapshot: dict, prev_mode: str | None = None) -> dict:
         "oil_move_pct": None,
         "tnx": _safe_float(snapshot.get("tnx")),
         "tnx_change_pct": None,
+        "hyg_lqd_ratio": _safe_float(snapshot.get("hyg_lqd_ratio")),
+        "put_call_ratio": _safe_float(snapshot.get("put_call_ratio")),
         "asof": snapshot.get("timestamp", ""),
         "source": "snapshot_fallback",
         "fetch_ok": False,
@@ -134,8 +153,9 @@ def _fetch_context(snapshot_path: str, prev_mode: str | None = None) -> dict:
     snapshot = _load_snapshot(snapshot_path)
     result = _base_context(snapshot, prev_mode=prev_mode)
 
+    _CREDIT_TICKERS = ["HYG", "LQD", "^PCALL"]
     data = yf.download(
-        list(MARKET_CONTEXT_TICKERS.keys()),
+        list(MARKET_CONTEXT_TICKERS.keys()) + _CREDIT_TICKERS,
         period="5d",
         interval="1d",
         progress=False,
@@ -161,6 +181,30 @@ def _fetch_context(snapshot_path: str, prev_mode: str | None = None) -> dict:
         result["vix_change_pct"] = _compute_move_pct(vix_close)
     if tnx_close is not None and len(tnx_close) >= 1:
         result["tnx"] = _safe_float(tnx_close.iloc[-1])
+
+    # --- Credit stress & sentiment indicators (observation only, no trading logic) ---
+    hyg_close = _extract_series_value(data, "HYG", "Close")
+    lqd_close = _extract_series_value(data, "LQD", "Close")
+    pcall_close = _extract_series_value(data, "^PCALL", "Close")
+
+    hyg_lqd_ratio = None
+    if hyg_close is not None and len(hyg_close) >= 1 and lqd_close is not None and len(lqd_close) >= 1:
+        hyg = _safe_float(hyg_close.iloc[-1])
+        lqd = _safe_float(lqd_close.iloc[-1])
+        if hyg is not None and lqd is not None and lqd != 0.0:
+            hyg_lqd_ratio = round(hyg / lqd, 4)
+
+    put_call_ratio = None
+    if pcall_close is not None and len(pcall_close) >= 1:
+        put_call_ratio = _safe_float(pcall_close.iloc[-1])
+
+    result["hyg_lqd_ratio"] = hyg_lqd_ratio
+    result["put_call_ratio"] = put_call_ratio
+
+    _patch_snapshot(snapshot_path, {
+        "hyg_lqd_ratio": hyg_lqd_ratio,
+        "put_call_ratio": put_call_ratio,
+    })
 
     result["fetch_ok"] = any(
         result[key] is not None
