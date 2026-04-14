@@ -55,6 +55,13 @@ BOT_VERSION = "SNIPER V8.0 (SHORTING ENABLED)"
 STATUS_DB = DB_PATH
 MARKET_CONTEXT_TRANSITION_ALERTS = True
 
+# Signal types that are permanently blocked from execution.
+# Live data (2026-04-14): ABSORPTION SELL had 0% WR and -$4.96 P&L on 2 trades.
+BLOCKED_SIGNAL_TYPES = {
+    "ABSORPTION SELL",
+    "🛡️ ABSORPTION SELL",
+}
+
 # -------------------- SETUP --------------------
 cst_tz = pytz.timezone("America/Chicago")
 et_tz = pytz.timezone("America/New_York")
@@ -3007,9 +3014,23 @@ def run():
                         except (TypeError, ValueError):
                             pass
 
-                    if regime_mode == "SELL_ONLY" and direction != "SHORT":
-                        if should_log_skip(f"sell-only:{sym}:{direction}", interval_s=300):
-                            log_line(f"📉 SELL-ONLY mode — skipping {direction} signal on {sym}")
+                    # Block specific signal types with poor live performance.
+                    canonical_stype = stype.strip()
+                    if canonical_stype in BLOCKED_SIGNAL_TYPES:
+                        log_line(
+                            f"🚫 BLOCKED SIGNAL TYPE — {sym} '{stype}' is on the blocked list "
+                            f"(live data: 0% WR, -$4.96 P&L). Skipping."
+                        )
+                        mark_signal_processed(signal_key, signal_ts, sym, stype, direction, confidence, "blocked_signal_type")
+                        continue
+
+                    # SELL_ONLY regime: block all new entries, not just longs.
+                    # Live data (2026-04-14): 16.7% WR, -$5.79 P&L in this regime.
+                    if regime_mode == "SELL_ONLY":
+                        log_line(
+                            f"📉 SELL-ONLY regime — blocking ALL new entries (live WR 16.7%, "
+                            f"-$5.79 P&L). Skipping {sym} {direction} '{stype}'."
+                        )
                         continue
                     blocked, block_reason = should_block_direction(market_context, direction)
                     if blocked:
