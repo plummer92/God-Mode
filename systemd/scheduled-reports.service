@@ -1,0 +1,14 @@
+[Unit]
+Description=Wolfe Scheduled Reports
+After=network.target
+
+[Service]
+Type=simple
+User=theplummer92
+WorkingDirectory=/home/theplummer92
+ExecStart=/usr/bin/env TZ=America/New_York /home/theplummer92/venv/bin/python3 /home/theplummer92/scheduled_reports.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
