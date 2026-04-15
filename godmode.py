@@ -89,6 +89,25 @@ RVOL_THRESH_LARGE_CAP = 2.0
 RVOL_THRESH_SMALL_MID = 3.0
 RVOL_VIX_ADDON = 1.0  # added to all thresholds when VIX > 25
 
+# ---------------- PHASE 3 QUALITY FILTERS ----------------
+# Conservative timing / quality gates layered on top of the existing signal labels.
+# All thresholds are env-configurable so dashboard and bot workflows stay compatible.
+SIGNAL_MAX_AGE_SECONDS = int(os.getenv("SIGNAL_MAX_AGE_SECONDS", "900"))  # reject bars older than 15m
+OPENING_CHAOS_BLOCK_MINUTES = int(os.getenv("OPENING_CHAOS_BLOCK_MINUTES", "10"))  # 9:30-9:39 ET
+OPENING_CHAOS_COOLDOWN_MINUTES = int(os.getenv("OPENING_CHAOS_COOLDOWN_MINUTES", "20"))  # 9:40-9:49 ET
+OPENING_CHAOS_RVOL_ADDON = float(os.getenv("OPENING_CHAOS_RVOL_ADDON", "0.75"))
+OPENING_CHAOS_MIN_MOVE_PCT = float(os.getenv("OPENING_CHAOS_MIN_MOVE_PCT", "0.0035"))  # 0.35%
+OPENING_CHAOS_MIN_FLOW_M = float(os.getenv("OPENING_CHAOS_MIN_FLOW_M", "8.0"))
+
+NEWS_SIGNAL_RVOL_ADDON = float(os.getenv("NEWS_SIGNAL_RVOL_ADDON", "0.75"))
+NEWS_SIGNAL_MIN_MOVE_PCT = float(os.getenv("NEWS_SIGNAL_MIN_MOVE_PCT", "0.0040"))  # 0.40%
+NEWS_SIGNAL_MIN_FLOW_M = float(os.getenv("NEWS_SIGNAL_MIN_FLOW_M", "8.0"))
+CLEAN_SIGNAL_MIN_MOVE_PCT = float(os.getenv("CLEAN_SIGNAL_MIN_MOVE_PCT", "0.0025"))  # 0.25%
+REVERSAL_OVERRIDE_MOVE_PCT = float(os.getenv("REVERSAL_OVERRIDE_MOVE_PCT", "0.0060"))  # 0.60%
+
+SELL_ONLY_BUY_RVOL_ADDON = float(os.getenv("SELL_ONLY_BUY_RVOL_ADDON", "0.75"))
+BLOCKED_REGIME_RVOL_ADDON = float(os.getenv("BLOCKED_REGIME_RVOL_ADDON", "1.0"))
+
 def get_rvol_threshold(symbol: str, vix: Optional[float] = None) -> float:
     """Return the minimum RVOL required to emit a STRONG signal for this symbol."""
     base = RVOL_THRESH_LARGE_CAP if symbol.upper() in _RVOL_LARGE_CAP else RVOL_THRESH_SMALL_MID
@@ -399,6 +418,133 @@ def get_flow_math(symbol: str, price: float, vol: float, open_p: float, close_p:
 def is_absorption_candidate(rvol: float, change_pct: float, flow_m: float) -> bool:
     return (rvol >= ABS_RVOL_MIN) and (abs(change_pct) <= ABS_MOVE_MAX) and (abs(flow_m) >= ABS_FLOW_MIN_M)
 
+
+def _coerce_bar_timestamp(ts_obj) -> Optional[datetime]:
+    """Convert a pandas/yfinance/alpaca index value into a timezone-aware UTC datetime."""
+    if ts_obj is None:
+        return None
+    try:
+        dt = ts_obj.to_pydatetime()
+    except Exception:
+        dt = ts_obj
+    if getattr(dt, "tzinfo", None) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _latest_bar_timestamp(closes) -> Optional[datetime]:
+    try:
+        if closes is None or len(closes) == 0:
+            return None
+        return _coerce_bar_timestamp(closes.index[-1])
+    except Exception:
+        return None
+
+
+def _bar_age_seconds(bar_ts: Optional[datetime]) -> Optional[float]:
+    if bar_ts is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - bar_ts).total_seconds())
+
+
+def _minutes_since_cash_open(bar_ts: Optional[datetime]) -> Optional[int]:
+    if bar_ts is None:
+        return None
+    ts_et = bar_ts.astimezone(_et_tz)
+    minutes = (ts_et.hour * 60 + ts_et.minute) - (9 * 60 + 30)
+    return minutes if minutes >= 0 else None
+
+
+def _signal_side(signal_lbl: str) -> Optional[str]:
+    if "BUY" in signal_lbl and "SELL" not in signal_lbl:
+        return "BUY"
+    if "SELL" in signal_lbl and "BUY" not in signal_lbl:
+        return "SELL"
+    return None
+
+
+def _passes_signal_quality_gate(
+    *,
+    symbol: str,
+    signal_lbl: str,
+    rvol: float,
+    change_pct: float,
+    flow_m: float,
+    news_flag: str,
+    regime: str,
+    vix: Optional[float],
+    prev_change_pct: Optional[float],
+    latest_bar_ts: Optional[datetime],
+) -> tuple[bool, Optional[str]]:
+    """Conservative post-classification gate to improve timing quality without changing schemas."""
+    if "Neutral" in signal_lbl or "ABSORPTION" in signal_lbl:
+        return True, None
+
+    bar_age = _bar_age_seconds(latest_bar_ts)
+    if bar_age is not None and bar_age > SIGNAL_MAX_AGE_SECONDS:
+        return False, f"STALE_BAR age={int(bar_age)}s>{SIGNAL_MAX_AGE_SECONDS}s"
+
+    side = _signal_side(signal_lbl)
+    base_rvol = get_rvol_threshold(symbol, vix)
+    required_rvol = base_rvol
+
+    if side == "BUY" and regime == "SELL_ONLY":
+        required_rvol += SELL_ONLY_BUY_RVOL_ADDON
+    elif side in {"BUY", "SELL"} and regime == "BLOCKED":
+        required_rvol += BLOCKED_REGIME_RVOL_ADDON
+
+    if side in {"BUY", "SELL"} and rvol < required_rvol:
+        return False, f"RVOL_GATE {rvol:.2f}<{required_rvol:.2f} regime={regime}"
+
+    if _is_alpaca_stock(symbol):
+        open_minutes = _minutes_since_cash_open(latest_bar_ts)
+        if open_minutes is not None and open_minutes < OPENING_CHAOS_BLOCK_MINUTES:
+            return False, f"OPENING_CHAOS_BLOCK minute={open_minutes}"
+        if open_minutes is not None and open_minutes < OPENING_CHAOS_COOLDOWN_MINUTES:
+            cooldown_rvol = required_rvol + OPENING_CHAOS_RVOL_ADDON
+            if (
+                rvol < cooldown_rvol
+                or abs(change_pct) < OPENING_CHAOS_MIN_MOVE_PCT
+                or abs(flow_m) < OPENING_CHAOS_MIN_FLOW_M
+            ):
+                return False, (
+                    "OPENING_CHAOS_FILTER "
+                    f"minute={open_minutes} rvol={rvol:.2f}/{cooldown_rvol:.2f} "
+                    f"move={abs(change_pct):.4f}/{OPENING_CHAOS_MIN_MOVE_PCT:.4f} "
+                    f"flow={abs(flow_m):.1f}/{OPENING_CHAOS_MIN_FLOW_M:.1f}"
+                )
+
+    if side in {"BUY", "SELL"} and prev_change_pct is not None:
+        same_direction = (change_pct == 0.0) or ((change_pct > 0) == (prev_change_pct > 0))
+        if not same_direction and abs(change_pct) < REVERSAL_OVERRIDE_MOVE_PCT:
+            return False, (
+                "REVERSAL_NO_CONFIRM "
+                f"curr={change_pct*100:.2f}% prev={prev_change_pct*100:.2f}%"
+            )
+
+    if side in {"BUY", "SELL"}:
+        if news_flag == "NEWS_DRIVEN":
+            news_rvol = required_rvol + NEWS_SIGNAL_RVOL_ADDON
+            if (
+                rvol < news_rvol
+                or abs(change_pct) < NEWS_SIGNAL_MIN_MOVE_PCT
+                or abs(flow_m) < NEWS_SIGNAL_MIN_FLOW_M
+            ):
+                return False, (
+                    "NEWS_SPIKE_FILTER "
+                    f"rvol={rvol:.2f}/{news_rvol:.2f} "
+                    f"move={abs(change_pct):.4f}/{NEWS_SIGNAL_MIN_MOVE_PCT:.4f} "
+                    f"flow={abs(flow_m):.1f}/{NEWS_SIGNAL_MIN_FLOW_M:.1f}"
+                )
+        elif abs(change_pct) < CLEAN_SIGNAL_MIN_MOVE_PCT and abs(flow_m) < OPENING_CHAOS_MIN_FLOW_M:
+            return False, (
+                "TECHNICAL_CONFIRM_FILTER "
+                f"move={abs(change_pct):.4f}/{CLEAN_SIGNAL_MIN_MOVE_PCT:.4f} "
+                f"flow={abs(flow_m):.1f}/{OPENING_CHAOS_MIN_FLOW_M:.1f}"
+            )
+
+    return True, None
+
 # ---------------- DISCORD (OPTIONAL) ----------------
 def post_discord(symbol: str, signal_lbl: str, rvol: float, flow_m: float, news_flag: str = "CLEAN") -> None:
     if not DISCORD_WEBHOOK:
@@ -662,11 +808,17 @@ def run_god_mode_pro() -> None:
                         price = float(closes.iloc[-1])
                         open_p = float(opens.iloc[-1])
                         vol = float(volumes.iloc[-1])
+                        latest_bar_ts = _latest_bar_timestamp(closes)
 
                         avg_vol = float(volumes.iloc[-MIN_BARS:-1].mean())
                         rvol = (vol / avg_vol) if avg_vol > 0 else 1.0
 
                         change_pct = (price - open_p) / open_p if open_p else 0.0
+                        prev_change_pct: Optional[float] = None
+                        if len(opens) >= 2 and len(closes) >= 2:
+                            prev_open = float(opens.iloc[-2])
+                            prev_close = float(closes.iloc[-2])
+                            prev_change_pct = ((prev_close - prev_open) / prev_open) if prev_open else 0.0
                         flow_m = float(get_flow_math(symbol, price, vol, open_p, price) / 1_000_000)
 
                         signal_lbl = analyze_signal(rvol, change_pct, flow_m,
@@ -693,6 +845,21 @@ def run_god_mode_pro() -> None:
                                 log(f"TREND GATE: {signal_lbl} on {symbol} suppressed — SPY below MA20")
                             else:
                                 news_flag = fetch_news_flag(symbol)
+                                passed_quality_gate, gate_reason = _passes_signal_quality_gate(
+                                    symbol=symbol,
+                                    signal_lbl=signal_lbl,
+                                    rvol=rvol,
+                                    change_pct=change_pct,
+                                    flow_m=flow_m,
+                                    news_flag=news_flag,
+                                    regime=regime,
+                                    vix=vix_val,
+                                    prev_change_pct=prev_change_pct,
+                                    latest_bar_ts=latest_bar_ts,
+                                )
+                                if not passed_quality_gate:
+                                    log(f"QUALITY GATE: {signal_lbl} on {symbol} suppressed — {gate_reason}")
+                                    continue
                                 session = get_time_session()
                                 save_signal_to_db(
                                     symbol=symbol,
