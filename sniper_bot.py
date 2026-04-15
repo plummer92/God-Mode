@@ -81,9 +81,20 @@ def env_float(name: str, default=None):
         return default
 
 
+def env_int(name: str, default=None):
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
 MAX_RISK_PER_TRADE_USD = env_float("MAX_RISK_PER_TRADE_USD", None)
 MAX_SINGLE_POSITION_GROSS_USD = env_float("MAX_SINGLE_POSITION_GROSS_USD", MAX_GROSS_EXPOSURE_USD)
 MAX_SECTOR_GROSS_USD = env_float("MAX_SECTOR_GROSS_USD", MAX_GROSS_EXPOSURE_USD)
+MAX_DAILY_REALIZED_LOSS_USD = env_float("MAX_DAILY_REALIZED_LOSS_USD", DAILY_LOSS_LIMIT_USD)
 ENABLE_STRICT_GAP_BLOCK = False
 ENABLE_STRICT_CORRELATION_BLOCK = False
 
@@ -121,6 +132,10 @@ CLOSE_RETRY_COOLDOWN_S = 30
 CLOSE_PENDING_LOG_INTERVAL_S = 30
 CLOSE_STALE_TIMEOUT_S = 90
 CLOSE_CANCEL_COOLDOWN_S = 30
+CLOSE_VERIFY_ATTEMPTS = env_int("CLOSE_VERIFY_ATTEMPTS", 3)
+CLOSE_VERIFY_SLEEP_S = env_int("CLOSE_VERIFY_SLEEP_SECONDS", 5)
+EOD_FINAL_VERIFY_ATTEMPTS = env_int("EOD_FINAL_VERIFY_ATTEMPTS", 3)
+EOD_FINAL_VERIFY_SLEEP_S = env_int("EOD_FINAL_VERIFY_SLEEP_SECONDS", 10)
 SKIP_LOG_SUPPRESS_SECONDS = 300
 HALT_MODE_LOG_INTERVAL_S = 300
 STOP_MODEL_CACHE_TTL_S = 300
@@ -254,7 +269,10 @@ def init_trade_log():
             execution_quality_flag TEXT, execution_size_multiplier_used REAL,
             break_even_armed INTEGER, break_even_armed_at_utc TEXT,
             exit_decision_price REAL, exit_price_source TEXT, exit_fill_confirmed INTEGER,
-            exit_slippage_dps REAL, exit_slippage_pct REAL, exit_slippage_bps REAL
+            exit_slippage_dps REAL, exit_slippage_pct REAL, exit_slippage_bps REAL,
+            exit_reason TEXT, intended_exit_time TEXT,
+            actual_fill_price REAL, actual_fill_timestamp TEXT,
+            broker_order_id TEXT, retry_used INTEGER, verification_result TEXT
         )""")
         # Add columns to existing tables that pre-date this schema change
         for col, coltype in (
@@ -279,6 +297,13 @@ def init_trade_log():
             ("exit_slippage_dps", "REAL"),
             ("exit_slippage_pct", "REAL"),
             ("exit_slippage_bps", "REAL"),
+            ("exit_reason", "TEXT"),
+            ("intended_exit_time", "TEXT"),
+            ("actual_fill_price", "REAL"),
+            ("actual_fill_timestamp", "TEXT"),
+            ("broker_order_id", "TEXT"),
+            ("retry_used", "INTEGER"),
+            ("verification_result", "TEXT"),
         ):
             try:
                 cur.execute(f"ALTER TABLE trades ADD COLUMN {col} {coltype}")
@@ -507,6 +532,47 @@ def update_trade_exit_decision(symbol, outcome, decision_price):
             conn.close()
 
 
+def update_trade_exit_audit(symbol, **fields):
+    valid_fields = {
+        "exit_reason",
+        "intended_exit_time",
+        "actual_fill_price",
+        "actual_fill_timestamp",
+        "broker_order_id",
+        "retry_used",
+        "verification_result",
+        "exit_order_id",
+        "exit_decision_price",
+    }
+    updates = []
+    values = []
+    for key, value in fields.items():
+        if key not in valid_fields:
+            continue
+        updates.append(f"{key}=?")
+        values.append(value)
+    if not updates:
+        return
+
+    conn = None
+    try:
+        conn = sqlite3.connect(TRADE_LOG_DB)
+        cur = conn.cursor()
+        cur.execute(
+            f"""UPDATE trades
+                SET {", ".join(updates)}
+                WHERE symbol=? AND outcome='open'
+                ORDER BY id DESC LIMIT 1""",
+            (*values, symbol),
+        )
+        conn.commit()
+    except Exception as e:
+        log_line(f"⚠️ Exit audit update failed for {symbol}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
 def arm_trade_break_even(symbol):
     conn = None
     try:
@@ -531,7 +597,10 @@ def arm_trade_break_even(symbol):
 
 
 def log_trade_close(symbol, exit_price, outcome, exit_order_id=None,
-                    exit_decision_price=None, fill_confirmed=None, price_source=None):
+                    exit_decision_price=None, fill_confirmed=None, price_source=None,
+                    exit_reason=None, intended_exit_time=None,
+                    actual_fill_timestamp=None, broker_order_id=None,
+                    retry_used=False, verification_result=None):
     conn = None
     try:
         open_trade = get_open_trade(symbol)
@@ -591,7 +660,10 @@ def log_trade_close(symbol, exit_price, outcome, exit_order_id=None,
             exit_price=?, exit_time=?, pnl_pct=?, pnl_usd=?, outcome=?, exit_order_id=?,
             exit_decision_price=COALESCE(?, exit_decision_price),
             exit_price_source=?, exit_fill_confirmed=?,
-            exit_slippage_dps=?, exit_slippage_pct=?, exit_slippage_bps=?
+            exit_slippage_dps=?, exit_slippage_pct=?, exit_slippage_bps=?,
+            exit_reason=?, intended_exit_time=COALESCE(?, intended_exit_time),
+            actual_fill_price=?, actual_fill_timestamp=?,
+            broker_order_id=?, retry_used=?, verification_result=?
             WHERE symbol=? AND outcome='open'
             ORDER BY id DESC LIMIT 1""",
             (exit_price, utc_now_str(), pnl_pct, pnl_usd, outcome,
@@ -602,6 +674,13 @@ def log_trade_close(symbol, exit_price, outcome, exit_order_id=None,
              None if exit_slip is None else exit_slip["dps"],
              None if exit_slip is None else (exit_slip["pct"] / 100.0),
              None if exit_slip is None else exit_slip["bps"],
+             exit_reason or outcome,
+             intended_exit_time,
+             exit_price,
+             actual_fill_timestamp or (utc_now_str() if exit_price is not None else None),
+             str(broker_order_id or exit_order_id) if (broker_order_id or exit_order_id) else None,
+             1 if retry_used else 0,
+             verification_result,
              symbol))
         conn.commit()
 
@@ -1246,6 +1325,22 @@ def safe_float(value, default=None):
         return default
 
 
+def order_filled_ts(order) -> str | None:
+    if order is None:
+        return None
+    filled_at = getattr(order, "filled_at", None)
+    if isinstance(filled_at, datetime):
+        return filled_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    text = str(filled_at or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
 def order_submitted_ts(order) -> float:
     if order is None:
         return 0.0
@@ -1282,7 +1377,9 @@ def build_pending_close_state(symbol: str, outcome: str, decision_price=None,
                               order_id: str | None = None, submitted_at: float | None = None,
                               retry_after: float | None = None,
                               cancel_submitted_at: float = 0.0,
-                              last_log_ts: float | None = None):
+                              last_log_ts: float | None = None,
+                              retry_used: bool = False,
+                              intended_exit_time: str | None = None):
     now = time.time()
     return {
         "order_id": order_id,
@@ -1292,6 +1389,8 @@ def build_pending_close_state(symbol: str, outcome: str, decision_price=None,
         "retry_after": now if retry_after is None else float(retry_after),
         "cancel_submitted_at": float(cancel_submitted_at or 0.0),
         "last_log_ts": now if last_log_ts is None else float(last_log_ts),
+        "retry_used": bool(retry_used),
+        "intended_exit_time": intended_exit_time or utc_now_str(),
     }
 
 
@@ -1373,25 +1472,227 @@ def is_regular_market_hours(trading_client=None) -> bool:
     return session_start <= now_et < session_end
 
 
-def submit_close_attempt(trading_client, symbol: str, outcome: str, decision_price=None):
+def get_position_for_symbol(trading_client, symbol: str):
+    try:
+        for pos in trading_client.get_all_positions():
+            if pos.symbol == symbol:
+                return pos
+    except Exception as e:
+        log_line(f"⚠️ Could not fetch broker position for {symbol}: {e}")
+    return None
+
+
+def get_daily_realized_pnl() -> float:
+    conn = None
+    try:
+        conn = sqlite3.connect(TRADE_LOG_DB)
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT COALESCE(SUM(pnl_usd), 0)
+               FROM trades
+               WHERE outcome != 'open'
+                 AND exit_time IS NOT NULL
+                 AND substr(exit_time, 1, 10) = ?""",
+            (current_trading_day(),),
+        )
+        row = cur.fetchone()
+        return float(row[0] or 0.0) if row else 0.0
+    except Exception as e:
+        log_line(f"⚠️ Could not compute daily realized PnL: {e}")
+        return 0.0
+    finally:
+        if conn:
+            conn.close()
+
+
+def entry_kill_switch_reason(trading_client, positions=None):
+    try:
+        open_positions = positions if positions is not None else trading_client_positions(trading_client)
+    except Exception as e:
+        return f"position refresh failed: {e}"
+
+    if len(open_positions) >= MAX_OPEN_POSITIONS:
+        return f"max open positions reached ({len(open_positions)}/{MAX_OPEN_POSITIONS})"
+
+    exposure_snapshot = get_portfolio_exposure_snapshot(trading_client, positions=open_positions)
+    current_gross_exposure = float(exposure_snapshot["gross_total"])
+    if current_gross_exposure >= float(MAX_GROSS_EXPOSURE_USD):
+        return (
+            f"gross exposure cap reached "
+            f"(${current_gross_exposure:.2f}/${float(MAX_GROSS_EXPOSURE_USD):.2f})"
+        )
+
+    daily_realized = get_daily_realized_pnl()
+    if (
+        MAX_DAILY_REALIZED_LOSS_USD is not None
+        and MAX_DAILY_REALIZED_LOSS_USD > 0
+        and daily_realized <= -float(MAX_DAILY_REALIZED_LOSS_USD)
+    ):
+        return (
+            f"daily realized loss limit hit "
+            f"(${abs(daily_realized):.2f}/${float(MAX_DAILY_REALIZED_LOSS_USD):.2f})"
+        )
+
+    return None
+
+
+def verify_and_finalize_close(trading_client, symbol: str, outcome: str, decision_price=None,
+                              order_id: str | None = None, intended_exit_time: str | None = None,
+                              retry_used: bool = False, context: str = "close") -> bool:
+    current_order_id = str(order_id) if order_id else None
+    retry_flag = bool(retry_used)
+    intended_ts = intended_exit_time or utc_now_str()
+
+    for attempt in range(1, CLOSE_VERIFY_ATTEMPTS + 1):
+        broker_position = get_position_for_symbol(trading_client, symbol)
+        order = None
+        status = None
+        fill_price = None
+        if current_order_id:
+            order, status, fill_price = get_order_snapshot(trading_client, current_order_id)
+
+        if broker_position is None or abs(position_qty(broker_position)) <= 0.0:
+            if fill_price is None:
+                fill_price, price_source = fetch_fill_price_from_broker(
+                    trading_client,
+                    symbol,
+                    exit_order_id=current_order_id,
+                    open_trade=get_open_trade(symbol),
+                )
+            else:
+                price_source = "order_fill"
+            fill_ts = order_filled_ts(order) if order is not None else None
+            verification_result = "verified_closed" if fill_price is not None else "verified_closed_no_fill"
+            log_line(
+                f"✅ CLOSE VERIFIED {symbol}: context={context} "
+                f"attempt={attempt}/{CLOSE_VERIFY_ATTEMPTS} "
+                f"order_id={current_order_id or 'n/a'} result={verification_result}"
+            )
+            log_trade_close(
+                symbol,
+                fill_price,
+                outcome,
+                exit_order_id=current_order_id,
+                exit_decision_price=decision_price,
+                fill_confirmed=(fill_price is not None),
+                price_source=price_source if fill_price is not None else "verification_no_fill",
+                exit_reason=outcome,
+                intended_exit_time=intended_ts,
+                actual_fill_timestamp=fill_ts,
+                broker_order_id=current_order_id,
+                retry_used=retry_flag,
+                verification_result=verification_result,
+            )
+            _pending_closes.pop(symbol, None)
+            return True
+
+        reason = f"position still open status={status or 'unknown'}"
+        if status in {"canceled", "expired", "rejected"} or current_order_id is None:
+            reason = f"ambiguous close status={status or 'missing_order'}"
+            if attempt < CLOSE_VERIFY_ATTEMPTS:
+                log_line(
+                    f"⚠️ CLOSE VERIFY RETRY {symbol}: context={context} "
+                    f"attempt={attempt}/{CLOSE_VERIFY_ATTEMPTS} reason={reason}"
+                )
+                retry_flag = True
+                state = submit_close_attempt(
+                    trading_client,
+                    symbol,
+                    outcome,
+                    decision_price=decision_price,
+                    force_retry=True,
+                    retry_used=True,
+                    intended_exit_time=intended_ts,
+                )
+                if state is not None:
+                    current_order_id = state.get("order_id") or current_order_id
+                time.sleep(CLOSE_VERIFY_SLEEP_S)
+                continue
+
+        if attempt < CLOSE_VERIFY_ATTEMPTS:
+            log_line(
+                f"⏳ CLOSE VERIFY WAIT {symbol}: context={context} "
+                f"attempt={attempt}/{CLOSE_VERIFY_ATTEMPTS} reason={reason}"
+            )
+            time.sleep(CLOSE_VERIFY_SLEEP_S)
+
+    verification_result = "still_open_after_verification"
+    log_line(
+        f"🚨 CLOSE VERIFICATION FAILED {symbol}: context={context} "
+        f"order_id={current_order_id or 'n/a'} result={verification_result}"
+    )
+    update_trade_exit_audit(
+        symbol,
+        exit_reason=outcome,
+        intended_exit_time=intended_ts,
+        broker_order_id=current_order_id,
+        retry_used=1 if retry_flag else 0,
+        verification_result=verification_result,
+        exit_order_id=current_order_id,
+        exit_decision_price=decision_price,
+    )
+    return False
+
+
+def verify_flattened_positions(trading_client, reason: str, max_attempts: int, sleep_s: int) -> bool:
+    for attempt in range(1, max_attempts + 1):
+        remaining = trading_client.get_all_positions()
+        if not remaining:
+            log_line(f"✅ FLAT VERIFIED: reason={reason} attempt={attempt}/{max_attempts}")
+            return True
+
+        syms = ", ".join(p.symbol for p in remaining)
+        log_line(
+            f"⚠️ FLAT VERIFY {reason}: attempt={attempt}/{max_attempts} "
+            f"still open={syms}"
+        )
+        for p in remaining:
+            try:
+                current_price = float(getattr(p, "current_price"))
+            except Exception:
+                current_price = None
+            submit_close_attempt(
+                trading_client,
+                p.symbol,
+                reason,
+                decision_price=current_price,
+                force_retry=True,
+                retry_used=(attempt > 1),
+            )
+        if attempt < max_attempts:
+            time.sleep(sleep_s)
+
+    remaining = trading_client.get_all_positions()
+    if remaining:
+        syms = ", ".join(p.symbol for p in remaining)
+        log_line(f"🚨 FLAT VERIFY FAILED: reason={reason} still open={syms}")
+        post_discord(f"🚨 FLAT VERIFY FAILED | {reason} | still open: {syms}")
+        return False
+    return True
+
+
+def submit_close_attempt(trading_client, symbol: str, outcome: str, decision_price=None,
+                         force_retry: bool = False, retry_used: bool = False,
+                         intended_exit_time: str | None = None):
     now = time.time()
     state = _pending_closes.get(symbol)
+    intended_ts = intended_exit_time or utc_now_str()
     if state:
         order_id = state.get("order_id")
         retry_after = float(state.get("retry_after", 0))
-        if order_id:
+        if order_id and not force_retry:
             pending_close_log(
                 symbol,
                 f"⏳ CLOSE SKIP {symbol}: close already pending (order_id={order_id}, outcome={state.get('outcome')})"
             )
-            return
-        if now < retry_after:
+            return state
+        if now < retry_after and not force_retry:
             pending_close_log(
                 symbol,
                 f"⏳ CLOSE SKIP {symbol}: cooling down after close failure until "
                 f"{datetime.fromtimestamp(retry_after, cst_tz).strftime('%Y-%m-%d %H:%M:%S')}"
             )
-            return
+            return state
 
     open_trade = get_open_trade(symbol)
     preferred_order_id = None if open_trade is None else open_trade["exit_order_id"]
@@ -1424,12 +1725,24 @@ def submit_close_attempt(trading_client, symbol: str, outcome: str, decision_pri
                 submitted_at=order_submitted_ts(pre_check_order) or now,
                 retry_after=now + CLOSE_RETRY_COOLDOWN_S,
                 last_log_ts=0,
+                retry_used=retry_used,
+                intended_exit_time=intended_ts,
+            )
+            update_trade_exit_audit(
+                symbol,
+                exit_reason=outcome,
+                intended_exit_time=intended_ts,
+                broker_order_id=existing_id,
+                retry_used=1 if retry_used else 0,
+                verification_result=f"existing_close_order_{pre_check_status}",
+                exit_order_id=existing_id,
+                exit_decision_price=decision_price,
             )
             log_line(
                 f"⏳ CLOSE GUARDED {symbol}: existing {pre_check_status} close order "
                 f"{existing_id} already working — tracking instead of re-submitting"
             )
-            return
+            return _pending_closes[symbol]
 
     try:
         close_resp = trading_client.delete(
@@ -1464,11 +1777,24 @@ def submit_close_attempt(trading_client, symbol: str, outcome: str, decision_pri
             retry_after=now + CLOSE_RETRY_COOLDOWN_S,
             cancel_submitted_at=0,
             last_log_ts=now,
+            retry_used=retry_used,
+            intended_exit_time=intended_ts,
+        )
+        update_trade_exit_audit(
+            symbol,
+            exit_reason=outcome,
+            intended_exit_time=intended_ts,
+            broker_order_id=exit_order_id,
+            retry_used=1 if retry_used else 0,
+            verification_result="close_submitted",
+            exit_order_id=exit_order_id,
+            exit_decision_price=decision_price,
         )
         if exit_order_id:
             log_line(f"📤 CLOSE SUBMITTED {symbol} ({outcome}) order_id={exit_order_id}")
         else:
             log_line(f"📤 CLOSE SUBMITTED {symbol} ({outcome}) with no order id returned")
+        return _pending_closes[symbol]
     except Exception as e:
         if is_close_pending_error(str(e)):
             active_order, status, _ = find_active_close_order(
@@ -1488,15 +1814,35 @@ def submit_close_attempt(trading_client, symbol: str, outcome: str, decision_pri
                 retry_after=now + CLOSE_RETRY_COOLDOWN_S,
                 cancel_submitted_at=0,
                 last_log_ts=0,
+                retry_used=retry_used,
+                intended_exit_time=intended_ts,
             )
             if active_order_id:
                 update_trade_exit_decision(symbol, outcome, decision_price)
                 update_trade_exit_order_id(symbol, active_order_id)
+                update_trade_exit_audit(
+                    symbol,
+                    exit_reason=outcome,
+                    intended_exit_time=intended_ts,
+                    broker_order_id=active_order_id,
+                    retry_used=1 if retry_used else 0,
+                    verification_result=f"close_pending_{status or 'unknown'}",
+                    exit_order_id=active_order_id,
+                    exit_decision_price=decision_price,
+                )
                 log_line(
                     f"⏳ CLOSE ORDER WORKING {symbol}: order {active_order_id} "
                     f"status={status or 'unknown'}; broker held qty for existing close | {e}"
                 )
             else:
+                update_trade_exit_audit(
+                    symbol,
+                    exit_reason=outcome,
+                    intended_exit_time=intended_ts,
+                    retry_used=1 if retry_used else 0,
+                    verification_result="close_pending_no_order_id",
+                    exit_decision_price=decision_price,
+                )
                 log_line(
                     f"⏳ CLOSE PENDING {symbol}: broker reports held/open-order state; "
                     f"retrying after cooldown | {e}"
@@ -1511,8 +1857,19 @@ def submit_close_attempt(trading_client, symbol: str, outcome: str, decision_pri
                 retry_after=now + CLOSE_RETRY_COOLDOWN_S,
                 cancel_submitted_at=0,
                 last_log_ts=now,
+                retry_used=retry_used,
+                intended_exit_time=intended_ts,
+            )
+            update_trade_exit_audit(
+                symbol,
+                exit_reason=outcome,
+                intended_exit_time=intended_ts,
+                retry_used=1 if retry_used else 0,
+                verification_result=f"close_submit_failed:{str(e)[:120]}",
+                exit_decision_price=decision_price,
             )
             log_line(f"❌ CLOSE FAIL {symbol}: {e}")
+        return _pending_closes.get(symbol)
 
 
 def hydrate_pending_closes_from_trade_log(trading_client, open_positions):
@@ -1557,6 +1914,8 @@ def hydrate_pending_closes_from_trade_log(trading_client, open_positions):
                         symbol, fill_price, "closed",
                         fill_confirmed=(fill_price is not None),
                         price_source=price_source or "reconciliation_no_exit_id",
+                        exit_reason="closed",
+                        verification_result="reconciled_position_gone",
                     )
                 continue
 
@@ -1576,6 +1935,9 @@ def hydrate_pending_closes_from_trade_log(trading_client, open_positions):
                 exit_decision_price=decision_price,
                 fill_confirmed=(fill_price is not None),
                 price_source=price_source or "reconciliation",
+                exit_reason="closed",
+                broker_order_id=exit_order_id,
+                verification_result="reconciled_position_gone",
             )
             continue
 
@@ -1595,6 +1957,7 @@ def hydrate_pending_closes_from_trade_log(trading_client, open_positions):
             retry_after=time.time(),
             cancel_submitted_at=0,
             last_log_ts=0,
+            intended_exit_time=utc_now_str(),
         )
         if status in PENDING_CLOSE_ORDER_STATUSES:
             log_line(
@@ -1629,6 +1992,11 @@ def reconcile_pending_closes(trading_client, open_positions):
                 exit_decision_price=state.get("decision_price"),
                 fill_confirmed=(fill_price is not None),
                 price_source=price_source or "reconciliation",
+                exit_reason=outcome,
+                intended_exit_time=state.get("intended_exit_time"),
+                broker_order_id=order_id,
+                retry_used=bool(state.get("retry_used")),
+                verification_result="reconciled_position_gone",
             )
             _pending_closes.pop(symbol, None)
             continue
@@ -1700,6 +2068,12 @@ def reconcile_pending_closes(trading_client, open_positions):
                 exit_decision_price=state.get("decision_price"),
                 fill_confirmed=(fill_price is not None and status == "filled"),
                 price_source="order_fill" if (fill_price is not None and status == "filled") else "reconciliation",
+                exit_reason=outcome,
+                intended_exit_time=state.get("intended_exit_time"),
+                actual_fill_timestamp=order_filled_ts(order),
+                broker_order_id=order_id,
+                retry_used=bool(state.get("retry_used")),
+                verification_result="order_filled",
             )
             _pending_closes.pop(symbol, None)
             continue
@@ -1712,6 +2086,9 @@ def reconcile_pending_closes(trading_client, open_positions):
                 symbol,
                 outcome,
                 decision_price=state.get("decision_price"),
+                force_retry=True,
+                retry_used=True,
+                intended_exit_time=state.get("intended_exit_time"),
             )
             continue
 
@@ -2056,21 +2433,41 @@ def manage_positions(trading_client):
                     f"🌙 AFTER HOURS EXIT: {symbol} {side} break-even armed and "
                     f"PnL turned negative ({pnl_pct:.2%}) → closing"
                 )
-                submit_close_attempt(
+                state = submit_close_attempt(
                     trading_client,
                     symbol,
                     "stop_loss",
                     decision_price=current_price,
                 )
+                verify_and_finalize_close(
+                    trading_client,
+                    symbol,
+                    "stop_loss",
+                    decision_price=current_price,
+                    order_id=None if state is None else state.get("order_id"),
+                    intended_exit_time=None if state is None else state.get("intended_exit_time"),
+                    retry_used=bool(state and state.get("retry_used")),
+                    context="after_hours_break_even",
+                )
                 continue
 
             if pnl_pct >= TAKE_PROFIT_PCT:
                 log_line(f"💰 TAKE PROFIT: {symbol} {side} +{pnl_pct:.2%} → closing")
-                submit_close_attempt(
+                state = submit_close_attempt(
                     trading_client,
                     symbol,
                     "take_profit",
                     decision_price=current_price,
+                )
+                verify_and_finalize_close(
+                    trading_client,
+                    symbol,
+                    "take_profit",
+                    decision_price=current_price,
+                    order_id=None if state is None else state.get("order_id"),
+                    intended_exit_time=None if state is None else state.get("intended_exit_time"),
+                    retry_used=bool(state and state.get("retry_used")),
+                    context="take_profit",
                 )
 
             elif pnl_pct <= (0.0 if break_even_armed else -HARD_STOP_LOSS_PCT):
@@ -2080,11 +2477,21 @@ def manage_positions(trading_client):
                     f"🛑 {stop_label}: {symbol} {side} {pnl_pct:.2%} "
                     f"(stop {stop_floor}) → closing"
                 )
-                submit_close_attempt(
+                state = submit_close_attempt(
                     trading_client,
                     symbol,
                     "stop_loss",
                     decision_price=current_price,
+                )
+                verify_and_finalize_close(
+                    trading_client,
+                    symbol,
+                    "stop_loss",
+                    decision_price=current_price,
+                    order_id=None if state is None else state.get("order_id"),
+                    intended_exit_time=None if state is None else state.get("intended_exit_time"),
+                    retry_used=bool(state and state.get("retry_used")),
+                    context="stop_loss",
                 )
 
             elif pnl_pct < -0.01:
@@ -2141,7 +2548,22 @@ def eod_risk_management(trading_client):
                         current_price = float(getattr(p, "current_price"))
                     except Exception:
                         current_price = None
-                    submit_close_attempt(trading_client, sym, "eod_preclose_cut", decision_price=current_price)
+                    state = submit_close_attempt(
+                        trading_client,
+                        sym,
+                        "eod_preclose_cut",
+                        decision_price=current_price,
+                    )
+                    verify_and_finalize_close(
+                        trading_client,
+                        sym,
+                        "eod_preclose_cut",
+                        decision_price=current_price,
+                        order_id=None if state is None else state.get("order_id"),
+                        intended_exit_time=None if state is None else state.get("intended_exit_time"),
+                        retry_used=bool(state and state.get("retry_used")),
+                        context="eod_preclose_cut",
+                    )
             else:
                 log_line("✅ EOD PRE-CLOSE CHECK (3:30pm): no positions down >1% — nothing to cut")
         except Exception as e:
@@ -2168,48 +2590,32 @@ def eod_risk_management(trading_client):
                         current_price = float(getattr(p, "current_price"))
                     except Exception:
                         current_price = None
-                    submit_close_attempt(trading_client, sym, "eod_force_close", decision_price=current_price)
+                    state = submit_close_attempt(
+                        trading_client,
+                        sym,
+                        "eod_force_close",
+                        decision_price=current_price,
+                    )
+                    verify_and_finalize_close(
+                        trading_client,
+                        sym,
+                        "eod_force_close",
+                        decision_price=current_price,
+                        order_id=None if state is None else state.get("order_id"),
+                        intended_exit_time=None if state is None else state.get("intended_exit_time"),
+                        retry_used=bool(state and state.get("retry_used")),
+                        context="eod_force_close",
+                    )
                 post_discord(
                     f"✅ EOD force-close orders submitted for {len(positions)} position(s). "
                     f"No overnight holds."
                 )
-
-                # Verification pass — wait 30s then retry anything still open
-                log_line("⏳ EOD FORCE CLOSE: waiting 30s to verify all positions closed...")
-                time.sleep(30)
-                try:
-                    remaining = trading_client.get_all_positions()
-                    if remaining:
-                        log_line(
-                            f"⚠️ EOD FORCE CLOSE RETRY: {len(remaining)} position(s) still open after 30s — retrying"
-                        )
-                        post_discord(
-                            f"⚠️ EOD RETRY: {len(remaining)} position(s) still open after 30s — re-submitting closes"
-                        )
-                        for p in remaining:
-                            sym = p.symbol
-                            side = "SHORT" if float(p.qty) < 0 else "LONG"
-                            log_line(f"🔴 EOD FORCE CLOSE RETRY {sym} {side}")
-                            try:
-                                current_price = float(getattr(p, "current_price"))
-                            except Exception:
-                                current_price = None
-                            submit_close_attempt(
-                                trading_client, sym, "eod_force_close", decision_price=current_price
-                            )
-                        # Final check after another 30s
-                        time.sleep(30)
-                        still_open = trading_client.get_all_positions()
-                        if still_open:
-                            syms = ", ".join(p.symbol for p in still_open)
-                            log_line(f"🚨 EOD FORCE CLOSE FAILED: {syms} still open after retry — manual intervention required")
-                            post_discord(f"🚨 EOD CLOSE FAILED after retry: {syms} still open. Manual intervention required!")
-                        else:
-                            log_line("✅ EOD FORCE CLOSE: all positions confirmed closed after retry")
-                    else:
-                        log_line("✅ EOD FORCE CLOSE: all positions confirmed closed")
-                except Exception as e:
-                    log_line(f"⚠️ EOD force-close verification error: {e}")
+                verify_flattened_positions(
+                    trading_client,
+                    "eod_force_close",
+                    EOD_FINAL_VERIFY_ATTEMPTS,
+                    EOD_FINAL_VERIFY_SLEEP_S,
+                )
             else:
                 log_line("✅ EOD FORCE CLOSE (3:45pm): no open positions — already flat")
         except Exception as e:
@@ -2641,6 +3047,12 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
 
     held_symbols = [p.symbol for p in positions]
 
+    kill_switch_reason = entry_kill_switch_reason(client, positions=positions)
+    if kill_switch_reason:
+        if should_log_skip(f"entry-kill-switch:{kill_switch_reason}", interval_s=60):
+            log_line(f"🛑 ENTRY BLOCKED {alpaca_symbol}: {kill_switch_reason}")
+        return
+
     # Skip if already holding this symbol in any direction
     if alpaca_symbol in held_symbols:
         if should_log_skip(f"already-held:{alpaca_symbol}", interval_s=60):
@@ -2663,12 +3075,6 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
             if should_log_skip(f"sector-limit:{alpaca_symbol}", interval_s=60):
                 log_line(f"🚫 SKIP SHORT {alpaca_symbol}: {reason}")
             return
-
-    # 5. Max positions check
-    if len(positions) >= MAX_OPEN_POSITIONS:
-        if should_log_skip("max-open-positions", interval_s=60):
-            log_line(f"🚦 SKIP {alpaca_symbol}: Max {MAX_OPEN_POSITIONS} positions reached")
-        return
 
     # 6. Market hours check (stocks only — crypto trades 24/7)
     if not is_crypto:

@@ -11,7 +11,11 @@ import requests
 from datetime import datetime, timedelta
 
 import pytz
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
@@ -34,6 +38,12 @@ DAILY_LOSS_LIMIT = 25.0
 POLL_SECONDS = 10
 EOD_CLOSE_HOUR = 15
 EOD_CLOSE_MINUTE = 45
+MAX_GROSS_EXPOSURE_USD = float(os.getenv("PAPER_MAX_GROSS_EXPOSURE_USD", str(TRADE_NOTIONAL * MAX_OPEN_POSITIONS)))
+MAX_DAILY_REALIZED_LOSS_USD = float(os.getenv("PAPER_MAX_DAILY_REALIZED_LOSS_USD", str(DAILY_LOSS_LIMIT)))
+CLOSE_VERIFY_ATTEMPTS = int(os.getenv("PAPER_CLOSE_VERIFY_ATTEMPTS", "3"))
+CLOSE_VERIFY_SLEEP_S = int(os.getenv("PAPER_CLOSE_VERIFY_SLEEP_SECONDS", "5"))
+EOD_FINAL_VERIFY_ATTEMPTS = int(os.getenv("PAPER_EOD_FINAL_VERIFY_ATTEMPTS", "3"))
+EOD_FINAL_VERIFY_SLEEP_S = int(os.getenv("PAPER_EOD_FINAL_VERIFY_SLEEP_SECONDS", "10"))
 
 DB_PATH = "/home/theplummer92/wolfe_signals.db"
 STATE_DB_PATH = "/home/theplummer92/paper_sniper_state.db"
@@ -86,6 +96,27 @@ def ensure_state_db():
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT,
+                symbol TEXT,
+                exit_reason TEXT,
+                intended_exit_time TEXT,
+                actual_fill_price REAL,
+                actual_fill_timestamp TEXT,
+                broker_order_id TEXT,
+                retry_used INTEGER,
+                verification_result TEXT,
+                pnl_usd REAL
+            )
+            """
+        )
+        try:
+            cur.execute("ALTER TABLE exit_events ADD COLUMN pnl_usd REAL")
+        except Exception:
+            pass
         conn.commit()
     finally:
         conn.close()
@@ -93,6 +124,109 @@ def ensure_state_db():
 
 def utc_now():
     return datetime.now(pytz.UTC)
+
+
+def utc_now_str():
+    return utc_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def order_filled_ts(order):
+    filled_at = getattr(order, "filled_at", None)
+    if isinstance(filled_at, datetime):
+        return filled_at.astimezone(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S")
+    if not filled_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(filled_at).replace("Z", "+00:00"))
+        return parsed.astimezone(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def log_exit_event(symbol: str, exit_reason: str, intended_exit_time: str,
+                   actual_fill_price, actual_fill_timestamp, broker_order_id,
+                   retry_used: bool, verification_result: str, pnl_usd=None):
+    conn = sqlite3.connect(STATE_DB_PATH)
+    try:
+        conn.execute(
+            """
+            INSERT INTO exit_events (
+                created_at, symbol, exit_reason, intended_exit_time,
+                actual_fill_price, actual_fill_timestamp, broker_order_id,
+                retry_used, verification_result, pnl_usd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now_str(),
+                str(symbol).upper(),
+                exit_reason,
+                intended_exit_time,
+                actual_fill_price,
+                actual_fill_timestamp,
+                str(broker_order_id) if broker_order_id else None,
+                1 if retry_used else 0,
+                verification_result,
+                pnl_usd,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_daily_realized_pnl():
+    conn = sqlite3.connect(STATE_DB_PATH)
+    try:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(pnl_usd), 0)
+            FROM exit_events
+            WHERE verification_result LIKE 'closed:%'
+              AND substr(created_at, 1, 10) = ?
+            """,
+            (datetime.now(LOG_TZ).strftime("%Y-%m-%d"),),
+        ).fetchone()
+        return 0.0 if row is None else float(row[0] or 0.0)
+    except Exception:
+        return 0.0
+    finally:
+        conn.close()
+
+
+def get_position_for_symbol(client, symbol: str):
+    try:
+        for position in client.get_all_positions():
+            if position.symbol == symbol:
+                return position
+    except Exception as e:
+        log(f"Position lookup failed for {symbol}: {e}")
+    return None
+
+
+def gross_exposure(positions) -> float:
+    total = 0.0
+    for position in positions or []:
+        try:
+            total += abs(float(getattr(position, "market_value", 0.0)))
+        except Exception:
+            try:
+                total += abs(float(getattr(position, "qty", 0.0))) * abs(float(getattr(position, "current_price", 0.0)))
+            except Exception:
+                pass
+    return total
+
+
+def entry_kill_switch_reason(client, positions=None):
+    open_positions = positions if positions is not None else client.get_all_positions()
+    if len(open_positions) >= MAX_OPEN_POSITIONS:
+        return f"max open positions reached ({len(open_positions)}/{MAX_OPEN_POSITIONS})"
+    current_gross = gross_exposure(open_positions)
+    if current_gross >= MAX_GROSS_EXPOSURE_USD:
+        return f"gross exposure cap reached (${current_gross:.2f}/${MAX_GROSS_EXPOSURE_USD:.2f})"
+    realized_loss = get_daily_realized_pnl()
+    if realized_loss <= -MAX_DAILY_REALIZED_LOSS_USD:
+        return f"daily realized loss limit hit (${abs(realized_loss):.2f}/${MAX_DAILY_REALIZED_LOSS_USD:.2f})"
+    return None
 
 
 def parse_signal_timestamp(signal_ts: str):
@@ -220,6 +354,73 @@ def get_new_signals(last_check):
             conn.close()
 
 
+def close_and_verify_position(client, symbol: str, exit_reason: str, intended_exit_time: str | None = None,
+                              pnl_usd=None):
+    intended_ts = intended_exit_time or utc_now_str()
+    retry_used = False
+    order_id = None
+    exit_order = None
+
+    for attempt in range(1, CLOSE_VERIFY_ATTEMPTS + 1):
+        if attempt > 1:
+            retry_used = True
+            log(f"CLOSE VERIFY RETRY {symbol}: attempt={attempt}/{CLOSE_VERIFY_ATTEMPTS} reason=still_open_or_ambiguous")
+        try:
+            exit_order = client.close_position(symbol)
+            order_id = getattr(exit_order, "id", None)
+        except Exception as e:
+            log(f"CLOSE SUBMIT {symbol}: {e}")
+
+        time.sleep(CLOSE_VERIFY_SLEEP_S)
+
+        position = get_position_for_symbol(client, symbol)
+        broker_fill_price = None
+        broker_fill_ts = None
+        status = "unknown"
+        if order_id:
+            try:
+                exit_order = client.get_order_by_id(order_id)
+                status = str(getattr(exit_order, "status", "unknown")).lower()
+                fill_value = getattr(exit_order, "filled_avg_price", None)
+                broker_fill_price = float(fill_value) if fill_value is not None else None
+                broker_fill_ts = order_filled_ts(exit_order)
+            except Exception as e:
+                log(f"CLOSE VERIFY {symbol}: order lookup failed for {order_id}: {e}")
+
+        if position is None:
+            verification_result = f"closed:{status}"
+            log(f"CLOSE VERIFIED {symbol}: reason={exit_reason} order_id={order_id or 'n/a'} result={verification_result}")
+            log_exit_event(
+                symbol,
+                exit_reason,
+                intended_ts,
+                broker_fill_price,
+                broker_fill_ts or utc_now_str(),
+                order_id,
+                retry_used,
+                verification_result,
+                pnl_usd,
+            )
+            return True
+
+        log(f"CLOSE VERIFY WAIT {symbol}: attempt={attempt}/{CLOSE_VERIFY_ATTEMPTS} status={status} position_still_open")
+
+    verification_result = "still_open_after_verification"
+    log(f"CLOSE VERIFICATION FAILED {symbol}: reason={exit_reason} result={verification_result}")
+    log_exit_event(
+        symbol,
+        exit_reason,
+        intended_ts,
+        None,
+        None,
+        order_id,
+        retry_used,
+        verification_result,
+        pnl_usd,
+    )
+    return False
+
+
 def manage_positions(client):
     try:
         positions = client.get_all_positions()
@@ -230,19 +431,21 @@ def manage_positions(client):
             if pnl_pct >= TAKE_PROFIT_PCT:
                 log(f"TAKE PROFIT: {symbol} {side} +{pnl_pct:.2%} closing")
                 try:
-                    client.close_position(symbol)
                     pnl_usd = TRADE_NOTIONAL * pnl_pct
-                    log(f"CLOSED {symbol} FOR PROFIT")
-                    post_discord(f"📄 PAPER CLOSE | {symbol} TAKE PROFIT | +${pnl_usd:.2f} (+{pnl_pct:.2%})")
+                    verified = close_and_verify_position(client, symbol, "take_profit", pnl_usd=pnl_usd)
+                    if verified:
+                        log(f"CLOSED {symbol} FOR PROFIT")
+                        post_discord(f"📄 PAPER CLOSE | {symbol} TAKE PROFIT | +${pnl_usd:.2f} (+{pnl_pct:.2%})")
                 except Exception as e:
                     log(f"CLOSE FAIL {symbol}: {e}")
             elif pnl_pct <= -STOP_LOSS_PCT:
                 log(f"STOP LOSS: {symbol} {side} {pnl_pct:.2%} closing")
                 try:
-                    client.close_position(symbol)
                     pnl_usd = TRADE_NOTIONAL * pnl_pct
-                    log(f"STOP LOSS EXECUTED {symbol}")
-                    post_discord(f"📄 PAPER CLOSE | {symbol} STOP LOSS | -${abs(pnl_usd):.2f} ({pnl_pct:.2%})")
+                    verified = close_and_verify_position(client, symbol, "stop_loss", pnl_usd=pnl_usd)
+                    if verified:
+                        log(f"STOP LOSS EXECUTED {symbol}")
+                        post_discord(f"📄 PAPER CLOSE | {symbol} STOP LOSS | -${abs(pnl_usd):.2f} ({pnl_pct:.2%})")
                 except Exception as e:
                     log(f"STOP LOSS FAIL {symbol}: {e}")
     except Exception as e:
@@ -284,9 +487,32 @@ def maybe_force_close_eod(client):
                 pnl_pct = float(p.unrealized_plpc)
                 log(f"EOD FORCE CLOSE {sym} {side} {pnl_pct:.2%}")
                 try:
-                    client.close_position(sym)
+                    pnl_usd = TRADE_NOTIONAL * pnl_pct
+                    close_and_verify_position(client, sym, "eod_force_close", pnl_usd=pnl_usd)
                 except Exception as e:
                     log(f"EOD CLOSE FAIL {sym}: {e}")
+            for attempt in range(1, EOD_FINAL_VERIFY_ATTEMPTS + 1):
+                remaining = client.get_all_positions()
+                if not remaining:
+                    log(f"EOD FINAL VERIFY PASS: flat on attempt {attempt}/{EOD_FINAL_VERIFY_ATTEMPTS}")
+                    break
+                syms = ", ".join(p.symbol for p in remaining)
+                log(f"EOD FINAL VERIFY RETRY: attempt {attempt}/{EOD_FINAL_VERIFY_ATTEMPTS} still open={syms}")
+                for p in remaining:
+                    pnl_pct = float(p.unrealized_plpc)
+                    close_and_verify_position(
+                        client,
+                        p.symbol,
+                        "eod_force_close",
+                        pnl_usd=TRADE_NOTIONAL * pnl_pct,
+                    )
+                if attempt < EOD_FINAL_VERIFY_ATTEMPTS:
+                    time.sleep(EOD_FINAL_VERIFY_SLEEP_S)
+            final_remaining = client.get_all_positions()
+            if final_remaining:
+                syms = ", ".join(p.symbol for p in final_remaining)
+                log(f"EOD FINAL VERIFY FAILED: still open={syms}")
+                post_discord(f"🚨 PAPER EOD CLOSE FAILED | still open: {syms}")
         else:
             log("EOD FORCE CLOSE (3:45pm ET): already flat")
     except Exception as e:
@@ -311,6 +537,10 @@ def execute_signal(client, symbol: str, price: float, signal: str, direction: st
             log(f"SKIP {symbol}: invalid signal price {price}")
             return False
         positions = client.get_all_positions()
+        kill_switch_reason = entry_kill_switch_reason(client, positions=positions)
+        if kill_switch_reason:
+            log(f"ENTRY BLOCKED {symbol}: {kill_switch_reason}")
+            return False
         held_symbols = {p.symbol for p in positions}
         if symbol in held_symbols:
             log(f"SKIP {symbol}: already have position")
