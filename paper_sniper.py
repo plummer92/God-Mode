@@ -35,6 +35,19 @@ MAX_OPEN_POSITIONS = 20
 MAX_SIGNAL_AGE_SECONDS = 1800
 DEDUP_WINDOW_SECONDS = 300
 DAILY_LOSS_LIMIT = 25.0
+
+# Wild experiment: no approved_symbols.json filter — trade any godmode signal
+# that passes RVOL threshold and is not a known bad actor.
+WILD_RVOL_MIN = 2.0
+
+# Hardcoded blacklist: penny stocks, halted/delisted frequent fliers, and
+# symbols that routinely gap / have no Alpaca liquidity.
+WILD_BLACKLIST = {
+    "MULN", "FFIE", "MVIS", "NKLA", "GOEV", "RIDE", "WKHS", "CLOV", "SPCE",
+    "BBBYQ", "APRN", "MLGO", "SOXS", "SOXL", "UVXY", "SVXY", "VIXY",
+    "TQQQ", "SQQQ", "SPXS", "SPXU", "SPXL", "UPRO", "TNA", "TZA",
+    "LABU", "LABD", "FNGU", "FNGD", "KOLD", "BOIL",
+}
 POLL_SECONDS = 10
 EOD_CLOSE_HOUR = 15
 EOD_CLOSE_MINUTE = 45
@@ -336,9 +349,10 @@ def get_new_signals(last_check):
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
+        # Wild mode: fetch ALL signal types (no signal_type filter), include rvol
         cur.execute(
             """
-            SELECT rowid, timestamp, symbol, signal_type, price, flow_m, change_pct
+            SELECT rowid, timestamp, symbol, signal_type, price, flow_m, change_pct, rvol
             FROM signals
             WHERE timestamp > ?
             ORDER BY timestamp ASC
@@ -591,18 +605,18 @@ def run():
 
 def _run():
     ensure_state_db()
-    log("PAPER SNIPER starting - wild experiment mode, all signal types")
+    log("PAPER SNIPER starting - wild experiment mode, no approved-symbols filter")
     log(
         f"Trade size: ${TRADE_NOTIONAL:.2f} | TP: {TAKE_PROFIT_PCT:.2%} | "
         f"SL: {STOP_LOSS_PCT:.2%} | Max positions: {MAX_OPEN_POSITIONS}"
     )
     log(
         f"Signal max age: {MAX_SIGNAL_AGE_SECONDS}s | Dedup window: {DEDUP_WINDOW_SECONDS}s | "
-        f"EOD force close: 3:45pm ET"
+        f"EOD force close: 3:45pm ET | RVOL min: {WILD_RVOL_MIN} | Blacklist: {len(WILD_BLACKLIST)} symbols"
     )
     post_discord(
-        f"📄 PAPER SNIPER ONLINE | wild mode | ${TRADE_NOTIONAL:.0f}/trade | "
-        f"TP {TAKE_PROFIT_PCT:.2%} SL {STOP_LOSS_PCT:.2%} | 3:45pm ET flat"
+        f"📄 PAPER SNIPER ONLINE | wild mode (no roster filter) | ${TRADE_NOTIONAL:.0f}/trade | "
+        f"TP {TAKE_PROFIT_PCT:.2%} SL {STOP_LOSS_PCT:.2%} | RVOL≥{WILD_RVOL_MIN} | 3:45pm ET flat"
     )
 
     client = get_client()
@@ -630,32 +644,43 @@ def _run():
 
             signals = get_new_signals(last_check)
             if signals and can_open_new_positions_now():
-                for rowid, signal_ts, symbol, signal_type, price, flow_m, change_pct in signals:
+                for rowid, signal_ts, symbol, signal_type, price, flow_m, change_pct, rvol in signals:
+                    sym_upper = str(symbol).upper()
+
+                    # Wild experiment filters (approved_symbols.json intentionally bypassed)
+                    rvol_val = float(rvol) if rvol is not None else 0.0
+                    if rvol_val < WILD_RVOL_MIN:
+                        log(f"SKIP {sym_upper}: rvol={rvol_val:.2f} < {WILD_RVOL_MIN}")
+                        continue
+                    if sym_upper in WILD_BLACKLIST:
+                        log(f"SKIP {sym_upper}: blacklisted")
+                        continue
+
                     direction = parse_signal_direction(signal_type, flow_m=flow_m, change_pct=change_pct)
                     if direction is None:
-                        log(f"SKIP {symbol}: unknown direction for signal '{signal_type}'")
+                        log(f"SKIP {sym_upper}: unknown direction for signal '{signal_type}'")
                         continue
 
                     parsed_ts = parse_signal_timestamp(signal_ts)
                     if parsed_ts is None:
-                        log(f"SKIP {symbol}: invalid timestamp '{signal_ts}'")
+                        log(f"SKIP {sym_upper}: invalid timestamp '{signal_ts}'")
                         continue
 
                     signal_age_seconds = max(0.0, (utc_now() - parsed_ts).total_seconds())
                     if signal_age_seconds > MAX_SIGNAL_AGE_SECONDS:
                         log(
-                            f"SKIP {symbol} {direction}: stale signal "
+                            f"SKIP {sym_upper} {direction}: stale signal "
                             f"age={signal_age_seconds:.1f}s signal=${float(price):.4f}"
                         )
                         continue
 
-                    signal_key = make_dedup_key(signal_ts, symbol, direction)
+                    signal_key = make_dedup_key(signal_ts, sym_upper, direction)
                     if is_signal_processed(signal_key):
-                        log(f"SKIP DUPE {symbol} {direction}: already acted on this 5-minute window")
+                        log(f"SKIP DUPE {sym_upper} {direction}: already acted on this 5-minute window")
                         continue
 
-                    if execute_signal(client, str(symbol).upper(), float(price), signal_type, direction):
-                        mark_signal_processed(signal_key, signal_ts, symbol, signal_type, direction)
+                    if execute_signal(client, sym_upper, float(price), signal_type, direction):
+                        mark_signal_processed(signal_key, signal_ts, sym_upper, signal_type, direction)
 
             last_check = (datetime.utcnow() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
             positions = client.get_all_positions()
