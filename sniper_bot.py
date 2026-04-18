@@ -399,7 +399,7 @@ def log_trade_open(symbol, direction, fill_price, signal_type, notional, signal_
                    entry_order_id=None, fill_confirmed=True, price_source="order_fill",
                    signal_age_seconds=None, entry_validation_price=None,
                    signal_to_live_drift_bps=None, execution_quality_flag=None,
-                   execution_size_multiplier_used=None):
+                   execution_size_multiplier_used=None, catalyst_type="CLEAN"):
     """
     Log a trade open.  fill_price is the actual Alpaca fill (filled_avg_price).
     signal_price is what the scanner saw when the signal fired — stored separately
@@ -434,10 +434,11 @@ def log_trade_open(symbol, direction, fill_price, signal_type, notional, signal_
         log_slippage(symbol, direction, "entry", signal_price, fill_price, price_source)
         slip_str = f" | slip {entry_slip['bps']:+.1f}bps" if abs(entry_slip["bps"]) >= 0.1 else ""
         fill_note = "" if fill_confirmed else f" | {price_source}"
+        catalyst_str = f" | {catalyst_type}" if direction == "SHORT" and catalyst_type != "CLEAN" else ""
         post_discord(
             f"**TRADE OPEN** | {direction} {symbol} @ ${fill_price:.2f}"
             f" | signal ${signal_price:.2f}{slip_str}"
-            f" | {signal_type} | ${notional:.2f} notional{fill_note}"
+            f" | {signal_type}{catalyst_str} | ${notional:.2f} notional{fill_note}"
         )
     except Exception as e:
         log_line(f"⚠️ Trade log open error: {e}")
@@ -2631,7 +2632,8 @@ def get_new_signals(last_check_ts: str):
         cursor = conn.cursor()
         query = """
             SELECT rowid, timestamp, symbol, signal_type, price, confidence,
-                   COALESCE(news_flag, 'CLEAN') AS news_flag
+                   COALESCE(news_flag, 'CLEAN') AS news_flag,
+                   COALESCE(catalyst_type, 'CLEAN') AS catalyst_type
             FROM signals
             WHERE timestamp > ?
             AND (signal_type LIKE '%STRONG%' OR signal_type LIKE '%ABSORPTION%')
@@ -2966,7 +2968,7 @@ def check_sector_short_limit(symbol: str, open_shorts: set, sectors: dict) -> st
 # -------------------- TRADE EXECUTION --------------------
 def execute_entry(client, symbol: str, signal: str, price: float, confidence=None,
                   signal_key: str | None = None, signal_ts: str | None = None,
-                  market_context: dict | None = None):
+                  market_context: dict | None = None, catalyst_type: str = "CLEAN"):
     """
     Execute a trade with full shorting support.
 
@@ -3256,6 +3258,7 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
             signal_to_live_drift_bps=validation["absolute_move_bps"],
             execution_quality_flag=execution_quality_flag,
             execution_size_multiplier_used=execution_size_multiplier,
+            catalyst_type=catalyst_type,
         )
     except Exception as e:
         log_line(f"❌ ORDER FAIL {alpaca_symbol}: {e}")
@@ -3384,7 +3387,7 @@ def run():
                 # best_per_slot maps dedup_key -> signal tuple
                 best_per_slot: dict = {}
                 for s in signals:
-                    signal_rowid, signal_ts, sym, stype, price, confidence, news_flag = s
+                    signal_rowid, signal_ts, sym, stype, price, confidence, news_flag, catalyst_type = s
                     direction = parse_signal_direction(stype)
                     if direction is None:
                         continue
@@ -3401,7 +3404,7 @@ def run():
                         best_per_slot[dedup_key] = s
 
                 for dedup_key, s in best_per_slot.items():
-                    signal_rowid, signal_ts, sym, stype, price, confidence, news_flag = s
+                    signal_rowid, signal_ts, sym, stype, price, confidence, news_flag, catalyst_type = s
                     direction = parse_signal_direction(stype)
                     if direction is None:
                         log_line(f"⛔ SKIP {sym}: Unknown signal direction for '{stype}'")
@@ -3420,6 +3423,20 @@ def run():
                         except (TypeError, ValueError):
                             pass
 
+                    # Catalyst confidence bonus for SHORT entries
+                    # EARNINGS_MISS / DOWNGRADE: +20  |  LEGAL / FDA_FAIL: +15
+                    catalyst_boost = 0
+                    if direction == "SHORT":
+                        if catalyst_type in ("EARNINGS_MISS", "DOWNGRADE"):
+                            catalyst_boost = 20
+                        elif catalyst_type in ("LEGAL", "FDA_FAIL"):
+                            catalyst_boost = 15
+                    if catalyst_boost > 0:
+                        try:
+                            effective_confidence = min(100, int(effective_confidence or 50) + catalyst_boost)
+                        except (TypeError, ValueError):
+                            pass
+
                     # Block specific signal types with poor live performance.
                     canonical_stype = stype.strip()
                     if canonical_stype in BLOCKED_SIGNAL_TYPES:
@@ -3430,14 +3447,26 @@ def run():
                         mark_signal_processed(signal_key, signal_ts, sym, stype, direction, confidence, "blocked_signal_type")
                         continue
 
-                    # SELL_ONLY regime: block all new entries, not just longs.
-                    # Live data (2026-04-14): 16.7% WR, -$5.79 P&L in this regime.
+                    # Regime gating — catalyst-aware for SHORT entries.
+                    # Catalyst shorts (non-CLEAN) bypass regime restrictions and fire in any regime.
+                    # CLEAN shorts only allowed in SELL_ONLY (market already in downtrend).
+                    # OPEN regime: catalyst shorts allowed, CLEAN shorts blocked.
+                    # SELL_ONLY regime: all shorts allowed; longs still blocked.
                     if regime_mode == "SELL_ONLY":
+                        if direction == "LONG":
+                            log_line(
+                                f"📉 SELL-ONLY regime — blocking LONG entry. "
+                                f"Skipping {sym} LONG '{stype}'."
+                            )
+                            continue
+                        # direction == SHORT: allow (fall through)
+                    elif regime_mode == "OPEN" and direction == "SHORT" and catalyst_boost == 0:
                         log_line(
-                            f"📉 SELL-ONLY regime — blocking ALL new entries (live WR 16.7%, "
-                            f"-$5.79 P&L). Skipping {sym} {direction} '{stype}'."
+                            f"⛔ SKIP SHORT {sym} '{stype}': OPEN regime, catalyst=CLEAN — "
+                            f"CLEAN shorts require SELL_ONLY regime or a catalyst."
                         )
                         continue
+
                     blocked, block_reason = should_block_direction(market_context, direction)
                     if blocked:
                         if should_log_skip(f"market-context:{sym}:{direction}:{block_reason}", interval_s=300):
@@ -3454,6 +3483,7 @@ def run():
                         confidence=effective_confidence,
                         signal_key=signal_key,
                         signal_ts=signal_ts,
+                        catalyst_type=catalyst_type,
                         market_context=market_context,
                     )
                 last_check = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")

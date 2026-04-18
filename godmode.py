@@ -69,6 +69,7 @@ APCA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
 APCA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
 NEWS_CACHE_TTL = 600  # 10 minutes per symbol
 _news_cache: Dict[str, tuple] = {}  # symbol -> (epoch_checked, news_flag)
+_catalyst_cache: Dict[str, tuple] = {}  # symbol -> (epoch_checked, catalyst_type)
 
 # ---------------- ABSORPTION -> RESOLUTION PARAMS ----------------
 # "absorption" = high RVOL + tiny move + big $flow
@@ -208,6 +209,75 @@ def fetch_news_flag(symbol: str) -> str:
     return flag
 
 
+# ---------------- ALPACA NEWS CATALYST TYPE ----------------
+_CATALYST_KEYWORDS = {
+    "EARNINGS_MISS": [
+        "miss", "below expectations", "disappoints", "cuts guidance", "lowers guidance",
+    ],
+    "DOWNGRADE": [
+        "downgrade", "cut to", "lowers price target", "reduces to",
+    ],
+    "FDA_FAIL": [
+        "fda", "rejected", "failed trial", "clinical hold",
+    ],
+    "LEGAL": [
+        "lawsuit", "sec investigation", "fraud", "probe",
+    ],
+}
+
+
+def fetch_catalyst_type(symbol: str) -> str:
+    """
+    Returns the catalyst type for the given symbol based on Alpaca News headlines
+    in the last 4 hours.  Only meaningful for SELL signals.
+
+    Categories (first match wins, checked in order):
+      EARNINGS_MISS — miss / below expectations / disappoints / cuts guidance / lowers guidance
+      DOWNGRADE     — downgrade / cut to / lowers price target / reduces to
+      FDA_FAIL      — FDA / rejected / failed trial / clinical hold
+      LEGAL         — lawsuit / SEC investigation / fraud / probe
+      CLEAN         — no news or no matching keywords
+
+    Results cached per symbol for NEWS_CACHE_TTL seconds.
+    Non-stock symbols (crypto, futures, macro) always return CLEAN.
+    """
+    if not _is_alpaca_stock(symbol):
+        return "CLEAN"
+
+    now_epoch = time.time()
+    cached = _catalyst_cache.get(symbol)
+    if cached and (now_epoch - cached[0]) < NEWS_CACHE_TTL:
+        return cached[1]
+
+    if not APCA_KEY or not APCA_SECRET:
+        return "CLEAN"
+
+    catalyst = "CLEAN"
+    try:
+        start_iso = (datetime.now(timezone.utc) - timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        resp = requests.get(
+            "https://data.alpaca.markets/v1beta1/news",
+            params={"symbols": symbol, "start": start_iso, "limit": 10},
+            headers={"APCA-API-KEY-ID": APCA_KEY, "APCA-API-SECRET-KEY": APCA_SECRET},
+            timeout=6,
+        )
+        if resp.status_code == 200:
+            articles = resp.json().get("news", [])
+            all_text = " ".join(
+                (a.get("headline", "") + " " + a.get("summary", "")).lower()
+                for a in articles
+            )
+            for cat, keywords in _CATALYST_KEYWORDS.items():
+                if any(kw in all_text for kw in keywords):
+                    catalyst = cat
+                    break
+    except Exception:
+        pass
+
+    _catalyst_cache[symbol] = (now_epoch, catalyst)
+    return catalyst
+
+
 # ---------------- UTIL: CSV HELPERS ----------------
 def _ensure_csv(path: str, header: List[str]) -> None:
     if not os.path.exists(path):
@@ -324,13 +394,21 @@ def init_db() -> None:
     except Exception:
         pass  # column already exists
 
+    # Add catalyst_type column if not present
+    try:
+        c.execute("ALTER TABLE signals ADD COLUMN catalyst_type TEXT DEFAULT 'CLEAN'")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
+
     conn.commit()
     conn.close()
     log(f"{Fore.GREEN}✅ DB ready: {DB_PATH}")
 
 def save_signal_to_db(symbol: str, sector: str, signal_type: str,
                       price: float, change_pct: float, rvol: float, flow_m: float,
-                      news_flag: str = "CLEAN", time_session: str = "UNKNOWN") -> None:
+                      news_flag: str = "CLEAN", time_session: str = "UNKNOWN",
+                      catalyst_type: str = "CLEAN") -> None:
     confidence = 50
     if "ABSORPTION" in signal_type:
         confidence += 30
@@ -347,12 +425,12 @@ def save_signal_to_db(symbol: str, sector: str, signal_type: str,
         c.execute("""
             INSERT INTO signals (
                 timestamp, symbol, signal_type, price, rvol, flow_m,
-                confidence, sector, change_pct, news_flag, time_session
+                confidence, sector, change_pct, news_flag, time_session, catalyst_type
             ) VALUES (
-                datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
         """, (symbol, signal_type, price, rvol, flow_m, confidence, sector,
-              float(change_pct), news_flag, time_session))
+              float(change_pct), news_flag, time_session, catalyst_type))
         conn.commit()
     except Exception as e:
         log(f"{Fore.RED}DB Write Error (signals): {e}")
@@ -845,6 +923,8 @@ def run_god_mode_pro() -> None:
                                 log(f"TREND GATE: {signal_lbl} on {symbol} suppressed — SPY below MA20")
                             else:
                                 news_flag = fetch_news_flag(symbol)
+                                is_sell_signal = "SELL" in signal_lbl and "BUY" not in signal_lbl
+                                catalyst_type = fetch_catalyst_type(symbol) if is_sell_signal else "CLEAN"
                                 passed_quality_gate, gate_reason = _passes_signal_quality_gate(
                                     symbol=symbol,
                                     signal_lbl=signal_lbl,
@@ -871,12 +951,14 @@ def run_god_mode_pro() -> None:
                                     flow_m=flow_m,
                                     news_flag=news_flag,
                                     time_session=session,
+                                    catalyst_type=catalyst_type,
                                 )
 
                                 now_epoch = time.time()
                                 if (now_epoch - last_alert_ts.get(symbol, 0) > 1200) or ("CLIMAX" in signal_lbl):
                                     news_tag = "[NEWS]" if news_flag == "NEWS_DRIVEN" else "[CLEAN]"
-                                    log(f"🚀 {signal_lbl}: {symbol} {news_tag} | Flow: ${flow_m:+.1f}M | RVOL={rvol:.2f} | Δ={change_pct*100:.2f}%")
+                                    cat_tag = f"[{catalyst_type}]" if catalyst_type != "CLEAN" else ""
+                                    log(f"🚀 {signal_lbl}: {symbol} {news_tag}{cat_tag} | Flow: ${flow_m:+.1f}M | RVOL={rvol:.2f} | Δ={change_pct*100:.2f}%")
                                     post_discord(symbol, signal_lbl, rvol, flow_m, news_flag)
                                     last_alert_ts[symbol] = now_epoch
 
