@@ -419,6 +419,176 @@ def build_roster(rows, current_data, cooling_rows=None):
     return payload
 
 
+def check_wild_paper_performance(payload):
+    """
+    Query Alpaca paper account closed trades and promote/demote symbols
+    based on wild paper performance.
+
+    Promotion rules (applied AFTER build_roster):
+      - >= 3 closed round-trip trades AND win_rate >= 60% -> add to buy or sell list
+        (direction decided by which side produced more wins)
+      - >= 3 closed round-trip trades AND win_rate < 30%  -> add to cooling_off
+      - Never promote a symbol already in cooling_off on live roster
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv("/home/theplummer92/.env")
+    except Exception:
+        pass
+
+    paper_key    = os.environ.get("APCA_PAPER_KEY_ID")
+    paper_secret = os.environ.get("APCA_PAPER_SECRET_KEY")
+
+    if not paper_key or not paper_secret:
+        print("[roster-wild] Skipping: APCA_PAPER_KEY_ID or APCA_PAPER_SECRET_KEY not set")
+        return
+
+    try:
+        from alpaca.trading.client import TradingClient
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+    except ImportError as e:
+        print(f"[roster-wild] Skipping: alpaca SDK not available: {e}")
+        return
+
+    try:
+        client = TradingClient(paper_key, paper_secret, paper=True)
+        req    = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500)
+        orders = client.get_orders(filter=req)
+    except Exception as e:
+        print(f"[roster-wild] Failed to fetch paper orders: {e}")
+        return
+
+    filled = [o for o in orders if str(o.status.value) == "filled"]
+    if not filled:
+        print("[roster-wild] No filled paper orders found — nothing to evaluate")
+        return
+
+    filled.sort(key=lambda o: o.filled_at)
+
+    # Pair orders into round-trip trades via FIFO lot matching
+    # open_lots: {symbol: [{"side": "buy"|"sell", "qty": float, "price": float}, ...]}
+    open_lots          = {}
+    trades_by_symbol   = {}   # {symbol: [{"side": "long"|"short", "win": bool}, ...]}
+
+    for order in filled:
+        sym   = order.symbol
+        side  = str(order.side.value).lower()   # "buy" or "sell"
+        qty   = float(order.filled_qty)
+        price = float(order.filled_avg_price)
+
+        lots = open_lots.setdefault(sym, [])
+        trades_by_symbol.setdefault(sym, [])
+
+        if not lots or lots[0]["side"] == side:
+            # Opening or adding to an existing position
+            lots.append({"side": side, "qty": qty, "price": price})
+        else:
+            # Closing / reducing the existing position
+            existing_side      = lots[0]["side"]
+            remaining_close    = qty
+
+            while lots and remaining_close > 0:
+                lot       = lots[0]
+                close_qty = min(lot["qty"], remaining_close)
+
+                if existing_side == "buy":
+                    trade_side = "long"
+                    pnl        = (price - lot["price"]) * close_qty
+                else:
+                    trade_side = "short"
+                    pnl        = (lot["price"] - price) * close_qty
+
+                trades_by_symbol[sym].append({"side": trade_side, "win": pnl > 0})
+
+                remaining_close -= close_qty
+                lot["qty"]      -= close_qty
+                if lot["qty"] <= 0:
+                    lots.pop(0)
+
+            # Any leftover qty opens a new position in the opposite direction
+            if remaining_close > 0:
+                lots.append({"side": side, "qty": remaining_close, "price": price})
+
+    WILD_MIN_TRADES = 3
+    WILD_PROMOTE_WR = 0.60
+    WILD_DEMOTE_WR  = 0.30
+
+    current_cooling = set(payload.get("cooling_off", []))
+    buy_list        = list(payload.get("buy", []))
+    sell_list       = list(payload.get("sell", []))
+
+    for sym, trade_list in trades_by_symbol.items():
+        if len(trade_list) < WILD_MIN_TRADES:
+            continue
+
+        total = len(trade_list)
+        wins  = sum(1 for t in trade_list if t["win"])
+        wr    = wins / total
+
+        if wr >= WILD_PROMOTE_WR:
+            if sym in current_cooling:
+                print(
+                    f"[roster-wild] SKIP PROMOTE {sym} — already in cooling_off (live) "
+                    f"— paper WR {wr:.0%} on {total} trades"
+                )
+                continue
+
+            long_wins  = sum(1 for t in trade_list if t["win"] and t["side"] == "long")
+            short_wins = sum(1 for t in trade_list if t["win"] and t["side"] == "short")
+
+            if long_wins >= short_wins:
+                if sym not in buy_list:
+                    buy_list.append(sym)
+                    print(
+                        f"[roster-wild] PROMOTED {sym} to buy list "
+                        f"— paper WR {wr:.0%} on {total} trades"
+                    )
+                else:
+                    print(
+                        f"[roster-wild] ALREADY IN buy list {sym} "
+                        f"— paper WR {wr:.0%} on {total} trades"
+                    )
+            else:
+                if sym not in sell_list:
+                    sell_list.append(sym)
+                    print(
+                        f"[roster-wild] PROMOTED {sym} to sell list "
+                        f"— paper WR {wr:.0%} on {total} trades"
+                    )
+                else:
+                    print(
+                        f"[roster-wild] ALREADY IN sell list {sym} "
+                        f"— paper WR {wr:.0%} on {total} trades"
+                    )
+
+        elif wr < WILD_DEMOTE_WR:
+            if sym not in current_cooling:
+                current_cooling.add(sym)
+                buy_list  = [s for s in buy_list  if s != sym]
+                sell_list = [s for s in sell_list if s != sym]
+                print(
+                    f"[roster-wild] MOVED {sym} to cooling_off "
+                    f"— paper WR {wr:.0%} on {total} trades"
+                )
+            else:
+                print(
+                    f"[roster-wild] ALREADY IN cooling_off {sym} "
+                    f"— paper WR {wr:.0%} on {total} trades"
+                )
+
+        else:
+            print(
+                f"[roster-wild] WATCHING {sym} "
+                f"— paper WR {wr:.0%} on {total} trades (inconclusive, need more data)"
+            )
+
+    payload["buy"]        = buy_list
+    payload["sell"]       = sell_list
+    payload["cooling_off"] = sorted(current_cooling)
+    payload["approved"]   = sorted(set(buy_list + sell_list + CRYPTO_SYMBOLS))
+
+
 def main():
     try:
         with open(OUT_PATH) as f:
@@ -436,6 +606,8 @@ def main():
     cooling_off_list = [s for s in current_data.get("cooling_off", []) if s.upper() not in overfit_symbols]
     cooling_rows = fetch_latest_rows_for_symbols(cooling_off_list)
     payload = build_roster(rows, current_data, cooling_rows)
+
+    check_wild_paper_performance(payload)
 
     with open(OUT_PATH, "w") as f:
         json.dump(payload, f, indent=2)
