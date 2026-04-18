@@ -67,6 +67,7 @@ STOCK_DATA_FEED = os.getenv("ALPACA_STOCK_DATA_FEED", "iex")
 # ---------------- ALPACA NEWS ----------------
 APCA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
 APCA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 NEWS_CACHE_TTL = 600  # 10 minutes per symbol
 _news_cache: Dict[str, tuple] = {}  # symbol -> (epoch_checked, news_flag)
 _catalyst_cache: Dict[str, tuple] = {}  # symbol -> (epoch_checked, catalyst_type)
@@ -226,18 +227,75 @@ _CATALYST_KEYWORDS = {
 }
 
 
+_VALID_CATALYST_CATEGORIES = frozenset(
+    ["EARNINGS_MISS", "DOWNGRADE", "FDA_FAIL", "LEGAL", "MACRO", "CLEAN"]
+)
+
+
+def _classify_with_gemini(symbol: str, headlines: List[str]) -> Optional[str]:
+    """Send headlines to Gemini for classification. Returns category or None on failure."""
+    if not GEMINI_API_KEY:
+        return None
+    headlines_text = "\n".join(f"- {h}" for h in headlines)
+    prompt = (
+        f"You are a financial news classifier. Classify the following news headlines for stock {symbol} "
+        f"into exactly one category. Respond with ONLY the category name, nothing else.\n\n"
+        f"Categories:\n"
+        f"EARNINGS_MISS - missed earnings, cut guidance, revenue below expectations, disappoints\n"
+        f"DOWNGRADE - analyst downgrade, price target cut, rating lowered\n"
+        f"FDA_FAIL - FDA rejection, failed clinical trial, clinical hold\n"
+        f"LEGAL - lawsuit, SEC investigation, fraud, DOJ probe\n"
+        f"MACRO - broad market news not specific to this stock\n"
+        f"CLEAN - positive news or no negative catalyst\n\n"
+        f"Headlines for {symbol}:\n{headlines_text}\n\n"
+        f"Respond with only one word from the category list above."
+    )
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+            f"?key={GEMINI_API_KEY}",
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 200, "temperature": 0},
+            },
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            parts = resp.json()["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts).strip().upper()
+            first_word = text.split()[0] if text else ""
+            if first_word in _VALID_CATALYST_CATEGORIES:
+                return first_word
+            for cat in _VALID_CATALYST_CATEGORIES:
+                if cat in text:
+                    return cat
+    except Exception:
+        pass
+    return None
+
+
+def _classify_with_keywords(all_text: str) -> str:
+    """Keyword fallback classifier. Returns first matching category or CLEAN."""
+    for cat, keywords in _CATALYST_KEYWORDS.items():
+        if any(kw in all_text for kw in keywords):
+            return cat
+    return "CLEAN"
+
+
 def fetch_catalyst_type(symbol: str) -> str:
     """
     Returns the catalyst type for the given symbol based on Alpaca News headlines
     in the last 4 hours.  Only meaningful for SELL signals.
 
-    Categories (first match wins, checked in order):
-      EARNINGS_MISS — miss / below expectations / disappoints / cuts guidance / lowers guidance
-      DOWNGRADE     — downgrade / cut to / lowers price target / reduces to
-      FDA_FAIL      — FDA / rejected / failed trial / clinical hold
-      LEGAL         — lawsuit / SEC investigation / fraud / probe
-      CLEAN         — no news or no matching keywords
+    Categories:
+      EARNINGS_MISS — missed earnings, cut guidance, revenue below expectations
+      DOWNGRADE     — analyst downgrade, price target cut, rating lowered
+      FDA_FAIL      — FDA rejection, failed clinical trial, clinical hold
+      LEGAL         — lawsuit, SEC investigation, fraud, DOJ probe
+      MACRO         — broad market news not specific to this stock
+      CLEAN         — positive news or no negative catalyst
 
+    Classification uses Gemini API when available; falls back to keyword matching.
     Results cached per symbol for NEWS_CACHE_TTL seconds.
     Non-stock symbols (crypto, futures, macro) always return CLEAN.
     """
@@ -263,14 +321,17 @@ def fetch_catalyst_type(symbol: str) -> str:
         )
         if resp.status_code == 200:
             articles = resp.json().get("news", [])
-            all_text = " ".join(
-                (a.get("headline", "") + " " + a.get("summary", "")).lower()
-                for a in articles
-            )
-            for cat, keywords in _CATALYST_KEYWORDS.items():
-                if any(kw in all_text for kw in keywords):
-                    catalyst = cat
-                    break
+            if articles:
+                headlines = [a.get("headline", "") for a in articles if a.get("headline")]
+                gemini_result = _classify_with_gemini(symbol, headlines)
+                if gemini_result is not None:
+                    catalyst = gemini_result
+                else:
+                    all_text = " ".join(
+                        (a.get("headline", "") + " " + a.get("summary", "")).lower()
+                        for a in articles
+                    )
+                    catalyst = _classify_with_keywords(all_text)
     except Exception:
         pass
 
@@ -783,6 +844,8 @@ signal.signal(signal.SIGINT, _handle_signal)
 # ---------------- MAIN LOOP ----------------
 def run_god_mode_pro() -> None:
     log(f"{Back.WHITE}{Fore.BLACK} 📱 GODMODE V7.0: Scanner starting... {Style.RESET_ALL}")
+    if not GEMINI_API_KEY:
+        log(f"{Fore.YELLOW}⚠️  GEMINI_API_KEY not set — catalyst classification will use keyword fallback only")
     init_db()
     ensure_market_log_header()
     _ensure_csv(ABS_WATCHLIST_PATH, WATCH_HEADER)
