@@ -546,6 +546,41 @@ def load_signal_counts() -> tuple[pd.DataFrame, str | None]:
 
 
 @st.cache_data(ttl=30)
+def load_catalyst_signals(limit: int = 50) -> tuple[pd.DataFrame, str | None]:
+    return run_query(
+        DB_PATH,
+        f"""
+        SELECT timestamp, symbol, signal_type, catalyst_type,
+               ROUND(rvol, 2) AS rvol
+        FROM signals
+        WHERE catalyst_type IS NOT NULL
+          AND catalyst_type != 'CLEAN'
+          AND catalyst_type != ''
+        ORDER BY timestamp DESC
+        LIMIT {int(limit)}
+        """,
+    )
+
+
+@st.cache_data(ttl=30)
+def load_catalyst_today_summary() -> tuple[pd.DataFrame, str | None]:
+    return run_query(
+        DB_PATH,
+        """
+        SELECT
+            COALESCE(catalyst_type, 'CLEAN') AS catalyst_type,
+            COUNT(*) AS signals,
+            SUM(CASE WHEN signal_type LIKE '%SELL%' THEN 1 ELSE 0 END) AS sell_signals,
+            SUM(CASE WHEN signal_type LIKE '%BUY%' THEN 1 ELSE 0 END) AS buy_signals
+        FROM signals
+        WHERE date(timestamp) = date('now')
+        GROUP BY catalyst_type
+        ORDER BY signals DESC
+        """,
+    )
+
+
+@st.cache_data(ttl=30)
 def load_top_movers() -> tuple[pd.DataFrame, str | None]:
     return run_query(
         DB_PATH,
@@ -1654,7 +1689,7 @@ sidebar.markdown(
     unsafe_allow_html=True,
 )
 
-tabs = st.tabs(["Overview", "Execution", "Signals", "Discovery", "Flow Audit", "System"])
+tabs = st.tabs(["Overview", "Execution", "Signals", "Discovery", "Flow Audit", "News & Catalysts", "System"])
 system_perf_placeholder = None
 
 with tabs[0]:
@@ -2215,6 +2250,95 @@ with tabs[4]:
                 render_timed_dataframe(perf, divergence_df, width="stretch", hide_index=True, height=260)
 
 with tabs[5]:
+    st.markdown('<p class="section-header">Catalyst Breakdown — Today</p>', unsafe_allow_html=True)
+    cat_summary_df, cat_summary_err = load_catalyst_today_summary()
+    if cat_summary_err or cat_summary_df.empty:
+        st.info("No catalyst data for today yet.")
+    else:
+        cols = st.columns(len(cat_summary_df))
+        cat_colors = {
+            "EARNINGS_MISS": "#ff6b6b",
+            "DOWNGRADE":     "#ffaa00",
+            "FDA_FAIL":      "#ff4444",
+            "LEGAL":         "#cc44ff",
+            "CLEAN":         "#4aff4a",
+        }
+        for idx, row in cat_summary_df.iterrows():
+            cat = row["catalyst_type"]
+            color = cat_colors.get(cat, "#7aff7a")
+            with cols[idx]:
+                st.markdown(
+                    f'<div class="panel" style="text-align:center;">'
+                    f'<div style="font-size:0.65rem;color:{color};letter-spacing:0.15em;">{cat}</div>'
+                    f'<div style="font-size:1.4rem;font-weight:700;color:{color};margin-top:0.3rem;">{int(row["signals"])}</div>'
+                    f'<div style="font-size:0.6rem;color:#7aff7a;margin-top:0.2rem;">'
+                    f'{int(row["sell_signals"])} sell · {int(row["buy_signals"])} buy</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown('<p class="section-header">Last 50 Catalyst Signals</p>', unsafe_allow_html=True)
+    cat_signals_df, cat_signals_err = load_catalyst_signals()
+    if cat_signals_err or cat_signals_df.empty:
+        st.info(cat_signals_err or "No non-CLEAN catalyst signals found yet.")
+    else:
+        # Join outcome from trade_log: get most recent trade per symbol
+        import sqlite3 as _sqlite3
+        try:
+            tconn = _sqlite3.connect(TRADE_LOG_DB)
+            trades_df = pd.read_sql_query(
+                "SELECT symbol, outcome, entry_time FROM trades ORDER BY id DESC",
+                tconn,
+            )
+            tconn.close()
+            # Keep most recent trade per symbol
+            latest_trades = trades_df.drop_duplicates(subset="symbol", keep="first")[["symbol", "outcome"]]
+            cat_signals_df = cat_signals_df.merge(latest_trades, on="symbol", how="left")
+            cat_signals_df["outcome"] = cat_signals_df["outcome"].fillna("--")
+        except Exception:
+            cat_signals_df["outcome"] = "--"
+
+        # Colour-code catalyst_type column
+        def _cat_style(val):
+            colors = {
+                "EARNINGS_MISS": "color:#ff6b6b;font-weight:700",
+                "DOWNGRADE":     "color:#ffaa00;font-weight:700",
+                "FDA_FAIL":      "color:#ff4444;font-weight:700",
+                "LEGAL":         "color:#cc44ff;font-weight:700",
+            }
+            return colors.get(str(val), "")
+
+        styled = cat_signals_df.style.applymap(_cat_style, subset=["catalyst_type"])
+        started = time.perf_counter()
+        st.dataframe(styled, use_container_width=True, hide_index=True, height=520)
+        perf.add("table_render", time.perf_counter() - started)
+
+    st.markdown('<p class="section-header">Catalyst Short Opportunity Ranking</p>', unsafe_allow_html=True)
+    opp_df, opp_err = run_query(
+        DB_PATH,
+        """
+        SELECT catalyst_type,
+               COUNT(*) AS total_signals,
+               COUNT(DISTINCT symbol) AS unique_symbols,
+               ROUND(AVG(rvol), 2) AS avg_rvol
+        FROM signals
+        WHERE catalyst_type IS NOT NULL
+          AND catalyst_type != 'CLEAN'
+          AND catalyst_type != ''
+          AND signal_type LIKE '%SELL%'
+        GROUP BY catalyst_type
+        ORDER BY total_signals DESC
+        """,
+    )
+    if not opp_err and not opp_df.empty:
+        started = time.perf_counter()
+        st.dataframe(opp_df, use_container_width=True, hide_index=True, height=200)
+        perf.add("table_render", time.perf_counter() - started)
+    else:
+        st.info("No sell-side catalyst data yet.")
+
+
+with tabs[6]:
     system_perf_placeholder = st.empty()
     st.markdown('<p class="section-header">Operator Health</p>', unsafe_allow_html=True)
     health_rows = pd.DataFrame(
