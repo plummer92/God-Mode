@@ -23,7 +23,7 @@ from market_context import (
 )
 
 # -------------------- CONFIG --------------------
-TRADE_NOTIONAL_USD = 25       # Trade size per signal
+TRADE_NOTIONAL_USD = 100      # Trade size per signal
 HARD_STOP_LOSS_PCT = 0.02     # -2.0% hard stop loss
 TAKE_PROFIT_PCT = 0.02        # +2.0% take profit
 BREAK_EVEN_ARM_PCT = 0.0075   # Arm break-even protection after +0.75% unrealized PnL
@@ -39,9 +39,9 @@ EXECUTION_RISK_HAIRCUT_ENTRY_SLIP_BPS = 25
 EXECUTION_RISK_HAIRCUT_MULTIPLIER = 0.85
 
 ENABLE_CONFIDENCE_SIZING = True
-MIN_TRADE_NOTIONAL_USD = 20.0
+MIN_TRADE_NOTIONAL_USD = 80.0
 BASE_TRADE_NOTIONAL_USD = TRADE_NOTIONAL_USD
-MAX_TRADE_NOTIONAL_USD = 35.0
+MAX_TRADE_NOTIONAL_USD = 140.0
 MAX_GROSS_EXPOSURE_USD = 2000.0
 
 # Paths
