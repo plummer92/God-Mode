@@ -14,11 +14,15 @@ import pytz
 
 TRADING_DEV_DIR = os.path.dirname(os.path.abspath(__file__))
 BOOTSTRAP_PATH = os.path.join(TRADING_DEV_DIR, "bootstrap_path.py")
+IMPORT_ROOT = TRADING_DEV_DIR
+if not os.path.exists(BOOTSTRAP_PATH):
+    BOOTSTRAP_PATH = os.path.join(TRADING_DEV_DIR, "trading-dev", "bootstrap_path.py")
+    IMPORT_ROOT = os.path.join(TRADING_DEV_DIR, "trading-dev")
 _bootstrap_spec = importlib.util.spec_from_file_location("bootstrap_path", BOOTSTRAP_PATH)
 _bootstrap_module = importlib.util.module_from_spec(_bootstrap_spec)
 assert _bootstrap_spec is not None and _bootstrap_spec.loader is not None
 _bootstrap_spec.loader.exec_module(_bootstrap_module)
-_bootstrap_module.ensure_trading_dev_first(TRADING_DEV_DIR)
+_bootstrap_module.ensure_trading_dev_first(IMPORT_ROOT)
 
 from alpaca_data import get_stock_hourly_bars
 
@@ -32,6 +36,13 @@ ROSTER_MANAGER_PATH = "/home/theplummer92/roster_manager.py"
 CST     = pytz.timezone("America/Chicago")
 LOOKBACK = 30
 MIN_TRADES = 10
+TRAIN_FRACTION = float(os.getenv("STRATEGY_LAB_TRAIN_FRACTION", "0.6"))
+VALIDATION_FRACTION = float(os.getenv("STRATEGY_LAB_VALIDATION_FRACTION", "0.2"))
+OUT_OF_SAMPLE_FRACTION = max(0.0, 1.0 - TRAIN_FRACTION - VALIDATION_FRACTION)
+LIVE_MIN_TOTAL_TRADES = int(os.getenv("STRATEGY_LAB_LIVE_MIN_TOTAL_TRADES", "30"))
+LIVE_MIN_OOS_TRADES = int(os.getenv("STRATEGY_LAB_LIVE_MIN_OOS_TRADES", "8"))
+OVERFIT_SCORE_GAP_THRESHOLD = float(os.getenv("STRATEGY_LAB_OVERFIT_SCORE_GAP_THRESHOLD", "20.0"))
+OVERFIT_RETURN_GAP_THRESHOLD = float(os.getenv("STRATEGY_LAB_OVERFIT_RETURN_GAP_THRESHOLD", "0.015"))
 try:
     LOOP_SLEEP_SECONDS = int(os.getenv("STRATEGY_LAB_LOOP_SLEEP_SECONDS", "14400"))
 except Exception:
@@ -61,16 +72,16 @@ DISCOVERY_STATUS = "queued_for_validation"
 # Conservative discovery thresholds to surface only symbol/filter combos
 # that stay strong across multiple parameter variants in a single run.
 DISCOVERY_MIN_SUPPORT_VARIANTS = 4
-DISCOVERY_MIN_BEST_SCORE = 245.0
-DISCOVERY_MIN_MEDIAN_SCORE = 235.0
+DISCOVERY_MIN_BEST_SCORE = 55.0
+DISCOVERY_MIN_MEDIAN_SCORE = 50.0
 DISCOVERY_MIN_REPRESENTATIVE_TRADES = 20
-DISCOVERY_MIN_REPRESENTATIVE_WIN_RATE = 0.75
-DISCOVERY_MIN_REPRESENTATIVE_AVG_RETURN = 0.01
+DISCOVERY_MIN_REPRESENTATIVE_WIN_RATE = 0.52
+DISCOVERY_MIN_REPRESENTATIVE_AVG_RETURN = 0.002
 VALIDATION_MIN_SUPPORT_VARIANTS = 8
-VALIDATION_MIN_MEDIAN_SCORE = 245.0
+VALIDATION_MIN_MEDIAN_SCORE = 60.0
 VALIDATION_MIN_REPRESENTATIVE_TRADES = 30
-VALIDATION_MIN_REPRESENTATIVE_WIN_RATE = 0.78
-VALIDATION_MIN_REPRESENTATIVE_AVG_RETURN = 0.012
+VALIDATION_MIN_REPRESENTATIVE_WIN_RATE = 0.54
+VALIDATION_MIN_REPRESENTATIVE_AVG_RETURN = 0.003
 VALIDATION_MAX_DUPLICATE_SHARE = 0.75
 
 
@@ -189,9 +200,32 @@ def init_db():
     _ensure_column(cur, "discovery_ideas", "validation_summary", "TEXT")
     _ensure_column(cur, "discovery_ideas", "validated_at", "TEXT")
     _ensure_column(cur, "validation_queue", "validated_at", "TEXT")
+    for table_name in ("results", "leaderboard"):
+        _ensure_column(cur, table_name, "config_key", "TEXT")
+        _ensure_column(cur, table_name, "in_sample_n_trades", "INTEGER")
+        _ensure_column(cur, table_name, "in_sample_win_rate", "REAL")
+        _ensure_column(cur, table_name, "in_sample_avg_return", "REAL")
+        _ensure_column(cur, table_name, "in_sample_profit_factor", "REAL")
+        _ensure_column(cur, table_name, "validation_n_trades", "INTEGER")
+        _ensure_column(cur, table_name, "validation_win_rate", "REAL")
+        _ensure_column(cur, table_name, "validation_avg_return", "REAL")
+        _ensure_column(cur, table_name, "validation_profit_factor", "REAL")
+        _ensure_column(cur, table_name, "out_of_sample_n_trades", "INTEGER")
+        _ensure_column(cur, table_name, "out_of_sample_win_rate", "REAL")
+        _ensure_column(cur, table_name, "out_of_sample_avg_return", "REAL")
+        _ensure_column(cur, table_name, "out_of_sample_profit_factor", "REAL")
+        _ensure_column(cur, table_name, "overfit_flag", "INTEGER")
+        _ensure_column(cur, table_name, "min_trade_threshold_pass", "INTEGER")
+        _ensure_column(cur, table_name, "final_live_eligible", "INTEGER")
+        _ensure_column(cur, table_name, "consistency_score", "REAL")
+        _ensure_column(cur, table_name, "research_candidate", "INTEGER")
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_results_symbol_filter_score "
         "ON results(symbol, signal_filter, score DESC)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_results_live_eligible_score "
+        "ON results(final_live_eligible, score DESC)"
     )
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_validation_queue_status_id "
@@ -215,6 +249,78 @@ def _median_score(rows):
     return float(np.median([row["sc"] for row in rows]))
 
 
+def _clamp(value, lower, upper):
+    return max(lower, min(upper, value))
+
+
+def _split_signals(signals):
+    total = len(signals)
+    if total <= 0:
+        return [], [], []
+    train_end = max(1, int(total * TRAIN_FRACTION))
+    validation_end = max(train_end + 1, int(total * (TRAIN_FRACTION + VALIDATION_FRACTION)))
+    validation_end = min(validation_end, total)
+    if validation_end >= total and total >= 3:
+        validation_end = total - 1
+    train = signals[:train_end]
+    validation = signals[train_end:validation_end]
+    oos = signals[validation_end:]
+    return train, validation, oos
+
+
+def _trade_metrics(trades):
+    if not trades:
+        return {
+            "n": 0,
+            "wr": 0.0,
+            "ar": 0.0,
+            "pf": 0.0,
+            "total_return": 0.0,
+        }
+    rets = [float(t["ret"]) for t in trades]
+    wins = [ret for ret in rets if ret > 0]
+    losses = [ret for ret in rets if ret <= 0]
+    gross_wins = sum(wins)
+    gross_losses = abs(sum(losses))
+    return {
+        "n": len(rets),
+        "wr": len(wins) / len(rets),
+        "ar": float(np.mean(rets)),
+        "pf": float(gross_wins / gross_losses) if gross_losses > 0 else float(99.0 if gross_wins > 0 else 0.0),
+        "total_return": float(sum(rets)),
+    }
+
+
+def _consistency_score(metric_list):
+    populated = [m for m in metric_list if int(m["n"]) > 0]
+    if len(populated) <= 1:
+        return 0.0
+    returns = [float(m["ar"]) for m in populated]
+    spread = float(np.std(returns))
+    return round(_clamp(1.0 - (spread / 0.03), 0.0, 1.0), 4)
+
+
+def _robust_score(in_sample, validation, out_of_sample, consistency_score, overfit_flag, min_trade_threshold_pass):
+    sample_score = _clamp((out_of_sample["n"] / max(LIVE_MIN_OOS_TRADES, 1)) * 0.6 + (in_sample["n"] / max(LIVE_MIN_TOTAL_TRADES, 1)) * 0.4, 0.0, 1.0)
+    oos_wr = _clamp(out_of_sample["wr"], 0.0, 1.0)
+    oos_return_component = _clamp(out_of_sample["ar"] / 0.03, -1.0, 1.0)
+    oos_pf_component = _clamp(out_of_sample["pf"] / 2.5, 0.0, 1.0)
+    validation_return_component = _clamp(validation["ar"] / 0.03, -1.0, 1.0)
+    score_value = (
+        (oos_wr * 0.25)
+        + (oos_return_component * 0.25)
+        + (oos_pf_component * 0.15)
+        + (sample_score * 0.15)
+        + (float(consistency_score) * 0.15)
+        + (validation_return_component * 0.05)
+    ) * 100.0
+    if overfit_flag:
+        score_value -= 15.0
+    if not min_trade_threshold_pass:
+        score_value -= 20.0
+    return round(score_value, 2)
+
+
 def summarize_discovery_ideas(all_results):
     grouped = {}
     for row in all_results:
@@ -229,9 +335,9 @@ def summarize_discovery_ideas(all_results):
         best_row = max(rows, key=lambda x: x["sc"])
         best_score = float(best_row["sc"])
         median_score = _median_score(rows)
-        representative_n_trades = int(best_row["n"])
-        representative_win_rate = float(best_row["wr"])
-        representative_avg_return = float(best_row["ar"])
+        representative_n_trades = int(best_row.get("oos_n") or best_row["n"])
+        representative_win_rate = float(best_row.get("oos_wr") or best_row["wr"])
+        representative_avg_return = float(best_row.get("oos_ar") or best_row["ar"])
 
         if best_score < DISCOVERY_MIN_BEST_SCORE:
             continue
@@ -246,7 +352,8 @@ def summarize_discovery_ideas(all_results):
 
         summary = (
             f"{symbol} {signal_filter} stayed strong across {support_variants} parameter variants; "
-            f"best_score={best_score:.2f} median_score={median_score:.2f}"
+            f"best_score={best_score:.2f} median_score={median_score:.2f} "
+            f"oos_trades={representative_n_trades}"
         )
         metadata = {
             "thresholds": {
@@ -268,6 +375,8 @@ def summarize_discovery_ideas(all_results):
                 "win_rate": round(representative_win_rate, 4),
                 "avg_return": round(representative_avg_return, 4),
                 "score": round(best_score, 2),
+                "overfit_flag": int(best_row.get("overfit_flag", 0) or 0),
+                "final_live_eligible": int(best_row.get("final_live_eligible", 0) or 0),
             },
         }
         ideas.append(
@@ -409,7 +518,10 @@ def post_validated_idea_alert(idea, verdict, summary):
 
 def _fetch_discovery_validation_rows(cur, symbol, signal_filter):
     cur.execute(
-        """SELECT rvol, tp, sl, hold_hours, n_trades, win_rate, avg_return, profit_factor, score
+        """SELECT rvol, tp, sl, hold_hours, n_trades, win_rate, avg_return, profit_factor, score,
+                  out_of_sample_n_trades, out_of_sample_win_rate, out_of_sample_avg_return,
+                  out_of_sample_profit_factor, overfit_flag, min_trade_threshold_pass,
+                  final_live_eligible, consistency_score
            FROM results
            WHERE symbol=? AND signal_filter=?
            ORDER BY score DESC""",
@@ -428,6 +540,14 @@ def _fetch_discovery_validation_rows(cur, symbol, signal_filter):
                 "avg_return": float(row[6]),
                 "profit_factor": float(row[7]),
                 "score": float(row[8]),
+                "out_of_sample_n_trades": int(row[9] or 0),
+                "out_of_sample_win_rate": float(row[10] or 0.0),
+                "out_of_sample_avg_return": float(row[11] or 0.0),
+                "out_of_sample_profit_factor": float(row[12] or 0.0),
+                "overfit_flag": int(row[13] or 0),
+                "min_trade_threshold_pass": int(row[14] or 0),
+                "final_live_eligible": int(row[15] or 0),
+                "consistency_score": float(row[16] or 0.0),
             }
         )
     return rows
@@ -444,6 +564,8 @@ def _evaluate_validation_rows(rows):
             "representative_win_rate": 0.0,
             "representative_avg_return": 0.0,
             "duplicate_share": 0.0,
+            "overfit_share": 0.0,
+            "live_eligible_share": 0.0,
             "robustness_note": "no supporting result rows found in strategy_lab.db",
         }
 
@@ -451,20 +573,22 @@ def _evaluate_validation_rows(rows):
     best_row = rows[0]
     best_score = float(best_row["score"])
     median_score = float(np.median([row["score"] for row in rows]))
-    representative_n_trades = int(np.median([row["n_trades"] for row in rows]))
-    representative_win_rate = float(np.median([row["win_rate"] for row in rows]))
-    representative_avg_return = float(np.median([row["avg_return"] for row in rows]))
+    representative_n_trades = int(np.median([row["out_of_sample_n_trades"] or row["n_trades"] for row in rows]))
+    representative_win_rate = float(np.median([row["out_of_sample_win_rate"] or row["win_rate"] for row in rows]))
+    representative_avg_return = float(np.median([row["out_of_sample_avg_return"] or row["avg_return"] for row in rows]))
 
     fingerprint_counts = {}
     for row in rows:
         fingerprint = (
-            round(row["n_trades"], 0),
-            round(row["win_rate"], 4),
-            round(row["avg_return"], 4),
+            round(row["out_of_sample_n_trades"] or row["n_trades"], 0),
+            round(row["out_of_sample_win_rate"] or row["win_rate"], 4),
+            round(row["out_of_sample_avg_return"] or row["avg_return"], 4),
             round(row["score"], 2),
         )
         fingerprint_counts[fingerprint] = fingerprint_counts.get(fingerprint, 0) + 1
     duplicate_share = max(fingerprint_counts.values()) / support_variants
+    overfit_share = sum(1 for row in rows if int(row.get("overfit_flag", 0) or 0) == 1) / support_variants
+    live_eligible_share = sum(1 for row in rows if int(row.get("final_live_eligible", 0) or 0) == 1) / support_variants
 
     validated = (
         support_variants >= VALIDATION_MIN_SUPPORT_VARIANTS
@@ -473,6 +597,8 @@ def _evaluate_validation_rows(rows):
         and representative_win_rate >= VALIDATION_MIN_REPRESENTATIVE_WIN_RATE
         and representative_avg_return >= VALIDATION_MIN_REPRESENTATIVE_AVG_RETURN
         and duplicate_share <= VALIDATION_MAX_DUPLICATE_SHARE
+        and overfit_share <= 0.5
+        and live_eligible_share >= 0.5
     )
 
     watchlist = (
@@ -498,6 +624,8 @@ def _evaluate_validation_rows(rows):
 
     if duplicate_share > VALIDATION_MAX_DUPLICATE_SHARE:
         robustness_note += "; duplicate-performance clutter is too concentrated"
+    if overfit_share > 0.5:
+        robustness_note += "; too many variants are flagged as overfit"
 
     return {
         "verdict": verdict,
@@ -508,6 +636,8 @@ def _evaluate_validation_rows(rows):
         "representative_win_rate": representative_win_rate,
         "representative_avg_return": representative_avg_return,
         "duplicate_share": duplicate_share,
+        "overfit_share": overfit_share,
+        "live_eligible_share": live_eligible_share,
         "robustness_note": robustness_note,
     }
 
@@ -519,7 +649,9 @@ def _build_validation_summary(metrics):
         f"representative_n_trades={metrics['representative_n_trades']} | "
         f"representative_win_rate={metrics['representative_win_rate']:.2%} | "
         f"representative_avg_return={metrics['representative_avg_return']:.2%} | "
-        f"duplicate_share={metrics['duplicate_share']:.0%} | {metrics['robustness_note']}"
+        f"duplicate_share={metrics['duplicate_share']:.0%} | "
+        f"overfit_share={metrics['overfit_share']:.0%} | "
+        f"live_eligible_share={metrics['live_eligible_share']:.0%} | {metrics['robustness_note']}"
     )
 
 
@@ -653,9 +785,13 @@ def _dedupe_signals(signals):
     seen = set()
     deduped = []
     for signal in signals:
+        ts_text = str(signal[0])
+        direction = "BUY" if "BUY" in str(signal[1]).upper() else "SELL"
         key = (
-            signal[0][:13],
-            "BUY" if "BUY" in str(signal[1]).upper() else "SELL",
+            ts_text[:13],
+            (ts_text[14:16] if len(ts_text) >= 16 else "00"),
+            direction,
+            round(float(signal[2]), 2),
         )
         if key in seen:
             continue
@@ -725,7 +861,8 @@ def get_price_bars(symbol, start, end, provider=DATA_PROVIDER, allow_fallback=Tr
 
 
 def simulate(symbol, signals, tp, sl, hold_hours, provider=DATA_PROVIDER, lookback_days=LOOKBACK, allow_fallback=True, run_end=None):
-    if not signals: return []
+    if not signals:
+        return []
     end = run_end or datetime.now(timezone.utc)
     start = end - timedelta(days=lookback_days + 5)
     df = get_price_bars(symbol, start, end, provider=provider, allow_fallback=allow_fallback)
@@ -737,32 +874,59 @@ def simulate(symbol, signals, tp, sl, hold_hours, provider=DATA_PROVIDER, lookba
     for sig in signals:
         try:
             ts_str, sig_type, entry_price, _ = sig
-            entry_price = float(entry_price)
             ts = pd.Timestamp(ts_str, tz="UTC")
-            start_idx = int(bar_index.searchsorted(ts, side="left"))
-            if start_idx >= len(df):
+            entry_idx = int(bar_index.searchsorted(ts, side="right"))
+            if entry_idx >= len(df):
                 continue
-            future = df.iloc[start_idx:]
-            if len(future) < 2: continue
+            future = df.iloc[entry_idx:]
+            if len(future) < 2:
+                continue
+            entry_price = float(future["Open"].iloc[0])
+            if entry_price <= 0:
+                continue
             is_long = "BUY" in sig_type.upper()
-            exit_idx = min(hold_bars, len(future)-1)
+            exit_idx = min(hold_bars, len(future) - 1)
             exit_price = float(future["Close"].iloc[exit_idx])
             if is_long:
                 ret = (exit_price - entry_price) / entry_price
-                for j in range(1, exit_idx+1):
-                    if (float(future["High"].iloc[j]) - entry_price) / entry_price >= tp: ret=tp; break
-                    if (entry_price - float(future["Low"].iloc[j])) / entry_price >= sl: ret=-sl; break
+                for j in range(0, exit_idx + 1):
+                    high_ret = (float(future["High"].iloc[j]) - entry_price) / entry_price
+                    low_ret = (entry_price - float(future["Low"].iloc[j])) / entry_price
+                    if low_ret >= sl and high_ret >= tp:
+                        ret = -sl
+                        break
+                    if low_ret >= sl:
+                        ret = -sl
+                        break
+                    if high_ret >= tp:
+                        ret = tp
+                        break
             else:
                 ret = (entry_price - exit_price) / entry_price
-                for j in range(1, exit_idx+1):
-                    if (entry_price - float(future["Low"].iloc[j])) / entry_price >= tp: ret=tp; break
-                    if (float(future["High"].iloc[j]) - entry_price) / entry_price >= sl: ret=-sl; break
-            results.append({"ret": ret, "win": ret > 0})
-        except: continue
+                for j in range(0, exit_idx + 1):
+                    tp_ret = (entry_price - float(future["Low"].iloc[j])) / entry_price
+                    sl_ret = (float(future["High"].iloc[j]) - entry_price) / entry_price
+                    if sl_ret >= sl and tp_ret >= tp:
+                        ret = -sl
+                        break
+                    if sl_ret >= sl:
+                        ret = -sl
+                        break
+                    if tp_ret >= tp:
+                        ret = tp
+                        break
+            results.append({
+                "ret": ret,
+                "win": ret > 0,
+                "signal_ts": ts_str,
+                "entry_bar_ts": str(future.index[0]),
+            })
+        except Exception:
+            continue
     return results
 
 def score(wr, avg_ret, n, pf):
-    return round((wr*0.4 + avg_ret*10*0.3 + min(pf,10)*0.2 + min(n/50,1)*0.1)*100, 2)
+    return round(((wr * 0.25) + (_clamp(avg_ret / 0.03, -1.0, 1.0) * 0.35) + (_clamp(pf / 2.5, 0.0, 1.0) * 0.2) + (_clamp(n / 40.0, 0.0, 1.0) * 0.2)) * 100.0, 2)
 
 
 def _rounded(value, digits):
@@ -792,6 +956,7 @@ def compute_results(
     all_results = []
     evaluated_symbols = set()
     run_end = run_end or datetime.now(timezone.utc)
+    seen_configs = set()
     for symbol in symbols:
         symbol_rows = 0
         for sf in signal_filters:
@@ -801,14 +966,20 @@ def compute_results(
                 if not sigs:
                     continue
                 sigs = _dedupe_signals(sigs)
+                train_sigs, validation_sigs, oos_sigs = _split_signals(sigs)
                 for tp in tp_values:
                     for sl in sl_values:
                         if tp <= sl:
                             continue
                         for hold in hold_hours_values:
-                            trades = simulate(
+                            config_key = f"{symbol}|{fs}|{rvol:.2f}|{tp:.4f}|{sl:.4f}|{int(hold)}"
+                            if config_key in seen_configs:
+                                continue
+                            seen_configs.add(config_key)
+
+                            train_trades = simulate(
                                 symbol,
-                                sigs,
+                                train_sigs,
                                 tp,
                                 sl,
                                 hold,
@@ -817,18 +988,96 @@ def compute_results(
                                 allow_fallback=allow_fallback,
                                 run_end=run_end,
                             )
-                            if len(trades) < MIN_TRADES:
+                            validation_trades = simulate(
+                                symbol,
+                                validation_sigs,
+                                tp,
+                                sl,
+                                hold,
+                                provider=provider,
+                                lookback_days=lookback_days,
+                                allow_fallback=allow_fallback,
+                                run_end=run_end,
+                            )
+                            oos_trades = simulate(
+                                symbol,
+                                oos_sigs,
+                                tp,
+                                sl,
+                                hold,
+                                provider=provider,
+                                lookback_days=lookback_days,
+                                allow_fallback=allow_fallback,
+                                run_end=run_end,
+                            )
+                            all_trades = train_trades + validation_trades + oos_trades
+                            if len(all_trades) < MIN_TRADES:
                                 continue
-                            wins = sum(1 for t in trades if t["win"])
-                            wr   = wins/len(trades)
-                            ar   = np.mean([t["ret"] for t in trades])
-                            gw   = sum(t["ret"] for t in trades if t["win"])
-                            gl   = abs(sum(t["ret"] for t in trades if not t["win"]))
-                            pf   = gw/gl if gl > 0 else 99
-                            sc   = score(wr, ar, len(trades), pf)
+                            in_sample = _trade_metrics(train_trades)
+                            validation = _trade_metrics(validation_trades)
+                            out_of_sample = _trade_metrics(oos_trades)
+                            overall = _trade_metrics(all_trades)
+                            min_trade_threshold_pass = (
+                                overall["n"] >= LIVE_MIN_TOTAL_TRADES
+                                and out_of_sample["n"] >= LIVE_MIN_OOS_TRADES
+                            )
+                            overfit_flag = int(
+                                (in_sample["n"] > 0 and out_of_sample["n"] > 0)
+                                and (
+                                    (score(in_sample["wr"], in_sample["ar"], in_sample["n"], in_sample["pf"]) -
+                                     score(out_of_sample["wr"], out_of_sample["ar"], out_of_sample["n"], out_of_sample["pf"]))
+                                    >= OVERFIT_SCORE_GAP_THRESHOLD
+                                    or (in_sample["ar"] - out_of_sample["ar"]) >= OVERFIT_RETURN_GAP_THRESHOLD
+                                )
+                            )
+                            consistency_score = _consistency_score([in_sample, validation, out_of_sample])
+                            final_live_eligible = int(
+                                min_trade_threshold_pass
+                                and not overfit_flag
+                                and out_of_sample["n"] > 0
+                                and out_of_sample["ar"] > 0
+                                and out_of_sample["pf"] >= 1.05
+                                and out_of_sample["wr"] >= 0.5
+                                and consistency_score >= 0.35
+                            )
+                            sc = _robust_score(
+                                in_sample,
+                                validation,
+                                out_of_sample,
+                                consistency_score,
+                                bool(overfit_flag),
+                                bool(min_trade_threshold_pass),
+                            )
                             all_results.append({
-                                "s": symbol, "f": fs, "rvol": rvol, "tp": tp, "sl": sl,
-                                "hold": hold, "n": len(trades), "wr": wr, "ar": ar, "pf": pf, "sc": sc
+                                "config_key": config_key,
+                                "s": symbol,
+                                "f": fs,
+                                "rvol": rvol,
+                                "tp": tp,
+                                "sl": sl,
+                                "hold": hold,
+                                "n": overall["n"],
+                                "wr": overall["wr"],
+                                "ar": overall["ar"],
+                                "pf": overall["pf"],
+                                "sc": sc,
+                                "in_n": in_sample["n"],
+                                "in_wr": in_sample["wr"],
+                                "in_ar": in_sample["ar"],
+                                "in_pf": in_sample["pf"],
+                                "val_n": validation["n"],
+                                "val_wr": validation["wr"],
+                                "val_ar": validation["ar"],
+                                "val_pf": validation["pf"],
+                                "oos_n": out_of_sample["n"],
+                                "oos_wr": out_of_sample["wr"],
+                                "oos_ar": out_of_sample["ar"],
+                                "oos_pf": out_of_sample["pf"],
+                                "overfit_flag": overfit_flag,
+                                "min_trade_threshold_pass": 1 if min_trade_threshold_pass else 0,
+                                "final_live_eligible": final_live_eligible,
+                                "consistency_score": consistency_score,
+                                "research_candidate": 1,
                             })
                             symbol_rows += 1
         if symbol_rows:
@@ -849,7 +1098,20 @@ def run():
     try:
         tested_at = datetime.now().isoformat()
         cur.executemany(
-            "INSERT INTO results VALUES (null,?,?,?,?,?,?,?,?,?,?,?,?)",
+            """
+            INSERT INTO results (
+                tested_at, symbol, signal_filter, rvol, tp, sl, hold_hours,
+                n_trades, win_rate, avg_return, profit_factor, score,
+                config_key, in_sample_n_trades, in_sample_win_rate, in_sample_avg_return,
+                in_sample_profit_factor, validation_n_trades, validation_win_rate,
+                validation_avg_return, validation_profit_factor, out_of_sample_n_trades,
+                out_of_sample_win_rate, out_of_sample_avg_return, out_of_sample_profit_factor,
+                overfit_flag, min_trade_threshold_pass, final_live_eligible,
+                consistency_score, research_candidate
+            ) VALUES (
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+            )
+            """,
             [
                 (
                     tested_at,
@@ -864,15 +1126,72 @@ def run():
                     round(r["ar"], 4),
                     round(r["pf"], 4),
                     r["sc"],
+                    r["config_key"],
+                    r["in_n"],
+                    round(r["in_wr"], 4),
+                    round(r["in_ar"], 4),
+                    round(r["in_pf"], 4),
+                    r["val_n"],
+                    round(r["val_wr"], 4),
+                    round(r["val_ar"], 4),
+                    round(r["val_pf"], 4),
+                    r["oos_n"],
+                    round(r["oos_wr"], 4),
+                    round(r["oos_ar"], 4),
+                    round(r["oos_pf"], 4),
+                    r["overfit_flag"],
+                    r["min_trade_threshold_pass"],
+                    r["final_live_eligible"],
+                    round(r["consistency_score"], 4),
+                    r["research_candidate"],
                 )
                 for r in all_results
             ],
         )
         cur.execute("DELETE FROM leaderboard")
-        all_results.sort(key=lambda x: x["sc"], reverse=True)
+        best_per_symbol_filter = {}
+        for row in all_results:
+            key = (row["s"], row["f"])
+            incumbent = best_per_symbol_filter.get(key)
+            if incumbent is None or (
+                row["sc"],
+                row["final_live_eligible"],
+                row["oos_n"],
+                row["oos_ar"],
+            ) > (
+                incumbent["sc"],
+                incumbent["final_live_eligible"],
+                incumbent["oos_n"],
+                incumbent["oos_ar"],
+            ):
+                best_per_symbol_filter[key] = row
+        leaderboard_rows = sorted(
+            best_per_symbol_filter.values(),
+            key=lambda x: (
+                -x["final_live_eligible"],
+                -x["sc"],
+                -x["oos_n"],
+                -x["oos_ar"],
+                x["s"],
+                x["f"],
+            ),
+        )
         updated_at = datetime.now().isoformat()
         cur.executemany(
-            "INSERT INTO leaderboard VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            """
+            INSERT INTO leaderboard (
+                rank, symbol, signal_filter, rvol, tp, sl, hold_hours,
+                n_trades, win_rate, avg_return, score, updated_at,
+                config_key, in_sample_n_trades, in_sample_win_rate, in_sample_avg_return,
+                in_sample_profit_factor, validation_n_trades, validation_win_rate,
+                validation_avg_return, validation_profit_factor, out_of_sample_n_trades,
+                out_of_sample_win_rate, out_of_sample_avg_return, out_of_sample_profit_factor,
+                overfit_flag, min_trade_threshold_pass, final_live_eligible,
+                consistency_score, research_candidate
+            ) VALUES (
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+            )
+            """,
             [
                 (
                     i,
@@ -887,8 +1206,26 @@ def run():
                     round(r["ar"], 4),
                     r["sc"],
                     updated_at,
+                    r["config_key"],
+                    r["in_n"],
+                    round(r["in_wr"], 4),
+                    round(r["in_ar"], 4),
+                    round(r["in_pf"], 4),
+                    r["val_n"],
+                    round(r["val_wr"], 4),
+                    round(r["val_ar"], 4),
+                    round(r["val_pf"], 4),
+                    r["oos_n"],
+                    round(r["oos_wr"], 4),
+                    round(r["oos_ar"], 4),
+                    round(r["oos_pf"], 4),
+                    r["overfit_flag"],
+                    r["min_trade_threshold_pass"],
+                    r["final_live_eligible"],
+                    round(r["consistency_score"], 4),
+                    r["research_candidate"],
                 )
-                for i, r in enumerate(all_results[:20], 1)
+                for i, r in enumerate(leaderboard_rows[:20], 1)
             ],
         )
         conn.commit()
