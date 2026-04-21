@@ -36,17 +36,18 @@ import requests
 import yfinance as yf
 from dotenv import load_dotenv
 from colorama import Fore, Back, Style, init
+from app_paths import DATA_DIR, ENV_FILE, LEGACY_SUPPORT_DIR
 
-_TRADING_DEV = "/home/theplummer92/trading-dev"
+_TRADING_DEV = str(LEGACY_SUPPORT_DIR)
 if _TRADING_DEV not in __import__("sys").path:
     __import__("sys").path.insert(0, _TRADING_DEV)
 from alpaca_data import get_stock_minute_bars
 
 # ---------------- INIT ----------------
 init(autoreset=True)
-load_dotenv()
+load_dotenv(ENV_FILE)
 
-BASE_DIR = "/home/theplummer92"
+BASE_DIR = str(DATA_DIR)
 
 # ---------------- PATHS / OUTPUTS ----------------
 CSV_FILENAME = os.getenv("MARKET_LOG_PATH", f"{BASE_DIR}/market_log.csv")

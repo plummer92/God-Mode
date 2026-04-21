@@ -2,8 +2,9 @@
 """summary.py — Print all-time trading performance summary."""
 import sqlite3
 from datetime import datetime
+from app_paths import DATA_DIR
 
-DB_PATH = "/home/theplummer92/trade_log.db"
+DB_PATH = str(DATA_DIR / "trade_log.db")
 
 
 def fetch_all_closed():

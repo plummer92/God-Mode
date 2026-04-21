@@ -10,11 +10,9 @@ import json
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from app_paths import DATA_DIR, LEGACY_SUPPORT_DIR, REPO_DIR
 
-TRADING_DEV_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "trading-dev",
-)
+TRADING_DEV_DIR = str(LEGACY_SUPPORT_DIR if LEGACY_SUPPORT_DIR.exists() else REPO_DIR)
 BOOTSTRAP_PATH = os.path.join(TRADING_DEV_DIR, "bootstrap_path.py")
 _bootstrap_spec = importlib.util.spec_from_file_location("bootstrap_path", BOOTSTRAP_PATH)
 _bootstrap_module = importlib.util.module_from_spec(_bootstrap_spec)
@@ -28,8 +26,8 @@ MIN_WIN_RATE   = 0.60
 MIN_AVG_RETURN = 0.003
 OUTPUT_CSV     = os.path.expanduser("~/symbol_hunt_results.csv")
 OUTPUT_JSON    = os.path.expanduser("~/symbol_hunt_top20.json")
-SNAPSHOT_CSV   = "/home/theplummer92/market_snapshot.csv"
-SNAPSHOT_JSON  = "/home/theplummer92/market_snapshot.json"
+SNAPSHOT_CSV   = str(DATA_DIR / "market_snapshot.csv")
+SNAPSHOT_JSON  = str(DATA_DIR / "market_snapshot.json")
 APPROVED_PATH  = os.path.expanduser("~/approved_symbols.json")
 REGIME_PATH    = os.path.expanduser("~/regime_snapshot.json")
 BORROWABLE_SYMBOLS_PATH = os.path.expanduser(

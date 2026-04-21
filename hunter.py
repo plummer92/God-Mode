@@ -15,6 +15,7 @@ from hunter_config import (
     APPROVED_TARGET_COUNT, OUTPUT_APPROVED_JSON,
     SCORES_DB_PATH, SIGNALS_DB_PATH
 )
+from app_paths import DATA_DIR
 
 # Load Auth
 load_dotenv()
@@ -29,8 +30,8 @@ def resolve_output_path() -> str:
     configured = str(OUTPUT_APPROVED_JSON)
     if os.getenv("HUNTER_ALLOW_LIVE_APPROVED_OVERRIDE", "").strip().lower() in {"1", "true", "yes"}:
         return configured
-    if os.path.abspath(configured) == "/home/theplummer92/approved_symbols.json":
-        safe_path = "/home/theplummer92/hunter_approved_symbols.json"
+    if os.path.abspath(configured) == str(DATA_DIR / "approved_symbols.json"):
+        safe_path = str(DATA_DIR / "hunter_approved_symbols.json")
         print(
             "⚠️ HUNTER SAFE OUTPUT: redirecting approved list write "
             f"from {configured} to {safe_path}"

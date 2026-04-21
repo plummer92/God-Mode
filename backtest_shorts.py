@@ -17,8 +17,9 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import pandas as pd
 import yfinance as yf
+from app_paths import DATA_DIR
 
-DB_PATH          = "/home/theplummer92/wolfe_signals.db"
+DB_PATH          = str(DATA_DIR / "wolfe_signals.db")
 TAKE_PROFIT_PCT  = 0.04   # +4%
 STOP_LOSS_PCT    = 0.02   # -2%
 NOTIONAL_USD     = 10.0   # per trade

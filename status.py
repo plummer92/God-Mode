@@ -4,11 +4,12 @@ import sqlite3
 import json
 import subprocess
 from datetime import datetime, timezone, date
+from app_paths import DATA_DIR
 
-TRADE_LOG_DB  = "/home/theplummer92/trade_log.db"
-SIGNALS_DB    = "/home/theplummer92/wolfe_signals.db"
-REGIME_PATH   = "/home/theplummer92/regime_snapshot.json"
-APPROVED_PATH = "/home/theplummer92/approved_symbols.json"
+TRADE_LOG_DB  = str(DATA_DIR / "trade_log.db")
+SIGNALS_DB    = str(DATA_DIR / "wolfe_signals.db")
+REGIME_PATH   = str(DATA_DIR / "regime_snapshot.json")
+APPROVED_PATH = str(DATA_DIR / "approved_symbols.json")
 SERVICES      = ["sniper", "paper-sniper", "strategy-lab", "dashboard"]
 
 W = 60

@@ -5,8 +5,11 @@ After=network.target
 [Service]
 Type=simple
 User=theplummer92
-WorkingDirectory=/home/theplummer92
-ExecStart=/home/theplummer92/venv/bin/python3 /home/theplummer92/sniper_bot.py
+Environment=GOD_MODE_DATA_DIR=/home/theplummer92
+Environment=GOD_MODE_ENV_FILE=/home/theplummer92/.env
+Environment=GOD_MODE_LEGACY_SUPPORT_DIR=/home/theplummer92/trading-dev
+WorkingDirectory=/home/theplummer92/god-mode-sync
+ExecStart=/home/theplummer92/venv/bin/python3 /home/theplummer92/god-mode-sync/sniper_bot.py
 Restart=on-failure
 RestartSec=10
 

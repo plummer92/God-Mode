@@ -16,18 +16,19 @@ import yfinance as yf
 from alpaca.trading.client import TradingClient
 from dotenv import load_dotenv
 
+from app_paths import DATA_DIR, ENV_FILE
 from Symbol_hunter import classify_sector
 from market_context import get_market_context
 
 
-DB_PATH = "/home/theplummer92/wolfe_signals.db"
-TRADE_LOG_DB = "/home/theplummer92/trade_log.db"
-REGIME_PATH = "/home/theplummer92/regime_snapshot.json"
-SNIPER_LOG = "/home/theplummer92/sniper.log"
-APPROVED_PATH = "/home/theplummer92/approved_symbols.json"
-MARKET_SNAPSHOT_JSON = "/home/theplummer92/market_snapshot.json"
-MARKET_SNAPSHOT_CSV = "/home/theplummer92/market_snapshot.csv"
-MARKET_SNAPSHOT_LOG = "/home/theplummer92/market_snapshot.log"
+DB_PATH = str(DATA_DIR / "wolfe_signals.db")
+TRADE_LOG_DB = str(DATA_DIR / "trade_log.db")
+REGIME_PATH = str(DATA_DIR / "regime_snapshot.json")
+SNIPER_LOG = str(DATA_DIR / "sniper.log")
+APPROVED_PATH = str(DATA_DIR / "approved_symbols.json")
+MARKET_SNAPSHOT_JSON = str(DATA_DIR / "market_snapshot.json")
+MARKET_SNAPSHOT_CSV = str(DATA_DIR / "market_snapshot.csv")
+MARKET_SNAPSHOT_LOG = str(DATA_DIR / "market_snapshot.log")
 CST = pytz.timezone("America/Chicago")
 FLOW_AUDIT_MAX_SYMBOLS = 24
 FLOW_AUDIT_LOOKBACK_BARS = 12
@@ -389,7 +390,7 @@ h1, h2, h3, [data-testid="stTabs"] button {
     unsafe_allow_html=True,
 )
 
-load_dotenv("/home/theplummer92/.env")
+load_dotenv(ENV_FILE)
 
 
 def utc_now() -> datetime:

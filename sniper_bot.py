@@ -21,6 +21,7 @@ from market_context import (
     market_multiplier_for_direction,
     should_block_direction,
 )
+from app_paths import DATA_DIR, ENV_FILE, LEGACY_SUPPORT_DIR
 
 # -------------------- CONFIG --------------------
 TRADE_NOTIONAL_USD = 100      # Trade size per signal
@@ -45,9 +46,9 @@ MAX_TRADE_NOTIONAL_USD = 140.0
 MAX_GROSS_EXPOSURE_USD = 2000.0
 
 # Paths
-DB_PATH = "/home/theplummer92/wolfe_signals.db"
-SNIPER_LOG = "/home/theplummer92/sniper.log"
-REGIME_PATH = "/home/theplummer92/regime_snapshot.json"
+DB_PATH = str(DATA_DIR / "wolfe_signals.db")
+SNIPER_LOG = str(DATA_DIR / "sniper.log")
+REGIME_PATH = str(DATA_DIR / "regime_snapshot.json")
 LOCKFILE = "/tmp/sniper_bot.lock"
 POLL_SECONDS = 10
 
@@ -66,6 +67,7 @@ BLOCKED_SIGNAL_TYPES = {
 cst_tz = pytz.timezone("America/Chicago")
 et_tz = pytz.timezone("America/New_York")
 load_dotenv()
+load_dotenv(ENV_FILE)
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
@@ -98,7 +100,7 @@ MAX_DAILY_REALIZED_LOSS_USD = env_float("MAX_DAILY_REALIZED_LOSS_USD", DAILY_LOS
 ENABLE_STRICT_GAP_BLOCK = False
 ENABLE_STRICT_CORRELATION_BLOCK = False
 
-TRADING_DEV_PATH = "/home/theplummer92/trading-dev"
+TRADING_DEV_PATH = str(LEGACY_SUPPORT_DIR)
 if TRADING_DEV_PATH not in sys.path and os.path.isdir(TRADING_DEV_PATH):
     sys.path.append(TRADING_DEV_PATH)
 
@@ -193,7 +195,7 @@ def current_trading_day() -> str:
     """
     return datetime.now(cst_tz).date().isoformat()
 
-TRADE_LOG_DB = "/home/theplummer92/trade_log.db"
+TRADE_LOG_DB = str(DATA_DIR / "trade_log.db")
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -2323,7 +2325,7 @@ def get_approved_symbols() -> dict:
       Removed from buys: MSFT (31% WR), NVDA (17% WR) — losers as longs
     """
     global _approved_symbols_cache, _approved_symbols_mtime
-    approved_path = "/home/theplummer92/approved_symbols.json"
+    approved_path = str(DATA_DIR / "approved_symbols.json")
     try:
         current_mtime = os.path.getmtime(approved_path)
         if _approved_symbols_cache is not None and _approved_symbols_mtime == current_mtime:

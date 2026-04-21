@@ -1,12 +1,13 @@
-#!/home/theplummer92/venv/bin/python3
+#!/usr/bin/env python3
 import sqlite3
 import json
 import os
 from datetime import datetime, timedelta
+from app_paths import DATA_DIR, ENV_FILE
 
-DB_PATH        = os.environ.get("STRATEGY_LAB_DB_PATH", "/home/theplummer92/strategy_lab.db")
-TRADE_DB_PATH  = os.environ.get("TRADE_DB_PATH", "/home/theplummer92/trade_log.db")
-OUT_PATH       = os.environ.get("APPROVED_SYMBOLS_PATH", "/home/theplummer92/approved_symbols.json")
+DB_PATH        = os.environ.get("STRATEGY_LAB_DB_PATH", str(DATA_DIR / "strategy_lab.db"))
+TRADE_DB_PATH  = os.environ.get("TRADE_DB_PATH", str(DATA_DIR / "trade_log.db"))
+OUT_PATH       = os.environ.get("APPROVED_SYMBOLS_PATH", str(DATA_DIR / "approved_symbols.json"))
 
 MIN_TRADES    = 20
 MIN_WIN_RATE  = 0.60
@@ -432,7 +433,7 @@ def check_wild_paper_performance(payload):
     """
     try:
         from dotenv import load_dotenv
-        load_dotenv("/home/theplummer92/.env")
+        load_dotenv(ENV_FILE)
     except Exception:
         pass
 

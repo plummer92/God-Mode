@@ -19,8 +19,9 @@ except Exception:
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
+from app_paths import DATA_DIR, ENV_FILE
 
-load_dotenv("/home/theplummer92/.env")
+load_dotenv(ENV_FILE)
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 # Use dedicated wild-experiment account keys if configured, else fall back to standard paper keys
@@ -58,9 +59,9 @@ CLOSE_VERIFY_SLEEP_S = int(os.getenv("PAPER_CLOSE_VERIFY_SLEEP_SECONDS", "5"))
 EOD_FINAL_VERIFY_ATTEMPTS = int(os.getenv("PAPER_EOD_FINAL_VERIFY_ATTEMPTS", "3"))
 EOD_FINAL_VERIFY_SLEEP_S = int(os.getenv("PAPER_EOD_FINAL_VERIFY_SLEEP_SECONDS", "10"))
 
-DB_PATH = "/home/theplummer92/wolfe_signals.db"
-STATE_DB_PATH = "/home/theplummer92/paper_sniper_state.db"
-LOG_FILE = "/home/theplummer92/paper_sniper.log"
+DB_PATH = str(DATA_DIR / "wolfe_signals.db")
+STATE_DB_PATH = str(DATA_DIR / "paper_sniper_state.db")
+LOG_FILE = str(DATA_DIR / "paper_sniper.log")
 LOCKFILE = "/tmp/paper_sniper.lock"
 LOG_TZ = pytz.timezone("America/Chicago")
 ET_TZ = pytz.timezone("America/New_York")

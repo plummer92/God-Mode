@@ -15,8 +15,14 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd /home/theplummer92
-            git pull origin main
+            DEPLOY_DIR=/home/theplummer92/god-mode-sync
+            if [ ! -d "${DEPLOY_DIR}/.git" ]; then
+              git clone https://github.com/plummer92/God-Mode.git "${DEPLOY_DIR}"
+            fi
+            cd "${DEPLOY_DIR}"
+            git fetch origin
+            git checkout main
+            git reset --hard origin/main
             sudo cp systemd/*.service /etc/systemd/system/
             sudo systemctl daemon-reload
             sudo systemctl restart sniper.service

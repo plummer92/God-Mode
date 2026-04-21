@@ -1,6 +1,7 @@
 import sqlite3
 import pandas as pd
-DB_PATH = "/home/theplummer92/wolfe_signals.db"
+from app_paths import DATA_DIR
+DB_PATH = str(DATA_DIR / "wolfe_signals.db")
 
 def run_backtest():
     conn = sqlite3.connect(DB_PATH)

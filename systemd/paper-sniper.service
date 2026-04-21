@@ -5,8 +5,10 @@ After=network.target
 [Service]
 Type=simple
 User=theplummer92
-WorkingDirectory=/home/theplummer92
-ExecStart=/home/theplummer92/venv/bin/python3 /home/theplummer92/paper_sniper.py
+Environment=GOD_MODE_DATA_DIR=/home/theplummer92
+Environment=GOD_MODE_ENV_FILE=/home/theplummer92/.env
+WorkingDirectory=/home/theplummer92/god-mode-sync
+ExecStart=/home/theplummer92/venv/bin/python3 /home/theplummer92/god-mode-sync/paper_sniper.py
 Restart=on-failure
 RestartSec=10
 

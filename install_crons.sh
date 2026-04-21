@@ -4,9 +4,10 @@
 # Assumes the server timezone is set to America/New_York (ET).
 # Check with: timedatectl
 
-VENV="/home/theplummer92/venv/bin/python3"
-SCRIPTS_DIR="/home/theplummer92"
-LOG_DIR="/home/theplummer92"
+HOME_DIR="${HOME:-/home/theplummer92}"
+VENV="${GOD_MODE_VENV_PYTHON:-$HOME_DIR/venv/bin/python3}"
+SCRIPTS_DIR="${GOD_MODE_REPO_DIR:-$HOME_DIR/god-mode-sync}"
+LOG_DIR="${GOD_MODE_DATA_DIR:-$HOME_DIR}"
 
 MORNING_CMD="30 9 * * 1-5 $VENV $SCRIPTS_DIR/morning_brief.py >> $LOG_DIR/morning_brief.log 2>&1"
 DAILY_CMD="0 16 * * 1-5 $VENV $SCRIPTS_DIR/daily_report.py >> $LOG_DIR/daily_report.log 2>&1"
