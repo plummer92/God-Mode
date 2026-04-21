@@ -31,6 +31,7 @@ import signal
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
+import pytz
 import requests
 import yfinance as yf
 from dotenv import load_dotenv
@@ -66,8 +67,10 @@ STOCK_DATA_FEED = os.getenv("ALPACA_STOCK_DATA_FEED", "iex")
 # ---------------- ALPACA NEWS ----------------
 APCA_KEY    = os.getenv("APCA_API_KEY_ID", "").strip()
 APCA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 NEWS_CACHE_TTL = 600  # 10 minutes per symbol
 _news_cache: Dict[str, tuple] = {}  # symbol -> (epoch_checked, news_flag)
+_catalyst_cache: Dict[str, tuple] = {}  # symbol -> (epoch_checked, catalyst_type)
 
 # ---------------- ABSORPTION -> RESOLUTION PARAMS ----------------
 # "absorption" = high RVOL + tiny move + big $flow
@@ -80,6 +83,58 @@ RESOLVE_UP_PCT = float(os.getenv("RESOLVE_UP_PCT", "0.002"))      # +0.20%
 RESOLVE_DN_PCT = float(os.getenv("RESOLVE_DN_PCT", "0.002"))      # -0.20%
 RESOLVE_MIN_RVOL = float(os.getenv("RESOLVE_MIN_RVOL", "1.5"))
 RESOLVE_WINDOW_SCANS = int(os.getenv("RESOLVE_WINDOW_SCANS", "18"))  # 18 scans * 5m = 90m
+
+# ---------------- RVOL TIERS ----------------
+# Large-cap / high-liquidity symbols get a lower RVOL threshold (more liquid = lower baseline vol)
+_RVOL_LARGE_CAP = frozenset(["SPY", "QQQ", "IWM", "AMZN", "META", "NVDA", "MSFT", "AAPL"])
+RVOL_THRESH_LARGE_CAP = 2.0
+RVOL_THRESH_SMALL_MID = 3.0
+RVOL_VIX_ADDON = 1.0  # added to all thresholds when VIX > 25
+
+# ---------------- PHASE 3 QUALITY FILTERS ----------------
+# Conservative timing / quality gates layered on top of the existing signal labels.
+# All thresholds are env-configurable so dashboard and bot workflows stay compatible.
+SIGNAL_MAX_AGE_SECONDS = int(os.getenv("SIGNAL_MAX_AGE_SECONDS", "900"))  # reject bars older than 15m
+OPENING_CHAOS_BLOCK_MINUTES = int(os.getenv("OPENING_CHAOS_BLOCK_MINUTES", "10"))  # 9:30-9:39 ET
+OPENING_CHAOS_COOLDOWN_MINUTES = int(os.getenv("OPENING_CHAOS_COOLDOWN_MINUTES", "20"))  # 9:40-9:49 ET
+OPENING_CHAOS_RVOL_ADDON = float(os.getenv("OPENING_CHAOS_RVOL_ADDON", "0.75"))
+OPENING_CHAOS_MIN_MOVE_PCT = float(os.getenv("OPENING_CHAOS_MIN_MOVE_PCT", "0.0035"))  # 0.35%
+OPENING_CHAOS_MIN_FLOW_M = float(os.getenv("OPENING_CHAOS_MIN_FLOW_M", "8.0"))
+
+NEWS_SIGNAL_RVOL_ADDON = float(os.getenv("NEWS_SIGNAL_RVOL_ADDON", "0.75"))
+NEWS_SIGNAL_MIN_MOVE_PCT = float(os.getenv("NEWS_SIGNAL_MIN_MOVE_PCT", "0.0040"))  # 0.40%
+NEWS_SIGNAL_MIN_FLOW_M = float(os.getenv("NEWS_SIGNAL_MIN_FLOW_M", "8.0"))
+CLEAN_SIGNAL_MIN_MOVE_PCT = float(os.getenv("CLEAN_SIGNAL_MIN_MOVE_PCT", "0.0025"))  # 0.25%
+REVERSAL_OVERRIDE_MOVE_PCT = float(os.getenv("REVERSAL_OVERRIDE_MOVE_PCT", "0.0060"))  # 0.60%
+
+SELL_ONLY_BUY_RVOL_ADDON = float(os.getenv("SELL_ONLY_BUY_RVOL_ADDON", "0.75"))
+BLOCKED_REGIME_RVOL_ADDON = float(os.getenv("BLOCKED_REGIME_RVOL_ADDON", "1.0"))
+
+def get_rvol_threshold(symbol: str, vix: Optional[float] = None) -> float:
+    """Return the minimum RVOL required to emit a STRONG signal for this symbol."""
+    base = RVOL_THRESH_LARGE_CAP if symbol.upper() in _RVOL_LARGE_CAP else RVOL_THRESH_SMALL_MID
+    if vix is not None and vix > 25:
+        base += RVOL_VIX_ADDON
+    return base
+
+# ---------------- SESSION TAGS ----------------
+_et_tz = pytz.timezone("America/New_York")
+
+def get_time_session() -> str:
+    """Return the current ET trading session label."""
+    now_et = datetime.now(_et_tz)
+    t = now_et.hour * 60 + now_et.minute
+    if t < 9 * 60 + 35:
+        return "PRE"
+    if t < 10 * 60 + 30:
+        return "PRIME"
+    if t < 11 * 60:
+        return "NORMAL"
+    if t < 13 * 60 + 30:
+        return "CHOP"
+    if t < 15 * 60 + 30:
+        return "NORMAL"
+    return "EOD"
 
 # ---------------- ASSET LIST ----------------
 # ---------------- ASSET LIST ----------------
@@ -153,6 +208,135 @@ def fetch_news_flag(symbol: str) -> str:
 
     _news_cache[symbol] = (now_epoch, flag)
     return flag
+
+
+# ---------------- ALPACA NEWS CATALYST TYPE ----------------
+_CATALYST_KEYWORDS = {
+    "EARNINGS_MISS": [
+        "miss", "below expectations", "disappoints", "cuts guidance", "lowers guidance",
+    ],
+    "DOWNGRADE": [
+        "downgrade", "cut to", "lowers price target", "reduces to",
+    ],
+    "FDA_FAIL": [
+        "fda", "rejected", "failed trial", "clinical hold",
+    ],
+    "LEGAL": [
+        "lawsuit", "sec investigation", "fraud", "probe",
+    ],
+}
+
+
+_VALID_CATALYST_CATEGORIES = frozenset(
+    ["EARNINGS_MISS", "DOWNGRADE", "FDA_FAIL", "LEGAL", "MACRO", "CLEAN"]
+)
+
+
+def _classify_with_gemini(symbol: str, headlines: List[str]) -> Optional[str]:
+    """Send headlines to Gemini for classification. Returns category or None on failure."""
+    if not GEMINI_API_KEY:
+        return None
+    headlines_text = "\n".join(f"- {h}" for h in headlines)
+    prompt = (
+        f"You are a financial news classifier. Classify the following news headlines for stock {symbol} "
+        f"into exactly one category. Respond with ONLY the category name, nothing else.\n\n"
+        f"Categories:\n"
+        f"EARNINGS_MISS - missed earnings, cut guidance, revenue below expectations, disappoints\n"
+        f"DOWNGRADE - analyst downgrade, price target cut, rating lowered\n"
+        f"FDA_FAIL - FDA rejection, failed clinical trial, clinical hold\n"
+        f"LEGAL - lawsuit, SEC investigation, fraud, DOJ probe\n"
+        f"MACRO - broad market news not specific to this stock\n"
+        f"CLEAN - positive news or no negative catalyst\n\n"
+        f"Headlines for {symbol}:\n{headlines_text}\n\n"
+        f"Respond with only one word from the category list above."
+    )
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+            f"?key={GEMINI_API_KEY}",
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 200, "temperature": 0},
+            },
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            parts = resp.json()["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts).strip().upper()
+            first_word = text.split()[0] if text else ""
+            if first_word in _VALID_CATALYST_CATEGORIES:
+                return first_word
+            for cat in _VALID_CATALYST_CATEGORIES:
+                if cat in text:
+                    return cat
+    except Exception:
+        pass
+    return None
+
+
+def _classify_with_keywords(all_text: str) -> str:
+    """Keyword fallback classifier. Returns first matching category or CLEAN."""
+    for cat, keywords in _CATALYST_KEYWORDS.items():
+        if any(kw in all_text for kw in keywords):
+            return cat
+    return "CLEAN"
+
+
+def fetch_catalyst_type(symbol: str) -> str:
+    """
+    Returns the catalyst type for the given symbol based on Alpaca News headlines
+    in the last 4 hours.  Only meaningful for SELL signals.
+
+    Categories:
+      EARNINGS_MISS — missed earnings, cut guidance, revenue below expectations
+      DOWNGRADE     — analyst downgrade, price target cut, rating lowered
+      FDA_FAIL      — FDA rejection, failed clinical trial, clinical hold
+      LEGAL         — lawsuit, SEC investigation, fraud, DOJ probe
+      MACRO         — broad market news not specific to this stock
+      CLEAN         — positive news or no negative catalyst
+
+    Classification uses Gemini API when available; falls back to keyword matching.
+    Results cached per symbol for NEWS_CACHE_TTL seconds.
+    Non-stock symbols (crypto, futures, macro) always return CLEAN.
+    """
+    if not _is_alpaca_stock(symbol):
+        return "CLEAN"
+
+    now_epoch = time.time()
+    cached = _catalyst_cache.get(symbol)
+    if cached and (now_epoch - cached[0]) < NEWS_CACHE_TTL:
+        return cached[1]
+
+    if not APCA_KEY or not APCA_SECRET:
+        return "CLEAN"
+
+    catalyst = "CLEAN"
+    try:
+        start_iso = (datetime.now(timezone.utc) - timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        resp = requests.get(
+            "https://data.alpaca.markets/v1beta1/news",
+            params={"symbols": symbol, "start": start_iso, "limit": 10},
+            headers={"APCA-API-KEY-ID": APCA_KEY, "APCA-API-SECRET-KEY": APCA_SECRET},
+            timeout=6,
+        )
+        if resp.status_code == 200:
+            articles = resp.json().get("news", [])
+            if articles:
+                headlines = [a.get("headline", "") for a in articles if a.get("headline")]
+                gemini_result = _classify_with_gemini(symbol, headlines)
+                if gemini_result is not None:
+                    catalyst = gemini_result
+                else:
+                    all_text = " ".join(
+                        (a.get("headline", "") + " " + a.get("summary", "")).lower()
+                        for a in articles
+                    )
+                    catalyst = _classify_with_keywords(all_text)
+    except Exception:
+        pass
+
+    _catalyst_cache[symbol] = (now_epoch, catalyst)
+    return catalyst
 
 
 # ---------------- UTIL: CSV HELPERS ----------------
@@ -264,13 +448,28 @@ def init_db() -> None:
     except Exception:
         pass  # column already exists
 
+    # Add time_session column if not present
+    try:
+        c.execute("ALTER TABLE signals ADD COLUMN time_session TEXT")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
+
+    # Add catalyst_type column if not present
+    try:
+        c.execute("ALTER TABLE signals ADD COLUMN catalyst_type TEXT DEFAULT 'CLEAN'")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
+
     conn.commit()
     conn.close()
     log(f"{Fore.GREEN}✅ DB ready: {DB_PATH}")
 
 def save_signal_to_db(symbol: str, sector: str, signal_type: str,
                       price: float, change_pct: float, rvol: float, flow_m: float,
-                      news_flag: str = "CLEAN") -> None:
+                      news_flag: str = "CLEAN", time_session: str = "UNKNOWN",
+                      catalyst_type: str = "CLEAN") -> None:
     confidence = 50
     if "ABSORPTION" in signal_type:
         confidence += 30
@@ -287,11 +486,12 @@ def save_signal_to_db(symbol: str, sector: str, signal_type: str,
         c.execute("""
             INSERT INTO signals (
                 timestamp, symbol, signal_type, price, rvol, flow_m,
-                confidence, sector, change_pct, news_flag
+                confidence, sector, change_pct, news_flag, time_session, catalyst_type
             ) VALUES (
-                datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?
+                datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
-        """, (symbol, signal_type, price, rvol, flow_m, confidence, sector, float(change_pct), news_flag))
+        """, (symbol, signal_type, price, rvol, flow_m, confidence, sector,
+              float(change_pct), news_flag, time_session, catalyst_type))
         conn.commit()
     except Exception as e:
         log(f"{Fore.RED}DB Write Error (signals): {e}")
@@ -315,19 +515,24 @@ def save_macro_features(vix: Optional[float], tnx: Optional[float], dxy: Optiona
         if conn:
             conn.close()
 # ---------------- SIGNAL LOGIC ----------------
-def analyze_signal(rvol: float, change_pct: float, flow_m: float) -> str:
+def analyze_signal(rvol: float, change_pct: float, flow_m: float,
+                   symbol: str = "", vix: Optional[float] = None) -> str:
     """
     Returns signal label. Flow and price direction must agree for a valid signal.
     If flow is positive but price is falling, buyers are getting run over (BULL TRAP).
     If flow is negative but price is rising, sellers are getting squeezed (BEAR TRAP).
+
+    RVOL threshold for STRONG signals is tier-based per symbol (see get_rvol_threshold).
+    VIX > 25 adds +1.0 to all thresholds to reduce noise in high-volatility regimes.
     """
+    rvol_threshold = get_rvol_threshold(symbol, vix)
     if rvol > 4.0 and abs(change_pct) < 0.001:
         return "🛡️ ABSORPTION SELL" if flow_m > 0 else "🛡️ ABSORPTION BUY"
     if rvol < 1.0 and abs(change_pct) > 0.005:
         return "⚠️ FAKE-OUT (Low Vol)"
     if rvol > 8.0:
         return "🔥 CLIMAX"
-    if rvol > 2.5:
+    if rvol > rvol_threshold:
         if abs(flow_m) < 5.0:
             return "Neutral"
         if flow_m > 0:
@@ -351,6 +556,133 @@ def get_flow_math(symbol: str, price: float, vol: float, open_p: float, close_p:
 
 def is_absorption_candidate(rvol: float, change_pct: float, flow_m: float) -> bool:
     return (rvol >= ABS_RVOL_MIN) and (abs(change_pct) <= ABS_MOVE_MAX) and (abs(flow_m) >= ABS_FLOW_MIN_M)
+
+
+def _coerce_bar_timestamp(ts_obj) -> Optional[datetime]:
+    """Convert a pandas/yfinance/alpaca index value into a timezone-aware UTC datetime."""
+    if ts_obj is None:
+        return None
+    try:
+        dt = ts_obj.to_pydatetime()
+    except Exception:
+        dt = ts_obj
+    if getattr(dt, "tzinfo", None) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _latest_bar_timestamp(closes) -> Optional[datetime]:
+    try:
+        if closes is None or len(closes) == 0:
+            return None
+        return _coerce_bar_timestamp(closes.index[-1])
+    except Exception:
+        return None
+
+
+def _bar_age_seconds(bar_ts: Optional[datetime]) -> Optional[float]:
+    if bar_ts is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - bar_ts).total_seconds())
+
+
+def _minutes_since_cash_open(bar_ts: Optional[datetime]) -> Optional[int]:
+    if bar_ts is None:
+        return None
+    ts_et = bar_ts.astimezone(_et_tz)
+    minutes = (ts_et.hour * 60 + ts_et.minute) - (9 * 60 + 30)
+    return minutes if minutes >= 0 else None
+
+
+def _signal_side(signal_lbl: str) -> Optional[str]:
+    if "BUY" in signal_lbl and "SELL" not in signal_lbl:
+        return "BUY"
+    if "SELL" in signal_lbl and "BUY" not in signal_lbl:
+        return "SELL"
+    return None
+
+
+def _passes_signal_quality_gate(
+    *,
+    symbol: str,
+    signal_lbl: str,
+    rvol: float,
+    change_pct: float,
+    flow_m: float,
+    news_flag: str,
+    regime: str,
+    vix: Optional[float],
+    prev_change_pct: Optional[float],
+    latest_bar_ts: Optional[datetime],
+) -> tuple[bool, Optional[str]]:
+    """Conservative post-classification gate to improve timing quality without changing schemas."""
+    if "Neutral" in signal_lbl or "ABSORPTION" in signal_lbl:
+        return True, None
+
+    bar_age = _bar_age_seconds(latest_bar_ts)
+    if bar_age is not None and bar_age > SIGNAL_MAX_AGE_SECONDS:
+        return False, f"STALE_BAR age={int(bar_age)}s>{SIGNAL_MAX_AGE_SECONDS}s"
+
+    side = _signal_side(signal_lbl)
+    base_rvol = get_rvol_threshold(symbol, vix)
+    required_rvol = base_rvol
+
+    if side == "BUY" and regime == "SELL_ONLY":
+        required_rvol += SELL_ONLY_BUY_RVOL_ADDON
+    elif side in {"BUY", "SELL"} and regime == "BLOCKED":
+        required_rvol += BLOCKED_REGIME_RVOL_ADDON
+
+    if side in {"BUY", "SELL"} and rvol < required_rvol:
+        return False, f"RVOL_GATE {rvol:.2f}<{required_rvol:.2f} regime={regime}"
+
+    if _is_alpaca_stock(symbol):
+        open_minutes = _minutes_since_cash_open(latest_bar_ts)
+        if open_minutes is not None and open_minutes < OPENING_CHAOS_BLOCK_MINUTES:
+            return False, f"OPENING_CHAOS_BLOCK minute={open_minutes}"
+        if open_minutes is not None and open_minutes < OPENING_CHAOS_COOLDOWN_MINUTES:
+            cooldown_rvol = required_rvol + OPENING_CHAOS_RVOL_ADDON
+            if (
+                rvol < cooldown_rvol
+                or abs(change_pct) < OPENING_CHAOS_MIN_MOVE_PCT
+                or abs(flow_m) < OPENING_CHAOS_MIN_FLOW_M
+            ):
+                return False, (
+                    "OPENING_CHAOS_FILTER "
+                    f"minute={open_minutes} rvol={rvol:.2f}/{cooldown_rvol:.2f} "
+                    f"move={abs(change_pct):.4f}/{OPENING_CHAOS_MIN_MOVE_PCT:.4f} "
+                    f"flow={abs(flow_m):.1f}/{OPENING_CHAOS_MIN_FLOW_M:.1f}"
+                )
+
+    if side in {"BUY", "SELL"} and prev_change_pct is not None:
+        same_direction = (change_pct == 0.0) or ((change_pct > 0) == (prev_change_pct > 0))
+        if not same_direction and abs(change_pct) < REVERSAL_OVERRIDE_MOVE_PCT:
+            return False, (
+                "REVERSAL_NO_CONFIRM "
+                f"curr={change_pct*100:.2f}% prev={prev_change_pct*100:.2f}%"
+            )
+
+    if side in {"BUY", "SELL"}:
+        if news_flag == "NEWS_DRIVEN":
+            news_rvol = required_rvol + NEWS_SIGNAL_RVOL_ADDON
+            if (
+                rvol < news_rvol
+                or abs(change_pct) < NEWS_SIGNAL_MIN_MOVE_PCT
+                or abs(flow_m) < NEWS_SIGNAL_MIN_FLOW_M
+            ):
+                return False, (
+                    "NEWS_SPIKE_FILTER "
+                    f"rvol={rvol:.2f}/{news_rvol:.2f} "
+                    f"move={abs(change_pct):.4f}/{NEWS_SIGNAL_MIN_MOVE_PCT:.4f} "
+                    f"flow={abs(flow_m):.1f}/{NEWS_SIGNAL_MIN_FLOW_M:.1f}"
+                )
+        elif abs(change_pct) < CLEAN_SIGNAL_MIN_MOVE_PCT and abs(flow_m) < OPENING_CHAOS_MIN_FLOW_M:
+            return False, (
+                "TECHNICAL_CONFIRM_FILTER "
+                f"move={abs(change_pct):.4f}/{CLEAN_SIGNAL_MIN_MOVE_PCT:.4f} "
+                f"flow={abs(flow_m):.1f}/{OPENING_CHAOS_MIN_FLOW_M:.1f}"
+            )
+
+    return True, None
 
 # ---------------- DISCORD (OPTIONAL) ----------------
 def post_discord(symbol: str, signal_lbl: str, rvol: float, flow_m: float, news_flag: str = "CLEAN") -> None:
@@ -512,6 +844,8 @@ signal.signal(signal.SIGINT, _handle_signal)
 # ---------------- MAIN LOOP ----------------
 def run_god_mode_pro() -> None:
     log(f"{Back.WHITE}{Fore.BLACK} 📱 GODMODE V7.0: Scanner starting... {Style.RESET_ALL}")
+    if not GEMINI_API_KEY:
+        log(f"{Fore.YELLOW}⚠️  GEMINI_API_KEY not set — catalyst classification will use keyword fallback only")
     init_db()
     ensure_market_log_header()
     _ensure_csv(ABS_WATCHLIST_PATH, WATCH_HEADER)
@@ -615,14 +949,21 @@ def run_god_mode_pro() -> None:
                         price = float(closes.iloc[-1])
                         open_p = float(opens.iloc[-1])
                         vol = float(volumes.iloc[-1])
+                        latest_bar_ts = _latest_bar_timestamp(closes)
 
                         avg_vol = float(volumes.iloc[-MIN_BARS:-1].mean())
                         rvol = (vol / avg_vol) if avg_vol > 0 else 1.0
 
                         change_pct = (price - open_p) / open_p if open_p else 0.0
+                        prev_change_pct: Optional[float] = None
+                        if len(opens) >= 2 and len(closes) >= 2:
+                            prev_open = float(opens.iloc[-2])
+                            prev_close = float(closes.iloc[-2])
+                            prev_change_pct = ((prev_close - prev_open) / prev_open) if prev_open else 0.0
                         flow_m = float(get_flow_math(symbol, price, vol, open_p, price) / 1_000_000)
 
-                        signal_lbl = analyze_signal(rvol, change_pct, flow_m)
+                        signal_lbl = analyze_signal(rvol, change_pct, flow_m,
+                                                    symbol=symbol, vix=vix_val)
 
                         # market log (everything)
                         _append_row(CSV_FILENAME, MARKET_HEADER, {
@@ -645,6 +986,24 @@ def run_god_mode_pro() -> None:
                                 log(f"TREND GATE: {signal_lbl} on {symbol} suppressed — SPY below MA20")
                             else:
                                 news_flag = fetch_news_flag(symbol)
+                                is_sell_signal = "SELL" in signal_lbl and "BUY" not in signal_lbl
+                                catalyst_type = fetch_catalyst_type(symbol) if is_sell_signal else "CLEAN"
+                                passed_quality_gate, gate_reason = _passes_signal_quality_gate(
+                                    symbol=symbol,
+                                    signal_lbl=signal_lbl,
+                                    rvol=rvol,
+                                    change_pct=change_pct,
+                                    flow_m=flow_m,
+                                    news_flag=news_flag,
+                                    regime=regime,
+                                    vix=vix_val,
+                                    prev_change_pct=prev_change_pct,
+                                    latest_bar_ts=latest_bar_ts,
+                                )
+                                if not passed_quality_gate:
+                                    log(f"QUALITY GATE: {signal_lbl} on {symbol} suppressed — {gate_reason}")
+                                    continue
+                                session = get_time_session()
                                 save_signal_to_db(
                                     symbol=symbol,
                                     sector=sector,
@@ -654,12 +1013,15 @@ def run_god_mode_pro() -> None:
                                     rvol=rvol,
                                     flow_m=flow_m,
                                     news_flag=news_flag,
+                                    time_session=session,
+                                    catalyst_type=catalyst_type,
                                 )
 
                                 now_epoch = time.time()
                                 if (now_epoch - last_alert_ts.get(symbol, 0) > 1200) or ("CLIMAX" in signal_lbl):
                                     news_tag = "[NEWS]" if news_flag == "NEWS_DRIVEN" else "[CLEAN]"
-                                    log(f"🚀 {signal_lbl}: {symbol} {news_tag} | Flow: ${flow_m:+.1f}M | RVOL={rvol:.2f} | Δ={change_pct*100:.2f}%")
+                                    cat_tag = f"[{catalyst_type}]" if catalyst_type != "CLEAN" else ""
+                                    log(f"🚀 {signal_lbl}: {symbol} {news_tag}{cat_tag} | Flow: ${flow_m:+.1f}M | RVOL={rvol:.2f} | Δ={change_pct*100:.2f}%")
                                     post_discord(symbol, signal_lbl, rvol, flow_m, news_flag)
                                     last_alert_ts[symbol] = now_epoch
 
