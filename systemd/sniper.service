@@ -1,0 +1,14 @@
+[Unit]
+Description=Wolfe Sniper Bot
+After=network.target
+
+[Service]
+Type=simple
+User=theplummer92
+WorkingDirectory=/home/theplummer92
+ExecStart=/home/theplummer92/venv/bin/python3 /home/theplummer92/sniper_bot.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
