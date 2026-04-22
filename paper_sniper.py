@@ -9,6 +9,7 @@ import sqlite3
 import time
 import requests
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytz
 try:
@@ -77,6 +78,13 @@ def log(msg):
     ts = datetime.now(LOG_TZ).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
+    try:
+        stdout_target = Path(os.readlink("/proc/self/fd/1")).resolve()
+        log_target = Path(LOG_FILE).resolve()
+        if stdout_target == log_target:
+            return
+    except Exception:
+        pass
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
 
