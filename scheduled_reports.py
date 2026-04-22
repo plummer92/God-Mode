@@ -5,12 +5,12 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
+from app_paths import DATA_DIR
 from reporting import build_daily_report, build_morning_brief, now_et, post_to_discord
 
 
-STATE_PATH = Path("/home/theplummer92/report_schedule_state.json")
+STATE_PATH = DATA_DIR / "report_schedule_state.json"
 SLEEP_SECONDS = 30
 
 

@@ -7,7 +7,6 @@ Type=simple
 User=theplummer92
 Environment=GOD_MODE_DATA_DIR=/home/theplummer92
 Environment=GOD_MODE_ENV_FILE=/home/theplummer92/.env
-Environment=GOD_MODE_LEGACY_SUPPORT_DIR=/home/theplummer92/trading-dev
 WorkingDirectory=/home/theplummer92/god-mode-sync
 ExecStart=/home/theplummer92/venv/bin/python3 /home/theplummer92/god-mode-sync/strategy_lab.py
 Restart=always

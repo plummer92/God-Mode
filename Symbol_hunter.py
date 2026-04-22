@@ -10,9 +10,9 @@ import json
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from app_paths import DATA_DIR, LEGACY_SUPPORT_DIR, REPO_DIR
+from app_paths import DATA_DIR, REPO_DIR
 
-TRADING_DEV_DIR = str(LEGACY_SUPPORT_DIR if LEGACY_SUPPORT_DIR.exists() else REPO_DIR)
+TRADING_DEV_DIR = str(REPO_DIR)
 BOOTSTRAP_PATH = os.path.join(TRADING_DEV_DIR, "bootstrap_path.py")
 _bootstrap_spec = importlib.util.spec_from_file_location("bootstrap_path", BOOTSTRAP_PATH)
 _bootstrap_module = importlib.util.module_from_spec(_bootstrap_spec)

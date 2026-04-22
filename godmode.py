@@ -36,11 +36,11 @@ import requests
 import yfinance as yf
 from dotenv import load_dotenv
 from colorama import Fore, Back, Style, init
-from app_paths import DATA_DIR, ENV_FILE, LEGACY_SUPPORT_DIR
+from app_paths import DATA_DIR, ENV_FILE, REPO_DIR
 
-_TRADING_DEV = str(LEGACY_SUPPORT_DIR)
-if _TRADING_DEV not in __import__("sys").path:
-    __import__("sys").path.insert(0, _TRADING_DEV)
+_REPO_DIR = str(REPO_DIR)
+if _REPO_DIR not in __import__("sys").path:
+    __import__("sys").path.insert(0, _REPO_DIR)
 from alpaca_data import get_stock_minute_bars
 
 # ---------------- INIT ----------------

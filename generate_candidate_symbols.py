@@ -5,6 +5,7 @@ import os
 import sqlite3
 import importlib.util
 from datetime import datetime
+from app_paths import DATA_DIR
 
 TRADING_DEV_DIR = os.path.dirname(os.path.abspath(__file__))
 BOOTSTRAP_PATH = os.path.join(TRADING_DEV_DIR, "bootstrap_path.py")
@@ -14,11 +15,11 @@ assert _bootstrap_spec is not None and _bootstrap_spec.loader is not None
 _bootstrap_spec.loader.exec_module(_bootstrap_module)
 _bootstrap_module.ensure_trading_dev_first(TRADING_DEV_DIR)
 
-DB_PATH = "/home/theplummer92/wolfe_signals.db"
-APPROVED_PATH = "/home/theplummer92/approved_symbols.json"
-HUNTER_TOP_PATH = "/home/theplummer92/symbol_hunt_top20.json"
-HUNTER_RESULTS_PATH = "/home/theplummer92/symbol_hunt_results.csv"
-OUTPUT_PATH = "/home/theplummer92/candidate_symbols.json"
+DB_PATH = str(DATA_DIR / "wolfe_signals.db")
+APPROVED_PATH = str(DATA_DIR / "approved_symbols.json")
+HUNTER_TOP_PATH = str(DATA_DIR / "symbol_hunt_top20.json")
+HUNTER_RESULTS_PATH = str(DATA_DIR / "symbol_hunt_results.csv")
+OUTPUT_PATH = str(DATA_DIR / "candidate_symbols.json")
 
 LOOKBACK_DAYS = 14
 TOP_N = int(os.getenv("CANDIDATE_SYMBOLS_TOP_N", "40"))

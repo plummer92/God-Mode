@@ -10,9 +10,6 @@ from pathlib import Path
 REPO_DIR = Path(__file__).resolve().parent
 HOME_DIR = Path.home()
 DATA_DIR = Path(os.getenv("GOD_MODE_DATA_DIR", str(HOME_DIR))).expanduser()
-LEGACY_SUPPORT_DIR = Path(
-    os.getenv("GOD_MODE_LEGACY_SUPPORT_DIR", str(HOME_DIR / "trading-dev"))
-).expanduser()
 ENV_FILE = Path(os.getenv("GOD_MODE_ENV_FILE", str(DATA_DIR / ".env"))).expanduser()
 VENV_PYTHON = Path(
     os.getenv("GOD_MODE_VENV_PYTHON", str(HOME_DIR / "venv" / "bin" / "python3"))

@@ -12,6 +12,7 @@ from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 import requests
+from app_paths import DATA_DIR, ENV_FILE
 
 try:
     from dotenv import load_dotenv
@@ -19,11 +20,11 @@ except Exception:  # pragma: no cover - fallback only used on minimal environmen
     load_dotenv = None
 
 
-BASE_DIR = Path("/home/theplummer92")
-ENV_PATH = BASE_DIR / ".env"
-DB_PATH = BASE_DIR / "trade_log.db"
-APPROVED_PATH = BASE_DIR / "approved_symbols.json"
-REGIME_PATH = BASE_DIR / "regime_snapshot.json"
+BASE_DIR = DATA_DIR
+ENV_PATH = Path(ENV_FILE)
+DB_PATH = DATA_DIR / "trade_log.db"
+APPROVED_PATH = DATA_DIR / "approved_symbols.json"
+REGIME_PATH = DATA_DIR / "regime_snapshot.json"
 ET = ZoneInfo("America/New_York")
 
 
@@ -54,7 +55,7 @@ def get_discord_webhook() -> str:
 def post_to_discord(message: str) -> None:
     webhook = get_discord_webhook()
     if not webhook:
-        raise RuntimeError("DISCORD_WEBHOOK is not set in /home/theplummer92/.env")
+        raise RuntimeError(f"DISCORD_WEBHOOK is not set in {ENV_PATH}")
     response = requests.post(webhook, json={"content": message}, timeout=10)
     response.raise_for_status()
 

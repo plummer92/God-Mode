@@ -11,14 +11,11 @@ import urllib.request
 import yfinance as yf
 from datetime import datetime, timedelta, timezone
 import pytz
-from app_paths import DATA_DIR, LEGACY_SUPPORT_DIR, REPO_DIR, VENV_PYTHON
+from app_paths import DATA_DIR, REPO_DIR, VENV_PYTHON
 
 TRADING_DEV_DIR = str(REPO_DIR)
 BOOTSTRAP_PATH = os.path.join(TRADING_DEV_DIR, "bootstrap_path.py")
 IMPORT_ROOT = TRADING_DEV_DIR
-if not os.path.exists(BOOTSTRAP_PATH):
-    BOOTSTRAP_PATH = os.path.join(str(LEGACY_SUPPORT_DIR), "bootstrap_path.py")
-    IMPORT_ROOT = str(LEGACY_SUPPORT_DIR)
 _bootstrap_spec = importlib.util.spec_from_file_location("bootstrap_path", BOOTSTRAP_PATH)
 _bootstrap_module = importlib.util.module_from_spec(_bootstrap_spec)
 assert _bootstrap_spec is not None and _bootstrap_spec.loader is not None
@@ -34,7 +31,7 @@ LOCKFILE = "/tmp/strategy_lab.lock"
 CANDIDATE_SYMBOLS_PATH = str(DATA_DIR / "candidate_symbols.json")
 CANDIDATE_GENERATOR_PATH = os.getenv(
     "CANDIDATE_GENERATOR_PATH",
-    os.path.join(str(LEGACY_SUPPORT_DIR), "generate_candidate_symbols.py"),
+    os.path.join(str(REPO_DIR), "generate_candidate_symbols.py"),
 )
 ROSTER_MANAGER_PATH = os.getenv("ROSTER_MANAGER_PATH", str(REPO_DIR / "roster_manager.py"))
 CST     = pytz.timezone("America/Chicago")

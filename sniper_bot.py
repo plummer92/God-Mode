@@ -21,7 +21,7 @@ from market_context import (
     market_multiplier_for_direction,
     should_block_direction,
 )
-from app_paths import DATA_DIR, ENV_FILE, LEGACY_SUPPORT_DIR
+from app_paths import DATA_DIR, ENV_FILE, REPO_DIR
 
 # -------------------- CONFIG --------------------
 TRADE_NOTIONAL_USD = 100      # Trade size per signal
@@ -100,9 +100,9 @@ MAX_DAILY_REALIZED_LOSS_USD = env_float("MAX_DAILY_REALIZED_LOSS_USD", DAILY_LOS
 ENABLE_STRICT_GAP_BLOCK = False
 ENABLE_STRICT_CORRELATION_BLOCK = False
 
-TRADING_DEV_PATH = str(LEGACY_SUPPORT_DIR)
-if TRADING_DEV_PATH not in sys.path and os.path.isdir(TRADING_DEV_PATH):
-    sys.path.append(TRADING_DEV_PATH)
+REPO_SUPPORT_PATH = str(REPO_DIR)
+if REPO_SUPPORT_PATH not in sys.path and os.path.isdir(REPO_SUPPORT_PATH):
+    sys.path.append(REPO_SUPPORT_PATH)
 
 try:
     from alpaca_data import get_latest_price as get_alpaca_latest_price
