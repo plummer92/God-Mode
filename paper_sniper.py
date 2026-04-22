@@ -271,6 +271,15 @@ def is_pdt_block_error(error) -> bool:
     return "pattern day trading" in text or "40310100" in text
 
 
+def is_qty_held_for_orders_error(error) -> bool:
+    text = str(error or "").lower()
+    return (
+        "40310000" in text
+        or "insufficient qty available for order" in text
+        or "held_for_orders" in text
+    )
+
+
 def pdt_equity_entry_block_active() -> bool:
     return get_runtime_flag(PDT_EQUITY_BLOCK_KEY) == _trading_day_str()
 
@@ -452,26 +461,40 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
         if attempt > 1:
             retry_used = True
             log(f"CLOSE VERIFY RETRY {symbol}: attempt={attempt}/{CLOSE_VERIFY_ATTEMPTS} reason=still_open_or_ambiguous")
-        try:
-            exit_order = client.close_position(symbol)
-            order_id = getattr(exit_order, "id", None)
-        except Exception as e:
-            log(f"CLOSE SUBMIT {symbol}: {e}")
-            if is_equity_symbol(symbol) and is_pdt_block_error(e):
-                verification_result = "broker_blocked:pdt"
-                activate_pdt_equity_entry_block(symbol, exit_reason, e)
-                log_exit_event(
-                    symbol,
-                    exit_reason,
-                    intended_ts,
-                    None,
-                    None,
-                    order_id,
-                    retry_used,
-                    verification_result,
-                    pnl_usd,
-                )
-                return False
+        should_submit_close = True
+        if order_id:
+            try:
+                existing_order = client.get_order_by_id(order_id)
+                existing_status = str(getattr(existing_order, "status", "unknown")).lower()
+                if existing_status in {"new", "accepted", "pending_new", "partially_filled"}:
+                    should_submit_close = False
+                    log(f"CLOSE VERIFY HOLD {symbol}: existing order_id={order_id} status={existing_status} still working")
+            except Exception:
+                pass
+
+        if should_submit_close:
+            try:
+                exit_order = client.close_position(symbol)
+                order_id = getattr(exit_order, "id", None)
+            except Exception as e:
+                log(f"CLOSE SUBMIT {symbol}: {e}")
+                if is_equity_symbol(symbol) and is_pdt_block_error(e):
+                    verification_result = "broker_blocked:pdt"
+                    activate_pdt_equity_entry_block(symbol, exit_reason, e)
+                    log_exit_event(
+                        symbol,
+                        exit_reason,
+                        intended_ts,
+                        None,
+                        None,
+                        order_id,
+                        retry_used,
+                        verification_result,
+                        pnl_usd,
+                    )
+                    return False
+                if is_qty_held_for_orders_error(e) and order_id:
+                    log(f"CLOSE VERIFY HOLD {symbol}: qty already reserved by order_id={order_id}; waiting on broker fill")
 
         time.sleep(CLOSE_VERIFY_SLEEP_S)
 
