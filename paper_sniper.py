@@ -69,6 +69,7 @@ ET_TZ = pytz.timezone("America/New_York")
 _paper_daily_start_equity = 0.0
 _paper_daily_start_date = None
 _eod_close_done_date = ""
+PDT_EQUITY_BLOCK_KEY = "pdt_equity_entry_block_date"
 
 
 def log(msg):
@@ -131,6 +132,15 @@ def ensure_state_db():
             cur.execute("ALTER TABLE exit_events ADD COLUMN pnl_usd REAL")
         except Exception:
             pass
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_flags (
+                flag_key TEXT PRIMARY KEY,
+                flag_value TEXT,
+                updated_at TEXT
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -215,6 +225,67 @@ def get_position_for_symbol(client, symbol: str):
     except Exception as e:
         log(f"Position lookup failed for {symbol}: {e}")
     return None
+
+
+def _trading_day_str():
+    return datetime.now(ET_TZ).strftime("%Y-%m-%d")
+
+
+def get_runtime_flag(flag_key: str):
+    conn = sqlite3.connect(STATE_DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT flag_value FROM runtime_flags WHERE flag_key = ? LIMIT 1",
+            (flag_key,),
+        ).fetchone()
+        return None if row is None else row[0]
+    finally:
+        conn.close()
+
+
+def set_runtime_flag(flag_key: str, flag_value: str):
+    conn = sqlite3.connect(STATE_DB_PATH)
+    try:
+        conn.execute(
+            """
+            INSERT INTO runtime_flags (flag_key, flag_value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(flag_key) DO UPDATE SET
+                flag_value = excluded.flag_value,
+                updated_at = excluded.updated_at
+            """,
+            (flag_key, flag_value, utc_now_str()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_equity_symbol(symbol: str):
+    text = str(symbol or "").upper()
+    return bool(text) and "-USD" not in text and "/" not in text and not text.startswith("^")
+
+
+def is_pdt_block_error(error) -> bool:
+    text = str(error or "").lower()
+    return "pattern day trading" in text or "40310100" in text
+
+
+def pdt_equity_entry_block_active() -> bool:
+    return get_runtime_flag(PDT_EQUITY_BLOCK_KEY) == _trading_day_str()
+
+
+def activate_pdt_equity_entry_block(symbol: str, exit_reason: str, error):
+    today_str = _trading_day_str()
+    if pdt_equity_entry_block_active():
+        return
+    set_runtime_flag(PDT_EQUITY_BLOCK_KEY, today_str)
+    msg = (
+        f"BROKER EXIT BLOCKED {symbol}: {exit_reason} close denied by PDT protection. "
+        f"Blocking new equity entries for {today_str} ET. Raw error: {error}"
+    )
+    log(msg)
+    post_discord(f"🚨 PAPER PDT GUARD | {symbol} close denied | blocking new equity entries for rest of day")
 
 
 def gross_exposure(positions) -> float:
@@ -375,6 +446,7 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
     retry_used = False
     order_id = None
     exit_order = None
+    verification_result = "still_open_after_verification"
 
     for attempt in range(1, CLOSE_VERIFY_ATTEMPTS + 1):
         if attempt > 1:
@@ -385,6 +457,21 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
             order_id = getattr(exit_order, "id", None)
         except Exception as e:
             log(f"CLOSE SUBMIT {symbol}: {e}")
+            if is_equity_symbol(symbol) and is_pdt_block_error(e):
+                verification_result = "broker_blocked:pdt"
+                activate_pdt_equity_entry_block(symbol, exit_reason, e)
+                log_exit_event(
+                    symbol,
+                    exit_reason,
+                    intended_ts,
+                    None,
+                    None,
+                    order_id,
+                    retry_used,
+                    verification_result,
+                    pnl_usd,
+                )
+                return False
 
         time.sleep(CLOSE_VERIFY_SLEEP_S)
 
@@ -420,7 +507,6 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
 
         log(f"CLOSE VERIFY WAIT {symbol}: attempt={attempt}/{CLOSE_VERIFY_ATTEMPTS} status={status} position_still_open")
 
-    verification_result = "still_open_after_verification"
     log(f"CLOSE VERIFICATION FAILED {symbol}: reason={exit_reason} result={verification_result}")
     log_exit_event(
         symbol,
@@ -555,6 +641,9 @@ def execute_signal(client, symbol: str, price: float, signal: str, direction: st
         kill_switch_reason = entry_kill_switch_reason(client, positions=positions)
         if kill_switch_reason:
             log(f"ENTRY BLOCKED {symbol}: {kill_switch_reason}")
+            return False
+        if is_equity_symbol(symbol) and pdt_equity_entry_block_active():
+            log(f"ENTRY BLOCKED {symbol}: equity entries paused for today after broker denied an earlier close (PDT protection)")
             return False
         held_symbols = {p.symbol for p in positions}
         if symbol in held_symbols:
