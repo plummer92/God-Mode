@@ -17,8 +17,8 @@ except Exception:
     def load_dotenv(*args, **kwargs):
         return False
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 from app_paths import DATA_DIR, ENV_FILE
 
 load_dotenv(ENV_FILE)
@@ -297,6 +297,28 @@ def activate_pdt_equity_entry_block(symbol: str, exit_reason: str, error):
     post_discord(f"🚨 PAPER PDT GUARD | {symbol} close denied | blocking new equity entries for rest of day")
 
 
+def find_open_order_for_symbol(client, symbol: str):
+    try:
+        orders = client.get_orders(
+            filter=GetOrdersRequest(
+                status=QueryOrderStatus.OPEN,
+                symbols=[str(symbol).upper()],
+                limit=50,
+            )
+        )
+    except Exception:
+        return None
+
+    symbol_upper = str(symbol).upper()
+    for order in orders or []:
+        if str(getattr(order, "symbol", "")).upper() != symbol_upper:
+            continue
+        status = str(getattr(order, "status", "unknown")).lower()
+        if status in {"new", "accepted", "pending_new", "partially_filled"}:
+            return order
+    return None
+
+
 def gross_exposure(positions) -> float:
     total = 0.0
     for position in positions or []:
@@ -456,12 +478,13 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
     order_id = None
     exit_order = None
     verification_result = "still_open_after_verification"
+    wait_for_existing_close = False
 
     for attempt in range(1, CLOSE_VERIFY_ATTEMPTS + 1):
         if attempt > 1:
             retry_used = True
             log(f"CLOSE VERIFY RETRY {symbol}: attempt={attempt}/{CLOSE_VERIFY_ATTEMPTS} reason=still_open_or_ambiguous")
-        should_submit_close = True
+        should_submit_close = not wait_for_existing_close
         if order_id:
             try:
                 existing_order = client.get_order_by_id(order_id)
@@ -493,8 +516,18 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
                         pnl_usd,
                     )
                     return False
-                if is_qty_held_for_orders_error(e) and order_id:
-                    log(f"CLOSE VERIFY HOLD {symbol}: qty already reserved by order_id={order_id}; waiting on broker fill")
+                if is_qty_held_for_orders_error(e):
+                    wait_for_existing_close = True
+                    open_order = find_open_order_for_symbol(client, symbol)
+                    if open_order is not None:
+                        order_id = getattr(open_order, "id", None) or order_id
+                        held_status = str(getattr(open_order, "status", "unknown")).lower()
+                        log(
+                            f"CLOSE VERIFY HOLD {symbol}: qty already reserved by broker "
+                            f"order_id={order_id or 'n/a'} status={held_status}; waiting on broker fill"
+                        )
+                    else:
+                        log(f"CLOSE VERIFY HOLD {symbol}: qty already reserved by broker; waiting before any new close submit")
 
         time.sleep(CLOSE_VERIFY_SLEEP_S)
 
