@@ -70,6 +70,7 @@ _paper_daily_start_equity = 0.0
 _paper_daily_start_date = None
 _eod_close_done_date = ""
 PDT_EQUITY_BLOCK_KEY = "pdt_equity_entry_block_date"
+_close_hold_until = {}
 
 
 def log(msg):
@@ -319,6 +320,20 @@ def find_open_order_for_symbol(client, symbol: str):
     return None
 
 
+def set_close_hold(symbol: str, seconds: int | None = None):
+    hold_seconds = int(seconds or max(CLOSE_VERIFY_SLEEP_S * CLOSE_VERIFY_ATTEMPTS, CLOSE_VERIFY_SLEEP_S))
+    _close_hold_until[str(symbol).upper()] = time.time() + hold_seconds
+
+
+def close_hold_active(symbol: str) -> bool:
+    expiry = _close_hold_until.get(str(symbol).upper())
+    return bool(expiry and expiry > time.time())
+
+
+def clear_close_hold(symbol: str):
+    _close_hold_until.pop(str(symbol).upper(), None)
+
+
 def gross_exposure(positions) -> float:
     total = 0.0
     for position in positions or []:
@@ -484,7 +499,9 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
         if attempt > 1:
             retry_used = True
             log(f"CLOSE VERIFY RETRY {symbol}: attempt={attempt}/{CLOSE_VERIFY_ATTEMPTS} reason=still_open_or_ambiguous")
-        should_submit_close = not wait_for_existing_close
+        should_submit_close = not wait_for_existing_close and not close_hold_active(symbol)
+        if not should_submit_close and close_hold_active(symbol):
+            log(f"CLOSE VERIFY HOLD {symbol}: broker still reserving qty from an in-flight close; waiting before any new close submit")
         if order_id:
             try:
                 existing_order = client.get_order_by_id(order_id)
@@ -518,6 +535,7 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
                     return False
                 if is_qty_held_for_orders_error(e):
                     wait_for_existing_close = True
+                    set_close_hold(symbol)
                     open_order = find_open_order_for_symbol(client, symbol)
                     if open_order is not None:
                         order_id = getattr(open_order, "id", None) or order_id
@@ -546,6 +564,7 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
                 log(f"CLOSE VERIFY {symbol}: order lookup failed for {order_id}: {e}")
 
         if position is None:
+            clear_close_hold(symbol)
             verification_result = f"closed:{status}"
             log(f"CLOSE VERIFIED {symbol}: reason={exit_reason} order_id={order_id or 'n/a'} result={verification_result}")
             log_exit_event(
@@ -760,6 +779,10 @@ def _run():
         f"Signal max age: {MAX_SIGNAL_AGE_SECONDS}s | Dedup window: {DEDUP_WINDOW_SECONDS}s | "
         f"EOD force close: 3:45pm ET | RVOL min: {WILD_RVOL_MIN} | Blacklist: {len(WILD_BLACKLIST)} symbols"
     )
+    if pdt_equity_entry_block_active():
+        log(f"PDT EQUITY ENTRY GUARD ACTIVE for {_trading_day_str()} ET - new equity entries paused after earlier broker exit denial")
+    else:
+        log(f"PDT EQUITY ENTRY GUARD INACTIVE for {_trading_day_str()} ET")
     post_discord(
         f"📄 PAPER SNIPER ONLINE | wild mode (no roster filter) | ${TRADE_NOTIONAL:.0f}/trade | "
         f"TP {TAKE_PROFIT_PCT:.2%} SL {STOP_LOSS_PCT:.2%} | RVOL≥{WILD_RVOL_MIN} | 3:45pm ET flat"
