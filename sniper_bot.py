@@ -129,6 +129,7 @@ _approved_symbols_cache: dict | None = None
 _approved_symbols_mtime: float | None = None
 _execution_telemetry_cache: dict = {}
 _stop_model_cache: dict = {}
+_last_blocked_signal_review_ts = 0.0
 
 CLOSE_RETRY_COOLDOWN_S = 30
 CLOSE_PENDING_LOG_INTERVAL_S = 30
@@ -144,6 +145,12 @@ STOP_MODEL_CACHE_TTL_S = 300
 STOP_MODEL_ATR_BARS = 14
 STOP_MODEL_LOOKBACK_BARS = 8
 STOP_MODEL_ATR_MULTIPLIER = 1.5
+BLOCKED_SIGNAL_REVIEW_INTERVAL_S = 300
+BLOCKED_SIGNAL_REVIEW_BATCH_SIZE = 25
+BLOCKED_SIGNAL_REVIEW_WINDOWS = (
+    ("15m", timedelta(minutes=15)),
+    ("1h", timedelta(hours=1)),
+)
 
 PENDING_CLOSE_ORDER_STATUSES = (
     "new",
@@ -169,6 +176,224 @@ def should_log_skip(key: str, interval_s: int = SKIP_LOG_SUPPRESS_SECONDS) -> bo
         return False
     _skip_log_cache[key] = now
     return True
+
+
+def _json_dumps_safe(value) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, default=str)
+    except Exception:
+        return "{}"
+
+
+def review_return_pct(entry_price: float, review_price: float, direction: str) -> float | None:
+    try:
+        entry = float(entry_price)
+        review = float(review_price)
+    except Exception:
+        return None
+    if entry <= 0:
+        return None
+    side = str(direction or "").upper()
+    if side == "SHORT":
+        return ((entry - review) / entry) * 100.0
+    return ((review - entry) / entry) * 100.0
+
+
+def fetch_blocked_signal_review_price(symbol: str, target_ts: datetime) -> float | None:
+    yahoo_symbol = str(symbol).replace("/", "-").upper()
+    start = target_ts - timedelta(minutes=10)
+    end = target_ts + timedelta(minutes=10)
+    attempts = [("1m", "2d"), ("5m", "5d")]
+    for interval, period in attempts:
+        try:
+            frame = yf.download(
+                yahoo_symbol,
+                period=period,
+                interval=interval,
+                progress=False,
+                auto_adjust=False,
+            )
+            if isinstance(frame.columns, pd.MultiIndex):
+                frame.columns = frame.columns.get_level_values(0)
+            if frame.empty or "Close" not in frame.columns:
+                continue
+            index = frame.index
+            if getattr(index, "tz", None) is None:
+                index = index.tz_localize("UTC")
+            else:
+                index = index.tz_convert("UTC")
+            window = frame.copy()
+            window.index = index
+            window = window.loc[(window.index >= start) & (window.index <= end)]
+            if window.empty:
+                continue
+            closest_idx = min(window.index, key=lambda ts: abs((ts - target_ts).total_seconds()))
+            price = window.loc[closest_idx, "Close"]
+            if isinstance(price, pd.Series):
+                price = price.iloc[-1]
+            return float(price)
+        except Exception:
+            continue
+    return None
+
+
+def record_blocked_signal(
+    *,
+    signal_key: str,
+    signal_ts: str | None,
+    symbol: str,
+    signal_type: str,
+    direction: str,
+    signal_price,
+    confidence,
+    effective_confidence,
+    news_flag: str | None,
+    catalyst_type: str | None,
+    regime_mode: str | None,
+    market_context: dict | None,
+    block_category: str,
+    block_reason: str,
+):
+    conn = None
+    try:
+        conn = sqlite3.connect(TRADE_LOG_DB)
+        cur = conn.cursor()
+        now_utc = utc_now_str()
+        market_state = None
+        if isinstance(market_context, dict):
+            market_state = market_context.get("state")
+        cur.execute(
+            """
+            INSERT INTO blocked_signals (
+                signal_key, signal_ts, symbol, signal_type, direction,
+                signal_price, confidence, effective_confidence, news_flag, catalyst_type,
+                regime_mode, market_state, block_category, block_reason, market_context_json,
+                first_blocked_at, last_blocked_at, skip_count, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(signal_key) DO UPDATE SET
+                effective_confidence=excluded.effective_confidence,
+                news_flag=excluded.news_flag,
+                catalyst_type=excluded.catalyst_type,
+                regime_mode=excluded.regime_mode,
+                market_state=excluded.market_state,
+                block_category=excluded.block_category,
+                block_reason=excluded.block_reason,
+                market_context_json=excluded.market_context_json,
+                last_blocked_at=excluded.last_blocked_at,
+                skip_count=blocked_signals.skip_count + 1,
+                updated_at=excluded.updated_at
+            """,
+            (
+                signal_key,
+                signal_ts,
+                str(symbol).upper(),
+                signal_type,
+                str(direction).upper(),
+                None if signal_price is None else float(signal_price),
+                None if confidence is None else int(confidence),
+                None if effective_confidence is None else int(effective_confidence),
+                news_flag,
+                catalyst_type,
+                regime_mode,
+                market_state,
+                block_category,
+                block_reason,
+                _json_dumps_safe(market_context or {}),
+                now_utc,
+                now_utc,
+                now_utc,
+            ),
+        )
+        conn.commit()
+    except Exception as e:
+        log_line(f"⚠️ Could not record blocked signal {signal_key}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def review_blocked_signals():
+    global _last_blocked_signal_review_ts
+    now_ts = time.time()
+    if (now_ts - _last_blocked_signal_review_ts) < BLOCKED_SIGNAL_REVIEW_INTERVAL_S:
+        return
+    _last_blocked_signal_review_ts = now_ts
+
+    rows_to_review: list[tuple[str, str, str, float, str, str]] = []
+    conn = None
+    try:
+        conn = sqlite3.connect(TRADE_LOG_DB)
+        cur = conn.cursor()
+        for label, delta in BLOCKED_SIGNAL_REVIEW_WINDOWS:
+            cur.execute(
+                f"""
+                SELECT signal_key, symbol, signal_ts, signal_price, direction
+                FROM blocked_signals
+                WHERE signal_ts IS NOT NULL
+                  AND signal_price IS NOT NULL
+                  AND review_{label}_price IS NULL
+                ORDER BY signal_ts ASC
+                LIMIT ?
+                """,
+                (BLOCKED_SIGNAL_REVIEW_BATCH_SIZE,),
+            )
+            for signal_key, symbol, signal_ts, signal_price, direction in cur.fetchall():
+                signal_dt = parse_signal_timestamp(signal_ts)
+                if signal_dt is None:
+                    continue
+                if utc_now() < (signal_dt + delta):
+                    continue
+                rows_to_review.append((label, signal_key, symbol, float(signal_price), direction, signal_ts))
+    except Exception as e:
+        log_line(f"⚠️ Could not load blocked signals for review: {e}")
+        return
+    finally:
+        if conn:
+            conn.close()
+
+    if not rows_to_review:
+        return
+
+    conn = None
+    try:
+        conn = sqlite3.connect(TRADE_LOG_DB)
+        cur = conn.cursor()
+        reviewed = 0
+        for label, signal_key, symbol, signal_price, direction, signal_ts in rows_to_review:
+            signal_dt = parse_signal_timestamp(signal_ts)
+            if signal_dt is None:
+                continue
+            target_ts = signal_dt + dict(BLOCKED_SIGNAL_REVIEW_WINDOWS)[label]
+            review_price = fetch_blocked_signal_review_price(symbol, target_ts)
+            if review_price is None:
+                continue
+            ret_pct = review_return_pct(signal_price, review_price, direction)
+            cur.execute(
+                f"""
+                UPDATE blocked_signals
+                SET review_{label}_price = ?,
+                    review_{label}_return_pct = ?,
+                    review_{label}_at = ?,
+                    updated_at = ?
+                WHERE signal_key = ?
+                """,
+                (
+                    float(review_price),
+                    None if ret_pct is None else float(ret_pct),
+                    utc_now_str(),
+                    utc_now_str(),
+                    signal_key,
+                ),
+            )
+            reviewed += 1
+        conn.commit()
+        if reviewed:
+            log_line(f"📊 BLOCKED SIGNAL REVIEW updated {reviewed} deferred outcomes")
+    except Exception as e:
+        log_line(f"⚠️ Could not review blocked signals: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 def post_discord(msg: str):
@@ -321,6 +546,57 @@ def init_trade_log():
             entry_order_id TEXT,
             processed_at TEXT
         )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS blocked_signals (
+            signal_key TEXT PRIMARY KEY,
+            signal_ts TEXT,
+            symbol TEXT,
+            signal_type TEXT,
+            direction TEXT,
+            signal_price REAL,
+            confidence INTEGER,
+            effective_confidence INTEGER,
+            news_flag TEXT,
+            catalyst_type TEXT,
+            regime_mode TEXT,
+            market_state TEXT,
+            block_category TEXT,
+            block_reason TEXT,
+            market_context_json TEXT,
+            first_blocked_at TEXT,
+            last_blocked_at TEXT,
+            skip_count INTEGER DEFAULT 1,
+            review_15m_price REAL,
+            review_15m_return_pct REAL,
+            review_15m_at TEXT,
+            review_1h_price REAL,
+            review_1h_return_pct REAL,
+            review_1h_at TEXT,
+            updated_at TEXT
+        )""")
+        for col, coltype in (
+            ("effective_confidence", "INTEGER"),
+            ("news_flag", "TEXT"),
+            ("catalyst_type", "TEXT"),
+            ("regime_mode", "TEXT"),
+            ("market_state", "TEXT"),
+            ("block_category", "TEXT"),
+            ("block_reason", "TEXT"),
+            ("market_context_json", "TEXT"),
+            ("first_blocked_at", "TEXT"),
+            ("last_blocked_at", "TEXT"),
+            ("skip_count", "INTEGER DEFAULT 1"),
+            ("review_15m_price", "REAL"),
+            ("review_15m_return_pct", "REAL"),
+            ("review_15m_at", "TEXT"),
+            ("review_1h_price", "REAL"),
+            ("review_1h_return_pct", "REAL"),
+            ("review_1h_at", "TEXT"),
+            ("updated_at", "TEXT"),
+        ):
+            try:
+                cur.execute(f"ALTER TABLE blocked_signals ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass
         conn.commit()
     finally:
         if conn:
@@ -2993,6 +3269,27 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
 
     # 2. Translate BTC-USD → BTC/USD
     alpaca_symbol = symbol.replace("-", "/").upper()
+    context = market_context or get_market_context(REGIME_PATH, logger=log_line)
+
+    def record_entry_block(block_category: str, block_reason: str):
+        if not signal_key:
+            return
+        record_blocked_signal(
+            signal_key=signal_key,
+            signal_ts=signal_ts,
+            symbol=alpaca_symbol,
+            signal_type=signal,
+            direction=direction or "UNKNOWN",
+            signal_price=price,
+            confidence=confidence,
+            effective_confidence=confidence,
+            news_flag=None,
+            catalyst_type=catalyst_type,
+            regime_mode=get_regime_mode(),
+            market_context=context,
+            block_category=block_category,
+            block_reason=block_reason,
+        )
 
     is_crypto = "/" in alpaca_symbol
 
@@ -3008,6 +3305,7 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
     if is_buy_signal and alpaca_symbol not in approved["buy"]:
         if should_log_skip(f"buy-approved:{alpaca_symbol}"):
             log_line(f"⛔ SKIP LONG  {alpaca_symbol}: Not in buy-approved list")
+        record_entry_block("buy_approved_block", "symbol not in buy-approved list")
         return
     if is_sell_signal and alpaca_symbol not in approved["sell"]:
         if should_log_skip(f"sell-approved:{alpaca_symbol}"):
@@ -3015,6 +3313,7 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
                 f"⛔ SKIP SHORT {alpaca_symbol}: Not in sell-approved list "
                 f"(roster constraint)"
             )
+        record_entry_block("sell_approved_block", "symbol not in sell-approved list")
         return
 
     # 3b. Short price cap — don't short stocks above $250 (blocks SPY/QQQ/IWM etc.)
@@ -3023,6 +3322,7 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
         log_line(
             f"⛔ SKIP SHORT {alpaca_symbol}: price ${price:.2f} exceeds max short price ${MAX_SHORT_PRICE_USD:.0f}"
         )
+        record_entry_block("short_price_cap_block", f"price exceeds short cap {MAX_SHORT_PRICE_USD:.0f}")
         return
 
     # 3c. No re-entry after stop loss same day
@@ -3034,12 +3334,14 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
     if alpaca_symbol in _no_reentry_today:
         if should_log_skip(f"no-reentry:{alpaca_symbol}"):
             log_line(f"🚫 SKIP {alpaca_symbol}: stopped out earlier today, no re-entry until tomorrow")
+        record_entry_block("same_day_reentry_block", "symbol stopped out earlier today")
         return
 
     # 3c. Earnings proximity block — skip if earnings within 7 days
     if is_near_earnings(symbol):
         if should_log_skip(f"earnings-near:{alpaca_symbol}"):
             log_line(f"📅 SKIP {alpaca_symbol}: Earnings within {EARNINGS_BLOCK_DAYS} days")
+        record_entry_block("earnings_block", f"earnings within {EARNINGS_BLOCK_DAYS} days")
         return
 
     # 4. Get current positions
@@ -3055,12 +3357,14 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
     if kill_switch_reason:
         if should_log_skip(f"entry-kill-switch:{kill_switch_reason}", interval_s=60):
             log_line(f"🛑 ENTRY BLOCKED {alpaca_symbol}: {kill_switch_reason}")
+        record_entry_block("kill_switch_block", kill_switch_reason)
         return
 
     # Skip if already holding this symbol in any direction
     if alpaca_symbol in held_symbols:
         if should_log_skip(f"already-held:{alpaca_symbol}", interval_s=60):
             log_line(f"🛡️ SKIP {alpaca_symbol}: Already have an open position")
+        record_entry_block("already_held_block", "already have an open position")
         return
 
     # 4a. Short-specific concentration rules
@@ -3072,12 +3376,14 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
         if reason:
             if should_log_skip(f"broad-etf-limit:{alpaca_symbol}", interval_s=60):
                 log_line(f"🚫 SKIP SHORT {alpaca_symbol}: {reason}")
+            record_entry_block("broad_market_short_limit", reason)
             return
 
         reason = check_sector_short_limit(alpaca_symbol, open_shorts, sectors)
         if reason:
             if should_log_skip(f"sector-limit:{alpaca_symbol}", interval_s=60):
                 log_line(f"🚫 SKIP SHORT {alpaca_symbol}: {reason}")
+            record_entry_block("sector_short_limit", reason)
             return
 
     # 6. Market hours check (stocks only — crypto trades 24/7)
@@ -3086,6 +3392,7 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
             if not client.get_clock().is_open:
                 if should_log_skip(f"market-closed:{alpaca_symbol}", interval_s=60):
                     log_line(f"💤 SKIP {alpaca_symbol}: Market closed")
+                record_entry_block("market_closed_block", "market closed")
                 return
         except Exception:
             pass
@@ -3099,18 +3406,21 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
         if 9 * 60 + 30 <= _t < 9 * 60 + 35:
             if should_log_skip(f"opening-chaos:{alpaca_symbol}", interval_s=60):
                 log_line(f"⏰ SKIP {alpaca_symbol}: Opening chaos window (9:30–9:35am) — no entries")
+            record_entry_block("opening_chaos_block", "opening chaos window")
             return
 
         # CHOP session: 11:00am–1:30pm ET — block new shorts (low follow-through)
         if is_sell_signal and 11 * 60 <= _t < 13 * 60 + 30:
             if should_log_skip(f"chop-no-short:{alpaca_symbol}", interval_s=300):
                 log_line(f"⏰ SKIP SHORT {alpaca_symbol}: CHOP session (11am–1:30pm) — no new shorts")
+            record_entry_block("chop_short_block", "CHOP session blocks new shorts")
             return
 
         # EOD: after 3:30pm ET — block new shorts (EOD rules close soon anyway)
         if is_sell_signal and _t >= 15 * 60 + 30:
             if should_log_skip(f"eod-no-short:{alpaca_symbol}", interval_s=300):
                 log_line(f"⏰ SKIP SHORT {alpaca_symbol}: EOD (after 3:30pm) — no new shorts")
+            record_entry_block("eod_short_block", "EOD blocks new shorts after 3:30pm")
             return
 
     # 7. Execute
@@ -3118,7 +3428,6 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
     tif       = TimeInForce.DAY
 
     symbol_multiplier = approved.get("size_multipliers", {}).get(alpaca_symbol, 1.0)
-    context = market_context or get_market_context(REGIME_PATH, logger=log_line)
     market_multiplier = market_multiplier_for_direction(context, direction)
     trade_notional, confidence_value, confidence_multiplier = compute_trade_notional(
         confidence,
@@ -3133,6 +3442,7 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
         signal_ts,
     )
     if validation["decision"] != "proceed":
+        record_entry_block("validation_block", str(validation.get("reason") or validation["decision"]))
         return
     trade_notional, execution_size_multiplier, execution_quality_flag = apply_execution_quality_adjustment(
         alpaca_symbol,
@@ -3154,6 +3464,7 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
             f" | final_shares={size_plan['final_shares']:.4f}"
             f" final_notional=${size_plan['final_notional']:.2f}"
         )
+        record_entry_block("size_plan_block", str(size_plan["skip_reason"]))
         return
 
     exposure_snapshot = get_portfolio_exposure_snapshot(client, positions=positions)
@@ -3172,6 +3483,7 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
             f"exceeds symbol cap ${MAX_SINGLE_POSITION_GROSS_USD:.2f} "
             f"| current=${current_symbol_gross:.2f} new=${size_plan['final_notional']:.2f}"
         )
+        record_entry_block("symbol_cap_block", f"proposed gross {proposed_symbol_gross:.2f} exceeds symbol cap")
         return
     if proposed_sector_gross > float(MAX_SECTOR_GROSS_USD):
         log_line(
@@ -3179,6 +3491,7 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
             f"exceeds sector cap ${MAX_SECTOR_GROSS_USD:.2f} "
             f"| current=${current_sector_gross:.2f} new=${size_plan['final_notional']:.2f}"
         )
+        record_entry_block("sector_cap_block", f"proposed sector gross {proposed_sector_gross:.2f} exceeds cap")
         return
     if proposed_gross_exposure > float(MAX_GROSS_EXPOSURE_USD):
         log_line(
@@ -3186,6 +3499,7 @@ def execute_entry(client, symbol: str, signal: str, price: float, confidence=Non
             f"exceeds cap ${MAX_GROSS_EXPOSURE_USD:.2f} | current=${current_gross_exposure:.2f} "
             f"new=${size_plan['final_notional']:.2f} source={exposure_source}"
         )
+        record_entry_block("gross_exposure_cap_block", f"proposed gross exposure {proposed_gross_exposure:.2f} exceeds cap")
         return
 
     try:
@@ -3446,6 +3760,22 @@ def run():
                             f"🚫 BLOCKED SIGNAL TYPE — {sym} '{stype}' is on the blocked list "
                             f"(live data: 0% WR, -$4.96 P&L). Skipping."
                         )
+                        record_blocked_signal(
+                            signal_key=signal_key,
+                            signal_ts=signal_ts,
+                            symbol=sym,
+                            signal_type=stype,
+                            direction=direction,
+                            signal_price=price,
+                            confidence=confidence,
+                            effective_confidence=effective_confidence,
+                            news_flag=news_flag,
+                            catalyst_type=catalyst_type,
+                            regime_mode=regime_mode,
+                            market_context=market_context,
+                            block_category="blocked_signal_type",
+                            block_reason="signal type blocked due to weak live performance",
+                        )
                         mark_signal_processed(signal_key, signal_ts, sym, stype, direction, confidence, "blocked_signal_type")
                         continue
 
@@ -3460,12 +3790,44 @@ def run():
                                 f"📉 SELL-ONLY regime — blocking LONG entry. "
                                 f"Skipping {sym} LONG '{stype}'."
                             )
+                            record_blocked_signal(
+                                signal_key=signal_key,
+                                signal_ts=signal_ts,
+                                symbol=sym,
+                                signal_type=stype,
+                                direction=direction,
+                                signal_price=price,
+                                confidence=confidence,
+                                effective_confidence=effective_confidence,
+                                news_flag=news_flag,
+                                catalyst_type=catalyst_type,
+                                regime_mode=regime_mode,
+                                market_context=market_context,
+                                block_category="sell_only_long_block",
+                                block_reason="SELL_ONLY regime blocks long entries",
+                            )
                             continue
                         # direction == SHORT: allow (fall through)
                     elif regime_mode == "OPEN" and direction == "SHORT" and catalyst_boost == 0:
                         log_line(
                             f"⛔ SKIP SHORT {sym} '{stype}': OPEN regime, catalyst=CLEAN — "
                             f"CLEAN shorts require SELL_ONLY regime or a catalyst."
+                        )
+                        record_blocked_signal(
+                            signal_key=signal_key,
+                            signal_ts=signal_ts,
+                            symbol=sym,
+                            signal_type=stype,
+                            direction=direction,
+                            signal_price=price,
+                            confidence=confidence,
+                            effective_confidence=effective_confidence,
+                            news_flag=news_flag,
+                            catalyst_type=catalyst_type,
+                            regime_mode=regime_mode,
+                            market_context=market_context,
+                            block_category="open_clean_short_block",
+                            block_reason="OPEN regime blocks clean shorts without catalyst",
                         )
                         continue
 
@@ -3476,6 +3838,22 @@ def run():
                                 f"🌐 SKIP {sym} {direction}: {block_reason} "
                                 f"(market={market_context.get('state', 'NEUTRAL')})"
                             )
+                        record_blocked_signal(
+                            signal_key=signal_key,
+                            signal_ts=signal_ts,
+                            symbol=sym,
+                            signal_type=stype,
+                            direction=direction,
+                            signal_price=price,
+                            confidence=confidence,
+                            effective_confidence=effective_confidence,
+                            news_flag=news_flag,
+                            catalyst_type=catalyst_type,
+                            regime_mode=regime_mode,
+                            market_context=market_context,
+                            block_category="market_context_block",
+                            block_reason=str(block_reason),
+                        )
                         continue
                     execute_entry(
                         t_client,
@@ -3488,6 +3866,7 @@ def run():
                         catalyst_type=catalyst_type,
                         market_context=market_context,
                     )
+                review_blocked_signals()
                 last_check = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
 
             time.sleep(POLL_SECONDS)
