@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Market Observer daily at 4:30pm ET (21:30 UTC)
+Requires=market-observer.service
+
+[Timer]
+# 21:30 UTC = 4:30pm EST (winter) / 5:30pm EDT (summer) — always after market close
+OnCalendar=Mon..Fri *-*-* 21:30:00 UTC
+Persistent=true
+Unit=market-observer.service
+
+[Install]
+WantedBy=timers.target

@@ -26,8 +26,8 @@ from app_paths import DATA_DIR, ENV_FILE, REPO_DIR
 # -------------------- CONFIG --------------------
 TRADE_NOTIONAL_USD = 100      # Trade size per signal
 HARD_STOP_LOSS_PCT = 0.02     # -2.0% hard stop loss
-TAKE_PROFIT_PCT = 0.02        # +2.0% take profit
-BREAK_EVEN_ARM_PCT = 0.0075   # Arm break-even protection after +0.75% unrealized PnL
+TAKE_PROFIT_PCT = 0.01        # +1.0% take profit
+BREAK_EVEN_ARM_PCT = 0.005    # Arm break-even protection after +0.50% unrealized PnL
 DAILY_LOSS_LIMIT_USD = 60.00  # Stop trading if down $60 in one day
 MAX_OPEN_POSITIONS = 5        # Never hold more than 5 positions at once
 MAX_SIGNAL_AGE_SECONDS = 900  # Skip entries if the scanner signal is older than 15 minutes
@@ -56,12 +56,11 @@ BOT_VERSION = "SNIPER V8.0 (SHORTING ENABLED)"
 STATUS_DB = DB_PATH
 MARKET_CONTEXT_TRANSITION_ALERTS = True
 
-# Signal types that are permanently blocked from execution.
-# Live data (2026-04-14): ABSORPTION SELL had 0% WR and -$4.96 P&L on 2 trades.
-BLOCKED_SIGNAL_TYPES = {
-    "ABSORPTION SELL",
-    "🛡️ ABSORPTION SELL",
-}
+# Signal types blocked from execution due to poor live performance.
+# Minimum threshold: 10 decided trades before a signal type qualifies for blacklisting.
+# ABSORPTION SELL previously blocked on 2 trades (0% WR, -$4.96) — sample too small, removed.
+MIN_SIGNAL_TYPE_BLOCK_TRADES = 10
+BLOCKED_SIGNAL_TYPES: set = set()  # Cleared: no signal type has reached 10-trade minimum yet
 
 # -------------------- SETUP --------------------
 cst_tz = pytz.timezone("America/Chicago")
@@ -127,6 +126,9 @@ _last_halt_log_ts = 0.0
 _skip_log_cache: dict = {}
 _approved_symbols_cache: dict | None = None
 _approved_symbols_mtime: float | None = None
+_signal_weights_cache: dict = {}
+_signal_weights_last_reload: float = 0.0
+SIGNAL_WEIGHTS_RELOAD_INTERVAL_S = 1800  # 30 minutes
 _execution_telemetry_cache: dict = {}
 _stop_model_cache: dict = {}
 _last_blocked_signal_review_ts = 0.0
@@ -975,7 +977,7 @@ def log_trade_close(symbol, exit_price, outcome, exit_order_id=None,
 
         if outcome == "stop_loss":
             global _no_reentry_today, _no_reentry_date
-            today = str(date.today())
+            today = current_trading_day()
             if _no_reentry_date != today:
                 _no_reentry_today = set()
                 _no_reentry_date = today
@@ -2640,6 +2642,39 @@ def get_approved_symbols() -> dict:
     return _approved_symbols_cache
 
 
+def get_signal_weights() -> dict:
+    """
+    Load signal_weights.json (written by market_observer.py) and return the
+    weights dict keyed by "signal_type|regime".  Reloads at most once every
+    SIGNAL_WEIGHTS_RELOAD_INTERVAL_S seconds so sniper picks up fresh data
+    without a restart.
+
+    Returns {} if the file doesn't exist yet (safe — sniper runs without weights).
+    """
+    global _signal_weights_cache, _signal_weights_last_reload
+    now = time.monotonic()
+    if now - _signal_weights_last_reload < SIGNAL_WEIGHTS_RELOAD_INTERVAL_S:
+        return _signal_weights_cache
+    weights_path = str(DATA_DIR / "signal_weights.json")
+    try:
+        with open(weights_path, "r") as f:
+            data = json.load(f)
+        # Support both wrapper format {"weights": {...}} and flat dict
+        weights = data.get("weights", data)
+        _signal_weights_cache = {k: v for k, v in weights.items() if not k.startswith("_")}
+        _signal_weights_last_reload = now
+        log_line(
+            f"📊 Signal weights loaded from {weights_path} — "
+            f"{len(_signal_weights_cache)} entries"
+        )
+    except FileNotFoundError:
+        _signal_weights_last_reload = now  # don't retry for a while
+    except Exception as e:
+        log_line(f"Signal weights reload error: {e}")
+        _signal_weights_last_reload = now
+    return _signal_weights_cache
+
+
 # -------------------- POSITION MANAGEMENT --------------------
 def manage_positions(trading_client):
     """
@@ -3725,6 +3760,14 @@ def run():
                     if direction is None:
                         log_line(f"⛔ SKIP {sym}: Unknown signal direction for '{stype}'")
                         continue
+                    # Early exit: silently drop symbols not on the approved list.
+                    # This prevents log spam from unapproved symbols (e.g. XRP-USD).
+                    _early_sym = sym.replace("-", "/").upper()
+                    _early_approved = get_approved_symbols()
+                    if direction == "LONG" and _early_sym not in _early_approved["buy"]:
+                        continue
+                    if direction == "SHORT" and _early_sym not in _early_approved["sell"]:
+                        continue
                     signal_key = make_signal_key(s)
                     if is_signal_processed(signal_key):
                         if should_log_skip(f"idempotent:{sym}:{direction}", interval_s=300):
@@ -3752,6 +3795,24 @@ def run():
                             effective_confidence = min(100, int(effective_confidence or 50) + catalyst_boost)
                         except (TypeError, ValueError):
                             pass
+
+                    # Signal weight feedback loop — apply market_observer outcome data.
+                    _sw = get_signal_weights()
+                    _sw_key = f"{stype.strip()}|{regime_mode}"
+                    _sw_entry = _sw.get(_sw_key)
+                    if _sw_entry:
+                        _w = float(_sw_entry.get("weight", 1.0))
+                        if _w != 1.0:
+                            _n  = int(_sw_entry.get("n", 0))
+                            _wr = float(_sw_entry.get("win_rate", 0.0))
+                            _old_conf = int(effective_confidence or 50)
+                            _new_conf = max(1, min(100, round(_old_conf * _w)))
+                            log_line(
+                                f"📊 WEIGHT APPLIED: {_sw_key} {_wr:.0%} WR → "
+                                f"{_w}x conf {'boost' if _w > 1.0 else 'penalty'} "
+                                f"({_n} outcomes) | conf {_old_conf} → {_new_conf}"
+                            )
+                            effective_confidence = _new_conf
 
                     # Block specific signal types with poor live performance.
                     canonical_stype = stype.strip()
@@ -3809,27 +3870,46 @@ def run():
                             continue
                         # direction == SHORT: allow (fall through)
                     elif regime_mode == "OPEN" and direction == "SHORT" and catalyst_boost == 0:
-                        log_line(
-                            f"⛔ SKIP SHORT {sym} '{stype}': OPEN regime, catalyst=CLEAN — "
-                            f"CLEAN shorts require SELL_ONLY regime or a catalyst."
-                        )
-                        record_blocked_signal(
-                            signal_key=signal_key,
-                            signal_ts=signal_ts,
-                            symbol=sym,
-                            signal_type=stype,
-                            direction=direction,
-                            signal_price=price,
-                            confidence=confidence,
-                            effective_confidence=effective_confidence,
-                            news_flag=news_flag,
-                            catalyst_type=catalyst_type,
-                            regime_mode=regime_mode,
-                            market_context=market_context,
-                            block_category="open_clean_short_block",
-                            block_reason="OPEN regime blocks clean shorts without catalyst",
-                        )
-                        continue
+                        # CLEAN shorts allowed in OPEN regime if:
+                        #   - symbol is on the sell-approved list
+                        #   - confidence >= 60
+                        #   - VIX >= 17 (some market stress present)
+                        # SELL_ONLY requirement only applies to non-approved symbols.
+                        _open_alpaca = sym.replace("-", "/").upper()
+                        _open_approved = get_approved_symbols()
+                        _open_vix = market_context.get("vix") if market_context else None
+                        _on_sell_list = _open_alpaca in _open_approved.get("sell", [])
+                        _conf_ok = (effective_confidence or 0) >= 60
+                        _vix_ok = (_open_vix is not None) and float(_open_vix) >= 17
+                        if _on_sell_list and _conf_ok and _vix_ok:
+                            pass  # Allow: approved sell symbol, high confidence, elevated VIX
+                        else:
+                            _reason = (
+                                "not on sell-approved list" if not _on_sell_list
+                                else f"confidence {effective_confidence} < 60" if not _conf_ok
+                                else f"VIX {_open_vix:.1f} < 17"
+                            )
+                            log_line(
+                                f"⛔ SKIP SHORT {sym} '{stype}': OPEN regime, catalyst=CLEAN — "
+                                f"{_reason}. Need sell-approved + conf≥60 + VIX≥17."
+                            )
+                            record_blocked_signal(
+                                signal_key=signal_key,
+                                signal_ts=signal_ts,
+                                symbol=sym,
+                                signal_type=stype,
+                                direction=direction,
+                                signal_price=price,
+                                confidence=confidence,
+                                effective_confidence=effective_confidence,
+                                news_flag=news_flag,
+                                catalyst_type=catalyst_type,
+                                regime_mode=regime_mode,
+                                market_context=market_context,
+                                block_category="open_clean_short_block",
+                                block_reason=f"OPEN regime clean short blocked: {_reason}",
+                            )
+                            continue
 
                     blocked, block_reason = should_block_direction(market_context, direction)
                     if blocked:

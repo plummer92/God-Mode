@@ -11,7 +11,10 @@ import urllib.request
 import yfinance as yf
 from datetime import datetime, timedelta, timezone
 import pytz
-from app_paths import DATA_DIR, REPO_DIR, VENV_PYTHON
+from app_paths import DATA_DIR, REPO_DIR, VENV_PYTHON, ENV_FILE
+from dotenv import load_dotenv
+load_dotenv()
+load_dotenv(str(ENV_FILE), override=False)
 
 TRADING_DEV_DIR = str(REPO_DIR)
 BOOTSTRAP_PATH = os.path.join(TRADING_DEV_DIR, "bootstrap_path.py")

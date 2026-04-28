@@ -1,0 +1,14 @@
+[Unit]
+Description=Wolfe Market Observer — daily signal outcome labeler
+After=network.target
+
+[Service]
+Type=oneshot
+User=theplummer92
+WorkingDirectory=/home/theplummer92/god-mode-sync
+ExecStart=/home/theplummer92/venv/bin/python3 /home/theplummer92/god-mode-sync/market_observer.py
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
