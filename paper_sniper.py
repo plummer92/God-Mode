@@ -986,8 +986,22 @@ def _run():
 
             signals = get_new_signals(last_check)
             if signals and can_open_new_positions_now():
+                # Snapshot held symbols once per loop so that orders submitted
+                # earlier in this same batch are treated as "already open" even
+                # before Alpaca reflects the fill in get_all_positions().
+                try:
+                    _loop_held_symbols = {p.symbol for p in client.get_all_positions()}
+                except Exception:
+                    _loop_held_symbols = set()
+
                 for rowid, signal_ts, symbol, signal_type, price, flow_m, change_pct, rvol in signals:
                     sym_upper = str(symbol).upper()
+
+                    # Hard guard: skip if we already hold (or just entered) this symbol
+                    # this loop cycle, regardless of signal_key bucket.
+                    if sym_upper in _loop_held_symbols:
+                        log(f"SKIP {sym_upper}: already have open position (loop guard)")
+                        continue
 
                     # Wild experiment filters (approved_symbols.json intentionally bypassed)
                     rvol_val = float(rvol) if rvol is not None else 0.0
@@ -1023,6 +1037,7 @@ def _run():
 
                     if execute_signal(client, sym_upper, float(price), signal_type, direction):
                         mark_signal_processed(signal_key, signal_ts, sym_upper, signal_type, direction)
+                        _loop_held_symbols.add(sym_upper)  # block re-entry for rest of this batch
 
             last_check = (datetime.utcnow() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
             positions = client.get_all_positions()

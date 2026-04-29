@@ -667,7 +667,7 @@ def main():
         conn_chk.close()
         if latest_tested:
             age_days = (datetime.utcnow() - datetime.fromisoformat(latest_tested)).days
-            if age_days >= STRATEGY_LAB_MAX_STALENESS_DAYS:
+            if age_days > 0 and age_days >= STRATEGY_LAB_MAX_STALENESS_DAYS:
                 print(f"[roster] WARNING: strategy_lab data is {age_days} days old (last tested {latest_tested[:10]}). Results may be stale.")
                 _post_stale_alert(age_days, latest_tested[:10])
     except Exception:
