@@ -405,6 +405,8 @@ def generate_daily_summary(date_str: str) -> str:
     by_symbol: dict[str, dict] = {}
     for r in rows:
         k = r["symbol"]
+        if _is_unsupported(k):
+            continue  # skip crypto/futures — no DB entries, 0% WR is misleading
         d = by_symbol.setdefault(k, {"tp": 0, "sl": 0, "total": 0})
         d["total"] += 1
         if   r["best_outcome"] == "TP": d["tp"] += 1

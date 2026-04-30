@@ -70,6 +70,7 @@ _paper_daily_start_equity = 0.0
 _paper_daily_start_date = None
 _eod_close_done_date = ""
 _carryover_purge_done_date = ""
+_carryover_alerted_date = ""
 PDT_EQUITY_BLOCK_KEY = "pdt_equity_entry_block_date"
 PDT_STUCK_KEY_PREFIX = "pdt_stuck_"
 _close_hold_until = {}
@@ -699,6 +700,7 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
 
 def manage_positions(client):
     try:
+        stuck_syms = set(get_pdt_stuck_symbols())
         positions = client.get_all_positions()
         for p in positions:
             pnl_pct = float(p.unrealized_plpc)
@@ -706,6 +708,9 @@ def manage_positions(client):
             side = "SHORT" if float(p.qty) < 0 else "LONG"
             # Skip if a recent close attempt is still in its cooldown period.
             if close_hold_active(symbol):
+                continue
+            # PDT_STUCK positions can't be closed until next market open — skip.
+            if symbol in stuck_syms:
                 continue
             if pnl_pct >= TAKE_PROFIT_PCT:
                 log(f"TAKE PROFIT: {symbol} {side} +{pnl_pct:.2%} closing")
@@ -816,7 +821,7 @@ def purge_carryover_positions(client):
     Returns True  → safe to process new signals (nothing to purge, or purge done).
     Returns False → carryover positions still open; caller should defer new entries.
     """
-    global _carryover_purge_done_date
+    global _carryover_purge_done_date, _carryover_alerted_date
     today_str = datetime.now(ET_TZ).strftime("%Y-%m-%d")
     if _carryover_purge_done_date == today_str:
         return True  # already handled for today's session
@@ -834,10 +839,17 @@ def purge_carryover_positions(client):
 
     syms = ", ".join(p.symbol for p in positions)
     log(f"CARRYOVER DETECTED: {len(positions)} prior-day position(s) — purging before new entries: {syms}")
-    post_discord(f"⚠️ PAPER CARRYOVER PURGE | {len(positions)} prior-day position(s): {syms}")
+    # Post the Discord alert only once per day, not on every retry loop.
+    if _carryover_alerted_date != today_str:
+        post_discord(f"⚠️ PAPER CARRYOVER PURGE | {len(positions)} prior-day position(s): {syms}")
+        _carryover_alerted_date = today_str
 
+    stuck_syms = set(get_pdt_stuck_symbols())
     for p in positions:
         sym = p.symbol
+        if sym in stuck_syms:
+            log(f"CARRYOVER PURGE SKIP {sym}: PDT_STUCK — will retry at next market open")
+            continue
         side = "SHORT" if float(p.qty) < 0 else "LONG"
         pnl_pct = float(p.unrealized_plpc)
         pnl_usd = TRADE_NOTIONAL * pnl_pct
@@ -859,6 +871,13 @@ def purge_carryover_positions(client):
         return True
 
     rem_syms = ", ".join(p.symbol for p in remaining)
+    # If every remaining position is PDT_STUCK, unblock normal operations —
+    # maybe_retry_pdt_stuck_at_open will handle them at tomorrow's open.
+    if all(p.symbol in stuck_syms for p in remaining):
+        log(f"CARRYOVER PURGE: remaining position(s) all PDT_STUCK ({rem_syms}) — unblocking entries")
+        _carryover_purge_done_date = today_str
+        return True
+
     log(f"CARRYOVER PURGE INCOMPLETE: {len(remaining)} position(s) still open: {rem_syms} — new entries deferred")
     return False
 
