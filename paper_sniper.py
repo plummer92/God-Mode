@@ -52,6 +52,9 @@ WILD_BLACKLIST = {
 POLL_SECONDS = 10
 EOD_CLOSE_HOUR = 15
 EOD_CLOSE_MINUTE = 45
+# Disable EOD force-close — positions ride until TP/SL regardless of day.
+# Set env var PAPER_EOD_FORCE_CLOSE=true to re-enable if needed.
+PAPER_EOD_FORCE_CLOSE = os.getenv("PAPER_EOD_FORCE_CLOSE", "false").lower() == "true"
 MAX_GROSS_EXPOSURE_USD = float(os.getenv("PAPER_MAX_GROSS_EXPOSURE_USD", str(TRADE_NOTIONAL * MAX_OPEN_POSITIONS)))
 MAX_DAILY_REALIZED_LOSS_USD = float(os.getenv("PAPER_MAX_DAILY_REALIZED_LOSS_USD", str(DAILY_LOSS_LIMIT)))
 CLOSE_VERIFY_ATTEMPTS = int(os.getenv("PAPER_CLOSE_VERIFY_ATTEMPTS", "3"))
@@ -763,6 +766,11 @@ def check_daily_loss_limit(equity):
 
 
 def maybe_force_close_eod(client):
+    """
+    EOD handler. When PAPER_EOD_FORCE_CLOSE is False (default), only posts a
+    Discord snapshot of open positions — no closes. Positions ride until TP/SL.
+    Set PAPER_EOD_FORCE_CLOSE=true in .env to re-enable force-closing.
+    """
     global _eod_close_done_date
     now_et = datetime.now(ET_TZ)
     if now_et.weekday() >= 5:
@@ -774,69 +782,80 @@ def maybe_force_close_eod(client):
     try:
         positions = client.get_all_positions()
         if positions:
-            msg = f"🔴 EOD FORCE CLOSE (3:45pm ET) - closing all {len(positions)} paper position(s). No overnight holds."
-            log(msg)
-            post_discord(msg)
-            stuck_syms_eod = set(get_pdt_stuck_symbols())
+            lines = []
             for p in positions:
-                sym = p.symbol
                 side = "SHORT" if float(p.qty) < 0 else "LONG"
                 pnl_pct = float(p.unrealized_plpc)
-                hold_active = close_hold_active(sym)
-                pdt_stuck = sym in stuck_syms_eod
-                log(
-                    f"EOD CLOSE ATTEMPT {sym} {side} pnl={pnl_pct:.2%} "
-                    f"qty={p.qty} close_hold={hold_active} pdt_stuck={pdt_stuck}"
-                )
-                # EOD must close regardless of intraday hold cooldowns.
-                clear_close_hold(sym)
-                try:
-                    pnl_usd = TRADE_NOTIONAL * pnl_pct
-                    ok = close_and_verify_position(client, sym, "eod_force_close", pnl_usd=pnl_usd)
-                    if not ok:
-                        log(f"EOD CLOSE UNVERIFIED {sym}: close_and_verify returned False — position may still be open")
-                except Exception as e:
-                    log(f"EOD CLOSE EXCEPTION {sym}: {e}")
-            for attempt in range(1, EOD_FINAL_VERIFY_ATTEMPTS + 1):
-                remaining = client.get_all_positions()
-                if not remaining:
-                    log(f"EOD FINAL VERIFY PASS: flat on attempt {attempt}/{EOD_FINAL_VERIFY_ATTEMPTS}")
-                    break
-                syms = ", ".join(p.symbol for p in remaining)
-                log(f"EOD FINAL VERIFY RETRY: attempt {attempt}/{EOD_FINAL_VERIFY_ATTEMPTS} still open={syms}")
-                for p in remaining:
+                lines.append(f"{p.symbol} {side} {pnl_pct:+.2%} qty={p.qty}")
+                log(f"EOD SNAPSHOT {p.symbol} {side} pnl={pnl_pct:.2%} qty={p.qty} — riding to TP/SL")
+            summary = " | ".join(lines)
+            if PAPER_EOD_FORCE_CLOSE:
+                msg = f"🔴 EOD FORCE CLOSE (3:45pm ET) - closing all {len(positions)} paper position(s)."
+                log(msg)
+                post_discord(msg)
+                stuck_syms_eod = set(get_pdt_stuck_symbols())
+                for p in positions:
                     sym = p.symbol
                     side = "SHORT" if float(p.qty) < 0 else "LONG"
                     pnl_pct = float(p.unrealized_plpc)
                     hold_active = close_hold_active(sym)
+                    pdt_stuck = sym in stuck_syms_eod
                     log(
-                        f"EOD RETRY {sym}: qty={p.qty} side={side} pnl={pnl_pct:.2%} "
-                        f"close_hold={hold_active} — clearing hold and retrying"
+                        f"EOD CLOSE ATTEMPT {sym} {side} pnl={pnl_pct:.2%} "
+                        f"qty={p.qty} close_hold={hold_active} pdt_stuck={pdt_stuck}"
                     )
                     clear_close_hold(sym)
                     try:
-                        ok = close_and_verify_position(
-                            client, sym, "eod_force_close",
-                            pnl_usd=TRADE_NOTIONAL * pnl_pct,
-                        )
+                        pnl_usd = TRADE_NOTIONAL * pnl_pct
+                        ok = close_and_verify_position(client, sym, "eod_force_close", pnl_usd=pnl_usd)
                         if not ok:
-                            log(f"EOD RETRY UNVERIFIED {sym}: still open after retry attempt {attempt}")
+                            log(f"EOD CLOSE UNVERIFIED {sym}: close_and_verify returned False — position may still be open")
                     except Exception as e:
-                        log(f"EOD RETRY EXCEPTION {sym}: {e}")
-                if attempt < EOD_FINAL_VERIFY_ATTEMPTS:
-                    time.sleep(EOD_FINAL_VERIFY_SLEEP_S)
-            final_remaining = client.get_all_positions()
-            if final_remaining:
-                syms = ", ".join(
-                    f"{p.symbol}(qty={p.qty},pnl={float(p.unrealized_plpc):.2%})"
-                    for p in final_remaining
-                )
-                log(f"EOD FINAL VERIFY FAILED: still open={syms}")
-                post_discord(f"🚨 PAPER EOD CLOSE FAILED | still open: {syms}")
+                        log(f"EOD CLOSE EXCEPTION {sym}: {e}")
+                for attempt in range(1, EOD_FINAL_VERIFY_ATTEMPTS + 1):
+                    remaining = client.get_all_positions()
+                    if not remaining:
+                        log(f"EOD FINAL VERIFY PASS: flat on attempt {attempt}/{EOD_FINAL_VERIFY_ATTEMPTS}")
+                        break
+                    syms = ", ".join(p.symbol for p in remaining)
+                    log(f"EOD FINAL VERIFY RETRY: attempt {attempt}/{EOD_FINAL_VERIFY_ATTEMPTS} still open={syms}")
+                    for p in remaining:
+                        sym = p.symbol
+                        side = "SHORT" if float(p.qty) < 0 else "LONG"
+                        pnl_pct = float(p.unrealized_plpc)
+                        hold_active = close_hold_active(sym)
+                        log(
+                            f"EOD RETRY {sym}: qty={p.qty} side={side} pnl={pnl_pct:.2%} "
+                            f"close_hold={hold_active} — clearing hold and retrying"
+                        )
+                        clear_close_hold(sym)
+                        try:
+                            ok = close_and_verify_position(
+                                client, sym, "eod_force_close",
+                                pnl_usd=TRADE_NOTIONAL * pnl_pct,
+                            )
+                            if not ok:
+                                log(f"EOD RETRY UNVERIFIED {sym}: still open after retry attempt {attempt}")
+                        except Exception as e:
+                            log(f"EOD RETRY EXCEPTION {sym}: {e}")
+                    if attempt < EOD_FINAL_VERIFY_ATTEMPTS:
+                        time.sleep(EOD_FINAL_VERIFY_SLEEP_S)
+                final_remaining = client.get_all_positions()
+                if final_remaining:
+                    syms = ", ".join(
+                        f"{p.symbol}(qty={p.qty},pnl={float(p.unrealized_plpc):.2%})"
+                        for p in final_remaining
+                    )
+                    log(f"EOD FINAL VERIFY FAILED: still open={syms}")
+                    post_discord(f"🚨 PAPER EOD CLOSE FAILED | still open: {syms}")
+            else:
+                msg = f"📋 PAPER EOD SNAPSHOT (3:45pm ET) | {len(positions)} open — riding to TP/SL | {summary}"
+                log(msg)
+                post_discord(msg)
         else:
-            log("EOD FORCE CLOSE (3:45pm ET): already flat")
+            log("EOD SNAPSHOT (3:45pm ET): already flat")
     except Exception as e:
-        log(f"EOD force-close error: {e}")
+        log(f"EOD handler error: {e}")
     _eod_close_done_date = today_str
 
 
@@ -915,8 +934,11 @@ def can_open_new_positions_now():
     now_et = datetime.now(ET_TZ)
     if now_et.weekday() >= 5:
         return False
-    close_time = now_et.replace(hour=EOD_CLOSE_HOUR, minute=EOD_CLOSE_MINUTE, second=0, microsecond=0)
-    return now_et < close_time
+    # No EOD cutoff — entries allowed any time the market is open since we no
+    # longer force-close at 3:45pm. Positions ride to TP/SL naturally.
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now_et < market_close
 
 
 def execute_signal(client, symbol: str, price: float, signal: str, direction: str):
@@ -988,7 +1010,7 @@ def _run():
     )
     log(
         f"Signal max age: {MAX_SIGNAL_AGE_SECONDS}s | Dedup window: {DEDUP_WINDOW_SECONDS}s | "
-        f"EOD force close: 3:45pm ET | RVOL min: {WILD_RVOL_MIN} | Blacklist: {len(WILD_BLACKLIST)} symbols"
+        f"no EOD close — positions ride to TP/SL | RVOL min: {WILD_RVOL_MIN} | Blacklist: {len(WILD_BLACKLIST)} symbols"
     )
     if pdt_equity_entry_block_active():
         log(f"PDT EQUITY ENTRY GUARD ACTIVE for {_trading_day_str()} ET - new equity entries paused after earlier broker exit denial")
@@ -996,7 +1018,8 @@ def _run():
         log(f"PDT EQUITY ENTRY GUARD INACTIVE for {_trading_day_str()} ET")
     post_discord(
         f"📄 PAPER SNIPER ONLINE | wild mode (no roster filter) | ${TRADE_NOTIONAL:.0f}/trade | "
-        f"TP {TAKE_PROFIT_PCT:.2%} SL {STOP_LOSS_PCT:.2%} | RVOL≥{WILD_RVOL_MIN} | 3:45pm ET flat"
+        f"TP {TAKE_PROFIT_PCT:.2%} SL {STOP_LOSS_PCT:.2%} | RVOL≥{WILD_RVOL_MIN} | "
+        f"no EOD close — positions ride to TP/SL"
     )
 
     client = get_client()
