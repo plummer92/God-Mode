@@ -9,6 +9,7 @@ import sqlite3
 import time
 import requests
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytz
 try:
@@ -17,15 +18,15 @@ except Exception:
     def load_dotenv(*args, **kwargs):
         return False
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
+from app_paths import DATA_DIR, ENV_FILE
 
-load_dotenv("/home/theplummer92/.env")
+load_dotenv(ENV_FILE)
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-# Use dedicated wild-experiment account keys if configured, else fall back to standard paper keys
-PAPER_KEY = os.getenv("APCA_WILD_PAPER_KEY_ID") or os.getenv("APCA_PAPER_KEY_ID")
-PAPER_SECRET = os.getenv("APCA_WILD_PAPER_SECRET_KEY") or os.getenv("APCA_PAPER_SECRET_KEY")
+PAPER_KEY = os.getenv("APCA_PAPER_KEY_ID")
+PAPER_SECRET = os.getenv("APCA_PAPER_SECRET_KEY")
 PAPER_URL = os.getenv("APCA_PAPER_BASE_URL", "https://paper-api.alpaca.markets")
 
 TRADE_NOTIONAL = 500.0
@@ -34,10 +35,10 @@ STOP_LOSS_PCT = 0.007
 MAX_OPEN_POSITIONS = 20
 MAX_SIGNAL_AGE_SECONDS = 1800
 DEDUP_WINDOW_SECONDS = 300
-DAILY_LOSS_LIMIT = 25.0
+DAILY_LOSS_LIMIT = 500.0
 
-# Wild experiment: no approved_symbols.json filter — trade any godmode signal
-# that passes RVOL threshold and is not a known bad actor.
+# Wild experiment: no approved_symbols.json filter, no signal-type whitelist.
+# Trade any godmode signal that passes RVOL threshold and is not a known bad actor.
 WILD_RVOL_MIN = 2.0
 
 # Hardcoded blacklist: penny stocks, halted/delisted frequent fliers, and
@@ -58,9 +59,9 @@ CLOSE_VERIFY_SLEEP_S = int(os.getenv("PAPER_CLOSE_VERIFY_SLEEP_SECONDS", "5"))
 EOD_FINAL_VERIFY_ATTEMPTS = int(os.getenv("PAPER_EOD_FINAL_VERIFY_ATTEMPTS", "3"))
 EOD_FINAL_VERIFY_SLEEP_S = int(os.getenv("PAPER_EOD_FINAL_VERIFY_SLEEP_SECONDS", "10"))
 
-DB_PATH = "/home/theplummer92/wolfe_signals.db"
-STATE_DB_PATH = "/home/theplummer92/paper_sniper_state.db"
-LOG_FILE = "/home/theplummer92/paper_sniper.log"
+DB_PATH = str(DATA_DIR / "wolfe_signals.db")
+STATE_DB_PATH = str(DATA_DIR / "paper_sniper_state.db")
+LOG_FILE = str(DATA_DIR / "paper_sniper.log")
 LOCKFILE = "/tmp/paper_sniper.lock"
 LOG_TZ = pytz.timezone("America/Chicago")
 ET_TZ = pytz.timezone("America/New_York")
@@ -68,12 +69,30 @@ ET_TZ = pytz.timezone("America/New_York")
 _paper_daily_start_equity = 0.0
 _paper_daily_start_date = None
 _eod_close_done_date = ""
+_carryover_purge_done_date = ""
+_carryover_alerted_date = ""
+PDT_EQUITY_BLOCK_KEY = "pdt_equity_entry_block_date"
+PDT_STUCK_KEY_PREFIX = "pdt_stuck_"
+_close_hold_until = {}
+_pdt_stuck_retry_done_date = ""
+# Module-level set of symbols we currently hold (or just entered this session).
+# Refreshed from the API at the start of every loop iteration. Symbols added
+# immediately after a successful execute_signal() so the API lag can't cause
+# duplicate entries within the same run.
+_held_symbols: set = set()
 
 
 def log(msg):
     ts = datetime.now(LOG_TZ).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
+    try:
+        stdout_target = Path(os.readlink("/proc/self/fd/1")).resolve()
+        log_target = Path(LOG_FILE).resolve()
+        if stdout_target == log_target:
+            return
+    except Exception:
+        pass
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
 
@@ -130,6 +149,15 @@ def ensure_state_db():
             cur.execute("ALTER TABLE exit_events ADD COLUMN pnl_usd REAL")
         except Exception:
             pass
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_flags (
+                flag_key TEXT PRIMARY KEY,
+                flag_value TEXT,
+                updated_at TEXT
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -161,6 +189,30 @@ def log_exit_event(symbol: str, exit_reason: str, intended_exit_time: str,
                    retry_used: bool, verification_result: str, pnl_usd=None):
     conn = sqlite3.connect(STATE_DB_PATH)
     try:
+        # Dedup guard 1: never log the same broker_order_id twice.
+        if broker_order_id:
+            existing = conn.execute(
+                "SELECT 1 FROM exit_events WHERE broker_order_id = ? LIMIT 1",
+                (str(broker_order_id),),
+            ).fetchone()
+            if existing:
+                return
+        # Dedup guard 2: for non-closed outcomes (still_open, broker_blocked, etc.)
+        # only log the first occurrence per (symbol, exit_reason, result, UTC day)
+        # to prevent per-poll-loop spam.
+        if verification_result and not str(verification_result).startswith("closed:"):
+            today = utc_now_str()[:10]
+            existing = conn.execute(
+                """
+                SELECT 1 FROM exit_events
+                WHERE symbol = ? AND exit_reason = ? AND verification_result = ?
+                  AND substr(created_at, 1, 10) = ?
+                LIMIT 1
+                """,
+                (str(symbol).upper(), exit_reason, verification_result, today),
+            ).fetchone()
+            if existing:
+                return
         conn.execute(
             """
             INSERT INTO exit_events (
@@ -214,6 +266,168 @@ def get_position_for_symbol(client, symbol: str):
     except Exception as e:
         log(f"Position lookup failed for {symbol}: {e}")
     return None
+
+
+def _trading_day_str():
+    return datetime.now(ET_TZ).strftime("%Y-%m-%d")
+
+
+def get_runtime_flag(flag_key: str):
+    conn = sqlite3.connect(STATE_DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT flag_value FROM runtime_flags WHERE flag_key = ? LIMIT 1",
+            (flag_key,),
+        ).fetchone()
+        return None if row is None else row[0]
+    finally:
+        conn.close()
+
+
+def set_runtime_flag(flag_key: str, flag_value: str):
+    conn = sqlite3.connect(STATE_DB_PATH)
+    try:
+        conn.execute(
+            """
+            INSERT INTO runtime_flags (flag_key, flag_value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(flag_key) DO UPDATE SET
+                flag_value = excluded.flag_value,
+                updated_at = excluded.updated_at
+            """,
+            (flag_key, flag_value, utc_now_str()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_equity_symbol(symbol: str):
+    text = str(symbol or "").upper()
+    return bool(text) and "-USD" not in text and "/" not in text and not text.startswith("^")
+
+
+def is_pdt_block_error(error) -> bool:
+    text = str(error or "").lower()
+    return "pattern day trading" in text or "40310100" in text
+
+
+def is_qty_held_for_orders_error(error) -> bool:
+    text = str(error or "").lower()
+    return (
+        "40310000" in text
+        or "insufficient qty available for order" in text
+        or "held_for_orders" in text
+    )
+
+
+def pdt_equity_entry_block_active() -> bool:
+    return get_runtime_flag(PDT_EQUITY_BLOCK_KEY) == _trading_day_str()
+
+
+def activate_pdt_equity_entry_block(symbol: str, exit_reason: str, error):
+    today_str = _trading_day_str()
+    if pdt_equity_entry_block_active():
+        return
+    set_runtime_flag(PDT_EQUITY_BLOCK_KEY, today_str)
+    msg = (
+        f"BROKER EXIT BLOCKED {symbol}: {exit_reason} close denied by PDT protection. "
+        f"Blocking new equity entries for {today_str} ET. Raw error: {error}"
+    )
+    log(msg)
+    post_discord(f"🚨 PAPER PDT GUARD | {symbol} close denied | blocking new equity entries for rest of day")
+
+
+def find_open_order_for_symbol(client, symbol: str):
+    try:
+        orders = client.get_orders(
+            filter=GetOrdersRequest(
+                status=QueryOrderStatus.OPEN,
+                symbols=[str(symbol).upper()],
+                limit=50,
+            )
+        )
+    except Exception:
+        return None
+
+    symbol_upper = str(symbol).upper()
+    for order in orders or []:
+        if str(getattr(order, "symbol", "")).upper() != symbol_upper:
+            continue
+        status = str(getattr(order, "status", "unknown")).lower()
+        if status in {"new", "accepted", "pending_new", "partially_filled"}:
+            return order
+    return None
+
+
+def set_close_hold(symbol: str, seconds: int | None = None):
+    hold_seconds = int(seconds or max(CLOSE_VERIFY_SLEEP_S * CLOSE_VERIFY_ATTEMPTS, CLOSE_VERIFY_SLEEP_S))
+    _close_hold_until[str(symbol).upper()] = time.time() + hold_seconds
+
+
+def close_hold_active(symbol: str) -> bool:
+    expiry = _close_hold_until.get(str(symbol).upper())
+    return bool(expiry and expiry > time.time())
+
+
+def clear_close_hold(symbol: str):
+    _close_hold_until.pop(str(symbol).upper(), None)
+
+
+def get_pdt_stuck_symbols():
+    conn = sqlite3.connect(STATE_DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT flag_key FROM runtime_flags WHERE flag_key LIKE ?",
+            (PDT_STUCK_KEY_PREFIX + "%",),
+        ).fetchall()
+        return [row[0][len(PDT_STUCK_KEY_PREFIX):] for row in rows]
+    finally:
+        conn.close()
+
+
+def clear_pdt_stuck(symbol: str):
+    conn = sqlite3.connect(STATE_DB_PATH)
+    try:
+        conn.execute(
+            "DELETE FROM runtime_flags WHERE flag_key = ?",
+            (PDT_STUCK_KEY_PREFIX + str(symbol).upper(),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def maybe_retry_pdt_stuck_at_open(client):
+    """Once per trading day, attempt to close any positions marked PDT_STUCK."""
+    global _pdt_stuck_retry_done_date
+    today_str = _trading_day_str()
+    if _pdt_stuck_retry_done_date == today_str:
+        return
+    _pdt_stuck_retry_done_date = today_str
+    stuck_symbols = get_pdt_stuck_symbols()
+    if not stuck_symbols:
+        return
+    log(f"PDT STUCK RETRY: {len(stuck_symbols)} symbol(s) flagged — attempting close at market open: {stuck_symbols}")
+    for symbol in stuck_symbols:
+        position = get_position_for_symbol(client, symbol)
+        if position is None:
+            log(f"PDT STUCK RETRY {symbol}: no open position — clearing flag")
+            clear_pdt_stuck(symbol)
+            continue
+        pnl_pct = float(position.unrealized_plpc)
+        pnl_usd = TRADE_NOTIONAL * pnl_pct
+        log(f"PDT STUCK RETRY {symbol}: attempting close at market open")
+        try:
+            verified = close_and_verify_position(client, symbol, "pdt_stuck_retry", pnl_usd=pnl_usd)
+            if verified:
+                log(f"PDT STUCK RETRY SUCCESS {symbol}: position closed")
+                clear_pdt_stuck(symbol)
+                post_discord(f"✅ PAPER PDT STUCK RESOLVED | {symbol} | closed at market open")
+            else:
+                log(f"PDT STUCK RETRY {symbol}: still could not close — will try again next open")
+        except Exception as e:
+            log(f"PDT STUCK RETRY FAIL {symbol}: {e}")
 
 
 def gross_exposure(positions) -> float:
@@ -374,16 +588,70 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
     retry_used = False
     order_id = None
     exit_order = None
+    verification_result = "still_open_after_verification"
+    wait_for_existing_close = False
 
     for attempt in range(1, CLOSE_VERIFY_ATTEMPTS + 1):
         if attempt > 1:
             retry_used = True
             log(f"CLOSE VERIFY RETRY {symbol}: attempt={attempt}/{CLOSE_VERIFY_ATTEMPTS} reason=still_open_or_ambiguous")
-        try:
-            exit_order = client.close_position(symbol)
-            order_id = getattr(exit_order, "id", None)
-        except Exception as e:
-            log(f"CLOSE SUBMIT {symbol}: {e}")
+        should_submit_close = not wait_for_existing_close and not close_hold_active(symbol)
+        if not should_submit_close and close_hold_active(symbol):
+            log(f"CLOSE VERIFY HOLD {symbol}: broker still reserving qty from an in-flight close; waiting before any new close submit")
+        if order_id:
+            try:
+                existing_order = client.get_order_by_id(order_id)
+                existing_status = str(getattr(existing_order, "status", "unknown")).lower()
+                if existing_status in {"new", "accepted", "pending_new", "partially_filled"}:
+                    should_submit_close = False
+                    log(f"CLOSE VERIFY HOLD {symbol}: existing order_id={order_id} status={existing_status} still working")
+            except Exception:
+                pass
+
+        if should_submit_close:
+            try:
+                exit_order = client.close_position(symbol)
+                order_id = getattr(exit_order, "id", None)
+            except Exception as e:
+                log(f"CLOSE SUBMIT {symbol}: {e}")
+                if is_equity_symbol(symbol) and is_pdt_block_error(e):
+                    verification_result = "broker_blocked:pdt"
+                    log(f"PDT CLOSE WARNING {symbol}: close denied by PDT (40310100). "
+                        f"Waiting 60s then retrying once. New entries NOT blocked.")
+                    time.sleep(60)
+                    try:
+                        exit_order = client.close_position(symbol)
+                        order_id = getattr(exit_order, "id", None)
+                        log(f"PDT CLOSE RETRY OK {symbol}: close submitted on second attempt")
+                        # Fall through — let the verify loop confirm position closed
+                    except Exception as e2:
+                        log(f"PDT CLOSE RETRY FAIL {symbol}: {e2}")
+                        pdt_stuck_key = f"{PDT_STUCK_KEY_PREFIX}{str(symbol).upper()}"
+                        set_runtime_flag(pdt_stuck_key, utc_now_str())
+                        log(f"PDT STUCK {symbol}: marked PDT_STUCK — new entries NOT blocked — "
+                            f"will retry at next market open")
+                        post_discord(
+                            f"🚨 PAPER PDT STUCK | {symbol} | close denied twice by PDT | "
+                            f"entries NOT blocked | retrying at next open"
+                        )
+                        log_exit_event(
+                            symbol, exit_reason, intended_ts, None, None, order_id,
+                            retry_used, "broker_blocked:pdt_stuck", pnl_usd,
+                        )
+                        return False
+                elif is_qty_held_for_orders_error(e):
+                    wait_for_existing_close = True
+                    set_close_hold(symbol)
+                    open_order = find_open_order_for_symbol(client, symbol)
+                    if open_order is not None:
+                        order_id = getattr(open_order, "id", None) or order_id
+                        held_status = str(getattr(open_order, "status", "unknown")).lower()
+                        log(
+                            f"CLOSE VERIFY HOLD {symbol}: qty already reserved by broker "
+                            f"order_id={order_id or 'n/a'} status={held_status}; waiting on broker fill"
+                        )
+                    else:
+                        log(f"CLOSE VERIFY HOLD {symbol}: qty already reserved by broker; waiting before any new close submit")
 
         time.sleep(CLOSE_VERIFY_SLEEP_S)
 
@@ -402,6 +670,7 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
                 log(f"CLOSE VERIFY {symbol}: order lookup failed for {order_id}: {e}")
 
         if position is None:
+            clear_close_hold(symbol)
             verification_result = f"closed:{status}"
             log(f"CLOSE VERIFIED {symbol}: reason={exit_reason} order_id={order_id or 'n/a'} result={verification_result}")
             log_exit_event(
@@ -419,7 +688,6 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
 
         log(f"CLOSE VERIFY WAIT {symbol}: attempt={attempt}/{CLOSE_VERIFY_ATTEMPTS} status={status} position_still_open")
 
-    verification_result = "still_open_after_verification"
     log(f"CLOSE VERIFICATION FAILED {symbol}: reason={exit_reason} result={verification_result}")
     log_exit_event(
         symbol,
@@ -437,11 +705,18 @@ def close_and_verify_position(client, symbol: str, exit_reason: str, intended_ex
 
 def manage_positions(client):
     try:
+        stuck_syms = set(get_pdt_stuck_symbols())
         positions = client.get_all_positions()
         for p in positions:
             pnl_pct = float(p.unrealized_plpc)
             symbol = p.symbol
             side = "SHORT" if float(p.qty) < 0 else "LONG"
+            # Skip if a recent close attempt is still in its cooldown period.
+            if close_hold_active(symbol):
+                continue
+            # PDT_STUCK positions can't be closed until next market open — skip.
+            if symbol in stuck_syms:
+                continue
             if pnl_pct >= TAKE_PROFIT_PCT:
                 log(f"TAKE PROFIT: {symbol} {side} +{pnl_pct:.2%} closing")
                 try:
@@ -450,8 +725,12 @@ def manage_positions(client):
                     if verified:
                         log(f"CLOSED {symbol} FOR PROFIT")
                         post_discord(f"📄 PAPER CLOSE | {symbol} TAKE PROFIT | +${pnl_usd:.2f} (+{pnl_pct:.2%})")
+                    else:
+                        # Back off 60s before next manage_positions retry.
+                        set_close_hold(symbol, seconds=60)
                 except Exception as e:
                     log(f"CLOSE FAIL {symbol}: {e}")
+                    set_close_hold(symbol, seconds=60)
             elif pnl_pct <= -STOP_LOSS_PCT:
                 log(f"STOP LOSS: {symbol} {side} {pnl_pct:.2%} closing")
                 try:
@@ -460,8 +739,11 @@ def manage_positions(client):
                     if verified:
                         log(f"STOP LOSS EXECUTED {symbol}")
                         post_discord(f"📄 PAPER CLOSE | {symbol} STOP LOSS | -${abs(pnl_usd):.2f} ({pnl_pct:.2%})")
+                    else:
+                        set_close_hold(symbol, seconds=60)
                 except Exception as e:
                     log(f"STOP LOSS FAIL {symbol}: {e}")
+                    set_close_hold(symbol, seconds=60)
     except Exception as e:
         log(f"Position management error: {e}")
 
@@ -495,16 +777,26 @@ def maybe_force_close_eod(client):
             msg = f"🔴 EOD FORCE CLOSE (3:45pm ET) - closing all {len(positions)} paper position(s). No overnight holds."
             log(msg)
             post_discord(msg)
+            stuck_syms_eod = set(get_pdt_stuck_symbols())
             for p in positions:
                 sym = p.symbol
                 side = "SHORT" if float(p.qty) < 0 else "LONG"
                 pnl_pct = float(p.unrealized_plpc)
-                log(f"EOD FORCE CLOSE {sym} {side} {pnl_pct:.2%}")
+                hold_active = close_hold_active(sym)
+                pdt_stuck = sym in stuck_syms_eod
+                log(
+                    f"EOD CLOSE ATTEMPT {sym} {side} pnl={pnl_pct:.2%} "
+                    f"qty={p.qty} close_hold={hold_active} pdt_stuck={pdt_stuck}"
+                )
+                # EOD must close regardless of intraday hold cooldowns.
+                clear_close_hold(sym)
                 try:
                     pnl_usd = TRADE_NOTIONAL * pnl_pct
-                    close_and_verify_position(client, sym, "eod_force_close", pnl_usd=pnl_usd)
+                    ok = close_and_verify_position(client, sym, "eod_force_close", pnl_usd=pnl_usd)
+                    if not ok:
+                        log(f"EOD CLOSE UNVERIFIED {sym}: close_and_verify returned False — position may still be open")
                 except Exception as e:
-                    log(f"EOD CLOSE FAIL {sym}: {e}")
+                    log(f"EOD CLOSE EXCEPTION {sym}: {e}")
             for attempt in range(1, EOD_FINAL_VERIFY_ATTEMPTS + 1):
                 remaining = client.get_all_positions()
                 if not remaining:
@@ -513,18 +805,32 @@ def maybe_force_close_eod(client):
                 syms = ", ".join(p.symbol for p in remaining)
                 log(f"EOD FINAL VERIFY RETRY: attempt {attempt}/{EOD_FINAL_VERIFY_ATTEMPTS} still open={syms}")
                 for p in remaining:
+                    sym = p.symbol
+                    side = "SHORT" if float(p.qty) < 0 else "LONG"
                     pnl_pct = float(p.unrealized_plpc)
-                    close_and_verify_position(
-                        client,
-                        p.symbol,
-                        "eod_force_close",
-                        pnl_usd=TRADE_NOTIONAL * pnl_pct,
+                    hold_active = close_hold_active(sym)
+                    log(
+                        f"EOD RETRY {sym}: qty={p.qty} side={side} pnl={pnl_pct:.2%} "
+                        f"close_hold={hold_active} — clearing hold and retrying"
                     )
+                    clear_close_hold(sym)
+                    try:
+                        ok = close_and_verify_position(
+                            client, sym, "eod_force_close",
+                            pnl_usd=TRADE_NOTIONAL * pnl_pct,
+                        )
+                        if not ok:
+                            log(f"EOD RETRY UNVERIFIED {sym}: still open after retry attempt {attempt}")
+                    except Exception as e:
+                        log(f"EOD RETRY EXCEPTION {sym}: {e}")
                 if attempt < EOD_FINAL_VERIFY_ATTEMPTS:
                     time.sleep(EOD_FINAL_VERIFY_SLEEP_S)
             final_remaining = client.get_all_positions()
             if final_remaining:
-                syms = ", ".join(p.symbol for p in final_remaining)
+                syms = ", ".join(
+                    f"{p.symbol}(qty={p.qty},pnl={float(p.unrealized_plpc):.2%})"
+                    for p in final_remaining
+                )
                 log(f"EOD FINAL VERIFY FAILED: still open={syms}")
                 post_discord(f"🚨 PAPER EOD CLOSE FAILED | still open: {syms}")
         else:
@@ -532,6 +838,77 @@ def maybe_force_close_eod(client):
     except Exception as e:
         log(f"EOD force-close error: {e}")
     _eod_close_done_date = today_str
+
+
+def purge_carryover_positions(client):
+    """
+    Called once per trading day at the first market-open loop cycle.
+    If broker positions exist before the bot has entered any trade today,
+    they are assumed to be prior-day carryover and are closed before any
+    new signals are processed.
+
+    Returns True  → safe to process new signals (nothing to purge, or purge done).
+    Returns False → carryover positions still open; caller should defer new entries.
+    """
+    global _carryover_purge_done_date, _carryover_alerted_date
+    today_str = datetime.now(ET_TZ).strftime("%Y-%m-%d")
+    if _carryover_purge_done_date == today_str:
+        return True  # already handled for today's session
+
+    try:
+        positions = client.get_all_positions()
+    except Exception as e:
+        log(f"CARRYOVER CHECK ERROR: {e}")
+        return True  # don't block new entries indefinitely on API failure
+
+    if not positions:
+        log("CARRYOVER CHECK: no prior-day positions detected - starting clean")
+        _carryover_purge_done_date = today_str
+        return True
+
+    syms = ", ".join(p.symbol for p in positions)
+    log(f"CARRYOVER DETECTED: {len(positions)} prior-day position(s) — purging before new entries: {syms}")
+    # Post the Discord alert only once per day, not on every retry loop.
+    if _carryover_alerted_date != today_str:
+        post_discord(f"⚠️ PAPER CARRYOVER PURGE | {len(positions)} prior-day position(s): {syms}")
+        _carryover_alerted_date = today_str
+
+    stuck_syms = set(get_pdt_stuck_symbols())
+    for p in positions:
+        sym = p.symbol
+        if sym in stuck_syms:
+            log(f"CARRYOVER PURGE SKIP {sym}: PDT_STUCK — will retry at next market open")
+            continue
+        side = "SHORT" if float(p.qty) < 0 else "LONG"
+        pnl_pct = float(p.unrealized_plpc)
+        pnl_usd = TRADE_NOTIONAL * pnl_pct
+        log(f"CARRYOVER PURGE ATTEMPT: {sym} {side} {pnl_pct:.2%}")
+        try:
+            close_and_verify_position(client, sym, "carryover_purge", pnl_usd=pnl_usd)
+        except Exception as e:
+            log(f"CARRYOVER PURGE FAIL {sym}: {e}")
+
+    try:
+        remaining = client.get_all_positions()
+    except Exception as e:
+        log(f"CARRYOVER VERIFY ERROR: {e}")
+        return False
+
+    if not remaining:
+        log("CARRYOVER PURGE COMPLETE: all prior-day positions closed — resuming normal operation")
+        _carryover_purge_done_date = today_str
+        return True
+
+    rem_syms = ", ".join(p.symbol for p in remaining)
+    # If every remaining position is PDT_STUCK, unblock normal operations —
+    # maybe_retry_pdt_stuck_at_open will handle them at tomorrow's open.
+    if all(p.symbol in stuck_syms for p in remaining):
+        log(f"CARRYOVER PURGE: remaining position(s) all PDT_STUCK ({rem_syms}) — unblocking entries")
+        _carryover_purge_done_date = today_str
+        return True
+
+    log(f"CARRYOVER PURGE INCOMPLETE: {len(remaining)} position(s) still open: {rem_syms} — new entries deferred")
+    return False
 
 
 def can_open_new_positions_now():
@@ -555,9 +932,8 @@ def execute_signal(client, symbol: str, price: float, signal: str, direction: st
         if kill_switch_reason:
             log(f"ENTRY BLOCKED {symbol}: {kill_switch_reason}")
             return False
-        held_symbols = {p.symbol for p in positions}
-        if symbol in held_symbols:
-            log(f"SKIP {symbol}: already have position")
+        if is_equity_symbol(symbol) and pdt_equity_entry_block_active():
+            log(f"ENTRY BLOCKED {symbol}: equity entries paused for today after broker denied an earlier close (PDT protection)")
             return False
         if len(positions) >= MAX_OPEN_POSITIONS:
             log(f"SKIP {symbol}: max positions reached ({MAX_OPEN_POSITIONS})")
@@ -614,6 +990,10 @@ def _run():
         f"Signal max age: {MAX_SIGNAL_AGE_SECONDS}s | Dedup window: {DEDUP_WINDOW_SECONDS}s | "
         f"EOD force close: 3:45pm ET | RVOL min: {WILD_RVOL_MIN} | Blacklist: {len(WILD_BLACKLIST)} symbols"
     )
+    if pdt_equity_entry_block_active():
+        log(f"PDT EQUITY ENTRY GUARD ACTIVE for {_trading_day_str()} ET - new equity entries paused after earlier broker exit denial")
+    else:
+        log(f"PDT EQUITY ENTRY GUARD INACTIVE for {_trading_day_str()} ET")
     post_discord(
         f"📄 PAPER SNIPER ONLINE | wild mode (no roster filter) | ${TRADE_NOTIONAL:.0f}/trade | "
         f"TP {TAKE_PROFIT_PCT:.2%} SL {STOP_LOSS_PCT:.2%} | RVOL≥{WILD_RVOL_MIN} | 3:45pm ET flat"
@@ -634,7 +1014,23 @@ def _run():
                 time.sleep(30)
                 continue
 
+            # Refresh held-symbols set from the API every loop so that fills
+            # propagated since last iteration are captured. Symbols are also
+            # added immediately after execute_signal() returns True, so API
+            # lag can never cause a duplicate entry within the same session.
+            global _held_symbols
+            try:
+                _held_symbols = {p.symbol for p in client.get_all_positions()}
+            except Exception as _e:
+                log(f"Position refresh error (keeping existing held set): {_e}")
+
+            maybe_retry_pdt_stuck_at_open(client)
             manage_positions(client)
+
+            if not purge_carryover_positions(client):
+                log("CARRYOVER PURGE PENDING: new entries deferred until prior-day positions are closed")
+                time.sleep(POLL_SECONDS)
+                continue
 
             acct = client.get_account()
             equity = float(acct.equity or 0.0)
@@ -646,6 +1042,13 @@ def _run():
             if signals and can_open_new_positions_now():
                 for rowid, signal_ts, symbol, signal_type, price, flow_m, change_pct, rvol in signals:
                     sym_upper = str(symbol).upper()
+
+                    # Skip silently if we already hold (or just entered) this symbol.
+                    # _held_symbols is refreshed from the API at the top of every loop
+                    # iteration and updated immediately after each successful entry, so
+                    # API fill lag cannot cause a duplicate position.
+                    if sym_upper in _held_symbols:
+                        continue
 
                     # Wild experiment filters (approved_symbols.json intentionally bypassed)
                     rvol_val = float(rvol) if rvol is not None else 0.0
@@ -681,6 +1084,7 @@ def _run():
 
                     if execute_signal(client, sym_upper, float(price), signal_type, direction):
                         mark_signal_processed(signal_key, signal_ts, sym_upper, signal_type, direction)
+                        _held_symbols.add(sym_upper)  # block re-entry before next API refresh
 
             last_check = (datetime.utcnow() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
             positions = client.get_all_positions()
