@@ -2,7 +2,14 @@
 import sqlite3
 import json
 import os
+import requests
 from datetime import datetime, timedelta
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv("/home/theplummer92/.env")
+except Exception:
+    pass
 
 DB_PATH        = os.environ.get("STRATEGY_LAB_DB_PATH", "/home/theplummer92/strategy_lab.db")
 TRADE_DB_PATH  = os.environ.get("TRADE_DB_PATH", "/home/theplummer92/trade_log.db")
@@ -10,12 +17,21 @@ OUT_PATH       = os.environ.get("APPROVED_SYMBOLS_PATH", "/home/theplummer92/app
 
 MIN_TRADES    = 20
 MIN_WIN_RATE  = 0.60
-MIN_SCORE     = 200
+MIN_SCORE     = 60
 
 MAX_LONGS     = 5
 MAX_SHORTS    = 5
 
-CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
+CRYPTO_EXCLUDED_SYMBOLS = {
+    "BTC/USD", "ETH/USD", "SOL/USD", "ADA-USD", "DOGE/USD", "XRP-USD",
+    "BTC-USD", "ETH-USD", "SOL-USD", "ADA/USD", "DOGE-USD", "XRP/USD",
+}
+
+
+def _is_crypto(symbol: str) -> bool:
+    """Return True for any symbol ending in -USD or /USD (crypto format)."""
+    s = symbol.upper()
+    return s in CRYPTO_EXCLUDED_SYMBOLS or s.endswith("-USD") or s.endswith("/USD")
 
 # Demotion thresholds
 DEMOTION_NO_WIN_DAYS    = 21   # closed trades in this window but 0 wins → demote
@@ -25,11 +41,63 @@ MIN_TRADES_FOR_DEMOTION = 15   # require enough recent live closes before any de
 
 # Freshness decay score
 FRESHNESS_INITIAL     = 100.0  # score assigned to newly rostered symbols
-FRESHNESS_DECAY_RATE  = 0.95   # multiplied per day (half-life ~13.5 days)
+FRESHNESS_DECAY_RATE  = 0.99   # multiplied per day (half-life ~69 days; was 0.95/~13.5d which drained low-volume systems)
 FRESHNESS_WIN_BOOST   = 8.0    # added per winning trade
 FRESHNESS_LOSS_HIT    = 3.0    # subtracted per losing trade
-FRESHNESS_MIN_ACTIVE  = 40.0   # below this → demote to cooling_off
+FRESHNESS_MIN_ACTIVE  = 20.0   # below this → demote to cooling_off (was 40; lowered for low-trade-frequency systems)
 FRESHNESS_PROMOTE_THR = 80.0   # above this → eligible for 1.5x trade size multiplier   # how many recent results to average
+
+# Strategy lab data staleness threshold
+STRATEGY_LAB_MAX_STALENESS_DAYS = 3
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+_STALE_ALERT_FLAG = "/tmp/roster_stale_alert_{date}.flag"
+
+
+def _load_signal_weights_top3() -> str:
+    """Return a one-line summary of the top 3 weighted signal types, or ''."""
+    weights_path = "/home/theplummer92/signal_weights.json"
+    try:
+        with open(weights_path) as f:
+            data = json.load(f)
+        weights = data.get("weights", data)
+        qualified = [
+            (k, v) for k, v in weights.items()
+            if not k.startswith("_") and v.get("n", 0) >= 15 and v.get("weight", 1.0) != 1.0
+        ]
+        if not qualified:
+            return ""
+        top3 = sorted(qualified, key=lambda x: -x[1]["weight"])[:3]
+        parts = [
+            f"{k}: {v['win_rate']:.0%} WR {v['weight']}x ({v['n']}n)"
+            for k, v in top3
+        ]
+        return "Top signals: " + " | ".join(parts)
+    except Exception:
+        return ""
+
+
+def _post_stale_alert(age_days: int, last_tested_date: str):
+    """Send a Discord alert when strategy_lab data is stale. Max once per calendar day."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    flag_path = _STALE_ALERT_FLAG.format(date=today)
+    if os.path.exists(flag_path):
+        return
+    if not DISCORD_WEBHOOK_URL:
+        return
+    top_weights = _load_signal_weights_top3()
+    msg = (
+        f"⚠️ Strategy Lab Stale — last backtest was {age_days} days ago "
+        f"({last_tested_date}). Alpaca auth may have failed. Check "
+        f"`journalctl -u strategy-lab.service`"
+    )
+    if top_weights:
+        msg += f"\n{top_weights}"
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=5)
+        open(flag_path, "w").close()
+    except Exception as e:
+        print(f"[roster] Discord stale alert failed: {e}")
 
 
 def log_roster_decision(action, symbol, reason, **fields):
@@ -159,7 +227,7 @@ def fetch_best_per_symbol():
     """
     rows = cur.execute(query, (MIN_TRADES, MIN_WIN_RATE, MIN_SCORE)).fetchall()
     conn.close()
-    return rows
+    return [r for r in rows if not _is_crypto(r["symbol"])]
 
 
 def fetch_latest_rows_for_symbols(symbols):
@@ -395,7 +463,7 @@ def build_roster(rows, current_data, cooling_rows=None):
     all_tracked = promoted | current_cooling
     stored_fresh = compute_freshness_scores(all_tracked, current_data)
 
-    approved = sorted(set(buy_list + sell_list + CRYPTO_SYMBOLS))
+    approved = sorted(set(buy_list + sell_list))
     payload = {
         "buy":              buy_list,
         "sell":             sell_list,
@@ -519,6 +587,9 @@ def check_wild_paper_performance(payload):
     sell_list       = list(payload.get("sell", []))
 
     for sym, trade_list in trades_by_symbol.items():
+        if _is_crypto(sym):
+            print(f"[roster-wild] SKIP {sym} — crypto excluded from roster")
+            continue
         if len(trade_list) < WILD_MIN_TRADES:
             continue
 
@@ -586,7 +657,7 @@ def check_wild_paper_performance(payload):
     payload["buy"]        = buy_list
     payload["sell"]       = sell_list
     payload["cooling_off"] = sorted(current_cooling)
-    payload["approved"]   = sorted(set(buy_list + sell_list + CRYPTO_SYMBOLS))
+    payload["approved"]   = sorted(set(buy_list + sell_list))
 
 
 def main():
@@ -601,6 +672,17 @@ def main():
         print(f"[roster] Excluding {len(overfit_symbols)} OVERFIT symbols: {sorted(overfit_symbols)}")
 
     rows = fetch_best_per_symbol()
+    try:
+        conn_chk = sqlite3.connect(DB_PATH)
+        latest_tested = conn_chk.execute("SELECT MAX(tested_at) FROM results").fetchone()[0]
+        conn_chk.close()
+        if latest_tested:
+            age_days = (datetime.utcnow() - datetime.fromisoformat(latest_tested)).days
+            if age_days > 0 and age_days >= STRATEGY_LAB_MAX_STALENESS_DAYS:
+                print(f"[roster] WARNING: strategy_lab data is {age_days} days old (last tested {latest_tested[:10]}). Results may be stale.")
+                _post_stale_alert(age_days, latest_tested[:10])
+    except Exception:
+        pass
     rows = [r for r in rows if r["symbol"].upper() not in overfit_symbols]
 
     cooling_off_list = [s for s in current_data.get("cooling_off", []) if s.upper() not in overfit_symbols]
@@ -614,6 +696,10 @@ def main():
 
     print("Updated approved_symbols.json")
     print(json.dumps(payload, indent=2))
+
+    top_weights = _load_signal_weights_top3()
+    if top_weights:
+        print(f"[roster] 📊 {top_weights}")
 
 
 if __name__ == "__main__":
