@@ -3879,19 +3879,19 @@ def run():
                         _open_approved = get_approved_symbols()
                         _open_vix = market_context.get("vix") if market_context else None
                         _on_sell_list = _open_alpaca in _open_approved.get("sell", [])
-                        _conf_ok = (effective_confidence or 0) >= 60
+                        _conf_ok = (effective_confidence or 0) >= 45
                         _vix_ok = (_open_vix is not None) and float(_open_vix) >= 17
                         if _on_sell_list and _conf_ok and _vix_ok:
                             pass  # Allow: approved sell symbol, high confidence, elevated VIX
                         else:
                             _reason = (
                                 "not on sell-approved list" if not _on_sell_list
-                                else f"confidence {effective_confidence} < 60" if not _conf_ok
+                                else f"confidence {effective_confidence} < 45" if not _conf_ok
                                 else f"VIX {_open_vix:.1f} < 17"
                             )
                             log_line(
                                 f"⛔ SKIP SHORT {sym} '{stype}': OPEN regime, catalyst=CLEAN — "
-                                f"{_reason}. Need sell-approved + conf≥60 + VIX≥17."
+                                f"{_reason}. Need sell-approved + conf≥45 + VIX≥17."
                             )
                             record_blocked_signal(
                                 signal_key=signal_key,

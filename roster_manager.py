@@ -18,7 +18,7 @@ OUT_PATH       = os.environ.get("APPROVED_SYMBOLS_PATH", str(DATA_DIR / "approve
 
 MIN_TRADES    = 20
 MIN_WIN_RATE  = 0.60
-MIN_SCORE     = 200
+MIN_SCORE     = 60
 
 MAX_LONGS     = 5
 MAX_SHORTS    = 5
