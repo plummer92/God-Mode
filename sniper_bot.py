@@ -92,6 +92,14 @@ def env_int(name: str, default=None):
         return default
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+LIVE_TRADING_ENABLED = env_bool("LIVE_TRADING_ENABLED", False)
 MAX_RISK_PER_TRADE_USD = env_float("MAX_RISK_PER_TRADE_USD", None)
 MAX_SINGLE_POSITION_GROSS_USD = env_float("MAX_SINGLE_POSITION_GROSS_USD", MAX_GROSS_EXPOSURE_USD)
 MAX_SECTOR_GROSS_USD = env_float("MAX_SECTOR_GROSS_USD", MAX_GROSS_EXPOSURE_USD)
@@ -3621,6 +3629,29 @@ def trading_client_positions(client):
 
 
 # -------------------- MAIN LOOP --------------------
+def run_observer_mode():
+    log_line("SNIPER OBSERVER MODE active - live order execution disabled")
+    log_line("Set LIVE_TRADING_ENABLED=true to allow live Alpaca order management and entries")
+    post_discord("SNIPER OBSERVER MODE | live trading disabled | scanner/audit services remain active")
+    last_hb = 0
+    while True:
+        now = time.time()
+        if now - last_hb >= 60:
+            market_context = get_market_context(REGIME_PATH, logger=log_line)
+            log_market_regime_transition(market_context)
+            note = f"audit_only|{market_context.get('final_regime', 'OPEN_NEUTRAL')}"
+            log_line(
+                f"heartbeat | observer={not LIVE_TRADING_ENABLED} "
+                f"regime={market_context.get('final_regime', 'OPEN_NEUTRAL')} "
+                f"VIX={fmt_num(market_context.get('vix'), 1)} "
+                f"SPY={fmt_pct(market_context.get('spy_move_pct'))} "
+                f"QQQ={fmt_pct(market_context.get('qqq_move_pct'))}"
+            )
+            write_sniper_status(status="OBSERVER", heartbeat_seq=0, in_position=0, note=note)
+            last_hb = now
+        time.sleep(POLL_SECONDS)
+
+
 def run():
     # Single instance check
     if os.path.exists(LOCKFILE):
@@ -3639,6 +3670,12 @@ def run():
     init_db()
     init_trade_log()
     load_daily_risk_state()
+
+    if not LIVE_TRADING_ENABLED:
+        write_sniper_status(status="OBSERVER", heartbeat_seq=0, in_position=0, note="audit_only|boot")
+        run_observer_mode()
+        return
+
     t_client = get_client()
 
     # Startup reconciliation: immediately compare open DB trades against live Alpaca

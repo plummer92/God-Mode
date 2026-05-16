@@ -25,8 +25,12 @@ jobs:
             git reset --hard origin/main
             sudo cp systemd/*.service /etc/systemd/system/
             sudo systemctl daemon-reload
+            sudo systemctl enable scheduled-reports.service
+            sudo systemctl enable signal-outcomes.service
             sudo systemctl restart sniper.service
             sudo systemctl restart paper-sniper.service
             sudo systemctl restart strategy-lab.service
             sudo systemctl restart dashboard.service
+            sudo systemctl restart scheduled-reports.service
+            sudo systemctl restart signal-outcomes.service
             echo "Deploy complete"

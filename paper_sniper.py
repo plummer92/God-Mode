@@ -25,8 +25,20 @@ from app_paths import DATA_DIR, ENV_FILE
 load_dotenv(ENV_FILE)
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-PAPER_KEY = os.getenv("APCA_PAPER_KEY_ID")
-PAPER_SECRET = os.getenv("APCA_PAPER_SECRET_KEY")
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+PAPER_TRADING_ENABLED = env_bool("PAPER_TRADING_ENABLED", False)
+
+# Use dedicated wild-experiment account keys if configured, else fall back to standard paper keys
+PAPER_KEY = os.getenv("APCA_WILD_PAPER_KEY_ID") or os.getenv("APCA_PAPER_KEY_ID")
+PAPER_SECRET = os.getenv("APCA_WILD_PAPER_SECRET_KEY") or os.getenv("APCA_PAPER_SECRET_KEY")
 PAPER_URL = os.getenv("APCA_PAPER_BASE_URL", "https://paper-api.alpaca.markets")
 
 TRADE_NOTIONAL = 500.0
@@ -956,6 +968,14 @@ def run():
 
 def _run():
     ensure_state_db()
+    if not PAPER_TRADING_ENABLED:
+        log("PAPER SNIPER OBSERVER MODE active - paper order execution disabled")
+        log("Set PAPER_TRADING_ENABLED=true to allow paper Alpaca orders")
+        post_discord("PAPER SNIPER OBSERVER MODE | paper trading disabled")
+        while True:
+            log("heartbeat | paper observer mode | no orders submitted")
+            time.sleep(300)
+
     log("PAPER SNIPER starting - wild experiment mode, no approved-symbols filter")
     log(
         f"Trade size: ${TRADE_NOTIONAL:.2f} | TP: {TAKE_PROFIT_PCT:.2%} | "

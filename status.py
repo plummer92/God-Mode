@@ -2,17 +2,34 @@
 """status.py — Quick health check for all God-Mode services."""
 import sqlite3
 import json
+import os
 import subprocess
+import sys
 from datetime import datetime, timezone, date
-from app_paths import DATA_DIR
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
+from app_paths import DATA_DIR, ENV_FILE
+
+load_dotenv(ENV_FILE)
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 TRADE_LOG_DB  = str(DATA_DIR / "trade_log.db")
 SIGNALS_DB    = str(DATA_DIR / "wolfe_signals.db")
 REGIME_PATH   = str(DATA_DIR / "regime_snapshot.json")
 APPROVED_PATH = str(DATA_DIR / "approved_symbols.json")
-SERVICES      = ["sniper", "paper-sniper", "strategy-lab", "dashboard"]
+SERVICES      = ["sniper", "paper-sniper", "strategy-lab", "dashboard", "scheduled-reports", "signal-outcomes"]
 
 W = 60
+
+
+def env_enabled(name):
+    return str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def hr(char="─", width=W):
@@ -117,6 +134,16 @@ def fetch_signal_count():
         return 0
 
 
+def fetch_signal_outcome_count():
+    try:
+        conn = sqlite3.connect(SIGNALS_DB)
+        row = conn.execute("SELECT COUNT(*) FROM signal_outcomes").fetchone()
+        conn.close()
+        return row[0] if row else 0
+    except Exception:
+        return 0
+
+
 def main():
     hr("═")
     print("  WOLFE GOD-MODE — SYSTEM STATUS")
@@ -144,6 +171,14 @@ def main():
         print(f"\n  Last heartbeat : {ts_utc} UTC ({age})  |  {note}")
     else:
         print("\n  Last heartbeat : no data")
+
+    # Trading mode
+    print("\n  TRADING MODE")
+    hr()
+    live_enabled = env_enabled("LIVE_TRADING_ENABLED")
+    paper_enabled = env_enabled("PAPER_TRADING_ENABLED")
+    print(f"  Live equities : {'ENABLED' if live_enabled else 'OFF / audit-only'}")
+    print(f"  Paper orders  : {'ENABLED' if paper_enabled else 'OFF / observer-only'}")
 
     # Regime
     print("\n  REGIME")
@@ -193,9 +228,11 @@ def main():
     alltime, total_trades = fetch_alltime_pnl()
     sign = "+" if alltime >= 0 else ""
     sig_count = fetch_signal_count()
+    outcome_count = fetch_signal_outcome_count()
     print(f"\n  ALL-TIME")
     hr()
     print(f"  P&L: {sign}${alltime:.2f}  |  {total_trades} closed trades  |  {sig_count:,} signals in DB")
+    print(f"  Signal outcomes labeled: {outcome_count:,}")
 
     hr("═")
 
