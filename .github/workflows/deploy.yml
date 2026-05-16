@@ -24,13 +24,18 @@ jobs:
             git checkout main
             git reset --hard origin/main
             sudo cp systemd/*.service /etc/systemd/system/
+            sudo cp systemd/*.timer /etc/systemd/system/
             sudo systemctl daemon-reload
+            sudo systemctl enable godmode.service
             sudo systemctl enable scheduled-reports.service
-            sudo systemctl enable signal-outcomes.service
-            sudo systemctl restart sniper.service
-            sudo systemctl restart paper-sniper.service
-            sudo systemctl restart strategy-lab.service
-            sudo systemctl restart dashboard.service
+            sudo systemctl enable market-observer.timer
+            sudo systemctl enable signal-outcomes.timer
+            sudo systemctl enable strategy-lab-run.timer
+            sudo systemctl disable sniper.service paper-sniper.service strategy-lab.service dashboard.service signal-outcomes.service || true
+            sudo systemctl stop sniper.service paper-sniper.service strategy-lab.service dashboard.service signal-outcomes.service || true
+            sudo systemctl restart godmode.service
             sudo systemctl restart scheduled-reports.service
-            sudo systemctl restart signal-outcomes.service
+            sudo systemctl restart market-observer.timer
+            sudo systemctl restart signal-outcomes.timer
+            sudo systemctl restart strategy-lab-run.timer
             echo "Deploy complete"

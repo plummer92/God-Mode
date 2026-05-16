@@ -1519,13 +1519,7 @@ def main_loop():
 def _main_loop():
     while True:
         try:
-            run()
-            # Update rosters after each iteration
-            try:
-                import subprocess
-                subprocess.run([str(VENV_PYTHON), ROSTER_MANAGER_PATH])
-            except Exception as re:
-                log(f"Roster manager error: {re}")
+            run_once()
             sleep_hours = LOOP_SLEEP_SECONDS / 3600
             log(f"Sleeping {sleep_hours:.1f} hours...")
             time.sleep(LOOP_SLEEP_SECONDS)
@@ -1533,8 +1527,19 @@ def _main_loop():
             log(f"Error: {e}")
             time.sleep(300)
 
+
+def run_once():
+    run()
+    try:
+        import subprocess
+        subprocess.run([str(VENV_PYTHON), ROSTER_MANAGER_PATH])
+    except Exception as re:
+        log(f"Roster manager error: {re}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run strategy lab or provider validation.")
+    parser.add_argument("--once", action="store_true", help="Run one strategy-lab iteration and exit")
     parser.add_argument("--validate-stock-window", action="store_true")
     parser.add_argument("--validate-fast", action="store_true")
     return parser.parse_args()
@@ -1545,5 +1550,7 @@ if __name__ == "__main__":
         run_validation_fast()
     elif args.validate_stock_window:
         run_validation()
+    elif args.once:
+        run_once()
     else:
         main_loop()

@@ -1,5 +1,5 @@
 [Unit]
-Description=Wolfe Signal Outcomes Labeler
+Description=Wolfe Strategy Lab one-shot run
 After=network.target
 
 [Service]
@@ -8,7 +8,7 @@ User=theplummer92
 Environment=GOD_MODE_DATA_DIR=/home/theplummer92
 Environment=GOD_MODE_ENV_FILE=/home/theplummer92/.env
 WorkingDirectory=/home/theplummer92/god-mode-sync
-ExecStart=/home/theplummer92/venv/bin/python3 /home/theplummer92/god-mode-sync/signal_outcomes.py --once
+ExecStart=/home/theplummer92/venv/bin/python3 /home/theplummer92/god-mode-sync/strategy_lab.py --once
 StandardOutput=journal
 StandardError=journal
 

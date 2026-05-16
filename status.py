@@ -23,7 +23,9 @@ TRADE_LOG_DB  = str(DATA_DIR / "trade_log.db")
 SIGNALS_DB    = str(DATA_DIR / "wolfe_signals.db")
 REGIME_PATH   = str(DATA_DIR / "regime_snapshot.json")
 APPROVED_PATH = str(DATA_DIR / "approved_symbols.json")
-SERVICES      = ["sniper", "paper-sniper", "strategy-lab", "dashboard", "scheduled-reports", "signal-outcomes"]
+SERVICES      = ["godmode", "scheduled-reports"]
+OPTIONAL_SERVICES = ["sniper", "paper-sniper", "strategy-lab", "dashboard", "signal-outcomes"]
+TIMERS        = ["market-observer", "signal-outcomes", "strategy-lab-run"]
 
 W = 60
 
@@ -40,6 +42,17 @@ def service_status(name):
     try:
         out = subprocess.check_output(
             ["systemctl", "is-active", f"{name}.service"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        return out
+    except Exception:
+        return "unknown"
+
+
+def timer_status(name):
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "is-active", f"{name}.timer"],
             stderr=subprocess.DEVNULL, text=True
         ).strip()
         return out
@@ -156,6 +169,15 @@ def main():
     for svc in SERVICES:
         status = service_status(svc)
         indicator = "OK  " if status == "active" else "DEAD"
+        print(f"  [{indicator}]  {svc}.service  ({status})")
+    for timer in TIMERS:
+        status = timer_status(timer)
+        indicator = "OK  " if status == "active" else "DEAD"
+        print(f"  [{indicator}]  {timer}.timer  ({status})")
+    print("  Optional always-on services:")
+    for svc in OPTIONAL_SERVICES:
+        status = service_status(svc)
+        indicator = "OFF " if status in ("inactive", "unknown") else "ON  "
         print(f"  [{indicator}]  {svc}.service  ({status})")
 
     # Sniper heartbeat

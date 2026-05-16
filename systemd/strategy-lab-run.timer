@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Strategy Lab every 6 hours
+Requires=strategy-lab-run.service
+
+[Timer]
+OnBootSec=20m
+OnUnitActiveSec=6h
+Persistent=true
+Unit=strategy-lab-run.service
+
+[Install]
+WantedBy=timers.target
