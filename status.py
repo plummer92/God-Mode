@@ -25,7 +25,8 @@ REGIME_PATH   = str(DATA_DIR / "regime_snapshot.json")
 APPROVED_PATH = str(DATA_DIR / "approved_symbols.json")
 SERVICES      = ["godmode", "scheduled-reports"]
 OPTIONAL_SERVICES = ["sniper", "paper-sniper", "strategy-lab", "dashboard", "signal-outcomes"]
-TIMERS        = ["market-observer", "signal-outcomes", "strategy-lab-run"]
+TIMERS        = ["market-observer", "signal-outcomes"]
+OPTIONAL_TIMERS = ["strategy-lab-run"]
 
 W = 60
 
@@ -39,25 +40,40 @@ def hr(char="─", width=W):
 
 
 def service_status(name):
-    try:
-        out = subprocess.check_output(
-            ["systemctl", "is-active", f"{name}.service"],
-            stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        return out
-    except Exception:
-        return "unknown"
+    return unit_status(f"{name}.service")
 
 
 def timer_status(name):
+    return unit_status(f"{name}.timer")
+
+
+def unit_status(unit):
     try:
-        out = subprocess.check_output(
-            ["systemctl", "is-active", f"{name}.timer"],
-            stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        return out
+        proc = subprocess.run(
+            ["systemctl", "is-active", unit],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        return proc.stdout.strip() or "unknown"
     except Exception:
         return "unknown"
+
+
+def list_processes(pattern):
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-af", pattern],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        lines = [line for line in proc.stdout.splitlines() if "pgrep -af" not in line]
+        return lines
+    except Exception:
+        return []
 
 
 def load_regime():
@@ -147,6 +163,16 @@ def fetch_signal_count():
         return 0
 
 
+def fetch_latest_signal():
+    try:
+        conn = sqlite3.connect(SIGNALS_DB)
+        row = conn.execute("SELECT MAX(timestamp) FROM signals").fetchone()
+        conn.close()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
 def fetch_signal_outcome_count():
     try:
         conn = sqlite3.connect(SIGNALS_DB)
@@ -174,11 +200,22 @@ def main():
         status = timer_status(timer)
         indicator = "OK  " if status == "active" else "DEAD"
         print(f"  [{indicator}]  {timer}.timer  ({status})")
+    print("  Optional timers:")
+    for timer in OPTIONAL_TIMERS:
+        status = timer_status(timer)
+        indicator = "OFF " if status in ("inactive", "unknown", "failed") else "ON  "
+        print(f"  [{indicator}]  {timer}.timer  ({status})")
     print("  Optional always-on services:")
     for svc in OPTIONAL_SERVICES:
         status = service_status(svc)
         indicator = "OFF " if status in ("inactive", "unknown") else "ON  "
         print(f"  [{indicator}]  {svc}.service  ({status})")
+
+    godmode_procs = list_processes("godmode.py")
+    if godmode_procs:
+        print("  Collector process:")
+        for line in godmode_procs[:3]:
+            print(f"        {line}")
 
     # Sniper heartbeat
     hb = fetch_sniper_status()
@@ -193,6 +230,10 @@ def main():
         print(f"\n  Last heartbeat : {ts_utc} UTC ({age})  |  {note}")
     else:
         print("\n  Last heartbeat : no data")
+
+    latest_signal = fetch_latest_signal()
+    if latest_signal:
+        print(f"  Latest signal  : {latest_signal}")
 
     # Trading mode
     print("\n  TRADING MODE")

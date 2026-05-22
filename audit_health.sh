@@ -26,6 +26,9 @@ done
 section "timers"
 systemctl list-timers --no-pager 2>&1 | grep -E 'market-observer|signal-outcomes|strategy-lab' || true
 
+section "godmode processes"
+pgrep -af 'godmode.py' || true
+
 run "failed units" systemctl --failed --no-pager
 run "memory" free -h
 run "disk" df -h / /home
