@@ -35,6 +35,8 @@ HORIZONS = (
 DEFAULT_BATCH_SIZE = int(os.getenv("SIGNAL_OUTCOME_BATCH_SIZE", "500"))
 DEFAULT_SLEEP_SECONDS = int(os.getenv("SIGNAL_OUTCOME_SLEEP_SECONDS", "300"))
 FLAT_BAND_PCT = float(os.getenv("SIGNAL_OUTCOME_FLAT_BAND_PCT", "0.05"))
+SQLITE_TIMEOUT_SECONDS = float(os.getenv("SIGNAL_OUTCOME_SQLITE_TIMEOUT_SECONDS", "45"))
+SQLITE_RETRY_ATTEMPTS = int(os.getenv("SIGNAL_OUTCOME_SQLITE_RETRY_ATTEMPTS", "4"))
 
 
 def log(message: str) -> None:
@@ -69,8 +71,18 @@ def release_lock() -> None:
         pass
 
 
+def connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT_SECONDS)
+    conn.execute(f"PRAGMA busy_timeout = {int(SQLITE_TIMEOUT_SECONDS * 1000)}")
+    return conn
+
+
+def is_locked_error(exc: Exception) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
 def init_db() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS signal_outcomes (
@@ -138,7 +150,7 @@ def yfinance_symbol(symbol: str) -> str:
 
 def load_due_signals(horizon: str, delta: timedelta, batch_size: int) -> list[sqlite3.Row]:
     cutoff = datetime.now(timezone.utc) - delta
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute(
             """
@@ -272,18 +284,27 @@ def build_outcome_rows(
 def save_outcomes(rows: list[tuple]) -> int:
     if not rows:
         return 0
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO signal_outcomes (
-                signal_rowid, horizon, symbol, signal_ts, target_ts, signal_type,
-                direction, signal_price, target_price, return_pct, outcome,
-                reviewed_at, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-        return conn.total_changes
+    for attempt in range(1, SQLITE_RETRY_ATTEMPTS + 1):
+        try:
+            with connect_db() as conn:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO signal_outcomes (
+                        signal_rowid, horizon, symbol, signal_ts, target_ts, signal_type,
+                        direction, signal_price, target_price, return_pct, outcome,
+                        reviewed_at, source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                return conn.total_changes
+        except sqlite3.OperationalError as exc:
+            if not is_locked_error(exc) or attempt >= SQLITE_RETRY_ATTEMPTS:
+                raise
+            sleep_s = min(30, 2 ** attempt)
+            log(f"sqlite locked while saving outcomes; retry {attempt}/{SQLITE_RETRY_ATTEMPTS} in {sleep_s}s")
+            time.sleep(sleep_s)
+    return 0
 
 
 def run_once(batch_size: int) -> int:

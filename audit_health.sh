@@ -18,6 +18,11 @@ run "git" git --no-pager log --oneline -3
 run "repo status" git status --short --branch
 run "god mode status" python3 status.py
 
+section "unit files"
+for unit in godmode.service scheduled-reports.service market-observer.timer signal-outcomes.timer strategy-lab-run.timer; do
+  systemctl cat "$unit" >/dev/null 2>&1 && echo "$unit: installed" || echo "$unit: missing"
+done
+
 section "timers"
 systemctl list-timers --no-pager 2>&1 | grep -E 'market-observer|signal-outcomes|strategy-lab' || true
 
