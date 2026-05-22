@@ -29,6 +29,10 @@ systemctl list-timers --no-pager 2>&1 | grep -E 'market-observer|signal-outcomes
 section "godmode processes"
 pgrep -af 'godmode.py' || true
 
+section "legacy user godmode"
+systemctl --user is-enabled godmode.service 2>/dev/null || true
+systemctl --user is-active godmode.service 2>/dev/null || true
+
 run "failed units" systemctl --failed --no-pager
 run "memory" free -h
 run "disk" df -h / /home

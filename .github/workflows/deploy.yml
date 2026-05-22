@@ -30,12 +30,13 @@ jobs:
             sudo systemctl enable scheduled-reports.service
             sudo systemctl enable market-observer.timer
             sudo systemctl enable signal-outcomes.timer
-            sudo systemctl enable strategy-lab-run.timer
+            systemctl --user disable --now godmode.service || true
+            sudo systemctl disable --now strategy-lab-run.timer || true
+            sudo systemctl reset-failed strategy-lab-run.service || true
             sudo systemctl disable sniper.service paper-sniper.service strategy-lab.service dashboard.service signal-outcomes.service || true
             sudo systemctl stop sniper.service paper-sniper.service strategy-lab.service dashboard.service signal-outcomes.service || true
             sudo systemctl restart godmode.service
             sudo systemctl restart scheduled-reports.service
             sudo systemctl restart market-observer.timer
             sudo systemctl restart signal-outcomes.timer
-            sudo systemctl restart strategy-lab-run.timer
             echo "Deploy complete"
