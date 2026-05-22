@@ -77,12 +77,22 @@ def fetch_rows(cur: sqlite3.Cursor, sql: str, params: tuple = ()) -> list[sqlite
     return list(cur.execute(sql, params))
 
 
+def table_exists(cur: sqlite3.Cursor, name: str) -> bool:
+    row = cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
 def build_report(min_sample: int = MIN_SAMPLE) -> str:
     if not Path(SIGNALS_DB).exists():
         return f"Audit DB not found: {SIGNALS_DB}"
 
     with connect() as conn:
         cur = conn.cursor()
+        if not table_exists(cur, "signals") or not table_exists(cur, "signal_outcomes"):
+            return f"Audit DB exists but is missing required tables: {SIGNALS_DB}"
         signal_count = scalar(cur, "SELECT COUNT(1) FROM signals", 0)
         outcome_count = scalar(cur, "SELECT COUNT(1) FROM signal_outcomes", 0)
         signal_range = cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM signals").fetchone()
