@@ -432,15 +432,17 @@ def init_db() -> None:
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS observations (
-        timestamp TEXT NOT NULL,
+        timestamp_utc TEXT NOT NULL,
         symbol TEXT NOT NULL,
-        price REAL,
-        rvol REAL,
-        flow_m REAL,
-        change_pct REAL,
-        signal_type TEXT,
         sector TEXT,
-        PRIMARY KEY (timestamp, symbol)
+        price REAL,
+        open_price REAL,
+        volume REAL,
+        avg_vol REAL,
+        rvol REAL,
+        change_pct REAL,
+        flow_m REAL,
+        signal_type TEXT
     )
     """)
 
@@ -456,7 +458,7 @@ def init_db() -> None:
 
     c.execute("CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_timestamp ON signals(symbol, timestamp)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_observations_symbol_timestamp ON observations(symbol, timestamp)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_obs_symbol_ts ON observations(symbol, timestamp_utc)")
 
     # Add news_flag column if not present (safe on existing DBs)
     try:
@@ -524,12 +526,26 @@ def save_observation_to_db(symbol: str, sector: str, signal_type: str,
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("""
-            INSERT OR IGNORE INTO observations (
-                timestamp, symbol, price, rvol, flow_m, change_pct, signal_type, sector
-            ) VALUES (
-                datetime('now'), ?, ?, ?, ?, ?, ?, ?
+            INSERT INTO observations (
+                timestamp_utc, symbol, sector, price, rvol, change_pct, flow_m, signal_type
             )
-        """, (symbol, price, rvol, flow_m, float(change_pct), signal_type, sector))
+            SELECT datetime('now'), ?, ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM observations
+                WHERE symbol = ?
+                  AND timestamp_utc = datetime('now')
+            )
+        """, (
+            symbol,
+            sector,
+            price,
+            rvol,
+            float(change_pct),
+            flow_m,
+            signal_type,
+            symbol,
+        ))
         conn.commit()
     except Exception as e:
         log(f"{Fore.RED}DB Write Error (observations): {e}")
@@ -911,7 +927,7 @@ def run_god_mode_pro() -> None:
                         "DELETE FROM signals WHERE timestamp < datetime('now', '-30 days')"
                     ).rowcount
                     conn.execute(
-                        "DELETE FROM observations WHERE timestamp < datetime('now', '-30 days')"
+                        "DELETE FROM observations WHERE timestamp_utc < datetime('now', '-30 days')"
                     )
                     conn.commit()
                     conn.close()

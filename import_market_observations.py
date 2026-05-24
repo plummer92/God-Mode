@@ -26,21 +26,23 @@ def ensure_observations(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS observations (
-            timestamp TEXT NOT NULL,
+            timestamp_utc TEXT NOT NULL,
             symbol TEXT NOT NULL,
-            price REAL,
-            rvol REAL,
-            flow_m REAL,
-            change_pct REAL,
-            signal_type TEXT,
             sector TEXT,
-            PRIMARY KEY (timestamp, symbol)
+            price REAL,
+            open_price REAL,
+            volume REAL,
+            avg_vol REAL,
+            rvol REAL,
+            change_pct REAL,
+            flow_m REAL,
+            signal_type TEXT
         )
         """
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_observations_symbol_timestamp "
-        "ON observations(symbol, timestamp)"
+        "CREATE INDEX IF NOT EXISTS idx_obs_symbol_ts "
+        "ON observations(symbol, timestamp_utc)"
     )
 
 
@@ -60,9 +62,16 @@ def import_rows(path: Path, batch_size: int = 1000) -> int:
         before = conn.total_changes
         conn.executemany(
             """
-            INSERT OR IGNORE INTO observations (
-                timestamp, symbol, price, rvol, flow_m, change_pct, signal_type, sector
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO observations (
+                timestamp_utc, symbol, price, rvol, flow_m, change_pct, signal_type, sector
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM observations
+                WHERE timestamp_utc = ?
+                  AND symbol = ?
+            )
             """,
             batch,
         )
@@ -87,6 +96,8 @@ def import_rows(path: Path, batch_size: int = 1000) -> int:
                     to_float(row.get("Change_Pct")),
                     row.get("Signal"),
                     row.get("Sector"),
+                    timestamp,
+                    symbol,
                 )
             )
             if len(batch) >= batch_size:

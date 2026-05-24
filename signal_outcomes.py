@@ -240,10 +240,10 @@ def price_near_observations(symbol: str, target_ts: datetime, tolerance: timedel
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """
-                SELECT timestamp, price
+                SELECT timestamp_utc, price
                 FROM observations
                 WHERE symbol = ?
-                  AND timestamp BETWEEN ? AND ?
+                  AND timestamp_utc BETWEEN ? AND ?
                   AND price IS NOT NULL
                 """,
                 (symbol, start, end),
@@ -254,7 +254,7 @@ def price_near_observations(symbol: str, target_ts: datetime, tolerance: timedel
         return None
 
     def distance(row: sqlite3.Row) -> float:
-        parsed = parse_ts(row["timestamp"])
+        parsed = parse_ts(row["timestamp_utc"])
         if parsed is None:
             return float("inf")
         return abs((parsed - target_ts).total_seconds())
