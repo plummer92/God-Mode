@@ -20,6 +20,9 @@ except Exception:
 
 SIGNALS_DB = DATA_DIR / "wolfe_signals.db"
 MIN_SAMPLE = 50
+TRUST_MIN_WIN_RATE = 55.0
+TRUST_MIN_AVG_EDGE = 0.05
+AVOID_MAX_AVG_EDGE = -0.05
 
 
 def load_env() -> None:
@@ -64,6 +67,26 @@ def table(rows: list[sqlite3.Row], columns: list[tuple[str, str]], limit: int | 
             parts.append(f"{label}={value}")
         rendered.append("  " + " | ".join(parts))
     return rendered
+
+
+def data_quality_grade(no_data_rows: list[sqlite3.Row]) -> tuple[str, str]:
+    if not no_data_rows:
+        return "UNKNOWN", "no outcome quality rows yet"
+    no_data_pcts = [float(row["no_data_pct"] or 0.0) for row in no_data_rows]
+    avg_no_data = sum(no_data_pcts) / len(no_data_pcts)
+    intraday_no_data = [
+        float(row["no_data_pct"] or 0.0)
+        for row in no_data_rows
+        if row["horizon"] in {"5m", "15m", "30m", "1h"}
+    ]
+    max_intraday = max(intraday_no_data) if intraday_no_data else avg_no_data
+    if avg_no_data <= 20 and max_intraday <= 30:
+        return "A", f"avg no-data {avg_no_data:.1f}%"
+    if avg_no_data <= 35 and max_intraday <= 45:
+        return "B", f"avg no-data {avg_no_data:.1f}%"
+    if avg_no_data <= 50 and max_intraday <= 65:
+        return "C", f"avg no-data {avg_no_data:.1f}%; short horizons are noisy"
+    return "D", f"avg no-data {avg_no_data:.1f}%; treat rankings as directional, not final"
 
 
 def scalar(cur: sqlite3.Cursor, sql: str, default=None):
@@ -188,6 +211,75 @@ def build_report(min_sample: int = MIN_SAMPLE) -> str:
             """,
         )
 
+        session_rows = fetch_rows(
+            cur,
+            """
+            SELECT o.horizon, COALESCE(s.time_session, 'UNKNOWN') time_session,
+                   COUNT(1) n,
+                   ROUND(100.0 * AVG(CASE WHEN o.outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
+                   ROUND(AVG(o.return_pct), 4) avg_edge_pct
+            FROM signal_outcomes o
+            JOIN signals s ON s.rowid = o.signal_rowid
+            WHERE o.outcome IN ('WIN','LOSS')
+              AND o.return_pct IS NOT NULL
+              AND o.horizon IN ('15m','1h','1d')
+            GROUP BY o.horizon, COALESCE(s.time_session, 'UNKNOWN')
+            HAVING n >= ?
+            ORDER BY o.horizon, avg_edge_pct DESC
+            """,
+            (min_sample,),
+        )
+
+        recent_combo_rows = fetch_rows(
+            cur,
+            """
+            SELECT o.horizon, o.signal_type, o.direction, COUNT(1) n,
+                   ROUND(100.0 * AVG(CASE WHEN o.outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
+                   ROUND(AVG(o.return_pct), 4) avg_edge_pct
+            FROM signal_outcomes o
+            WHERE o.outcome IN ('WIN','LOSS')
+              AND o.return_pct IS NOT NULL
+              AND o.signal_ts >= datetime('now', '-7 days')
+            GROUP BY o.horizon, o.signal_type, o.direction
+            HAVING n >= ?
+            ORDER BY avg_edge_pct DESC
+            """,
+            (max(10, min_sample // 2),),
+        )
+
+        trusted_symbol_rows = fetch_rows(
+            cur,
+            """
+            SELECT symbol, direction, COUNT(1) n,
+                   ROUND(100.0 * AVG(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
+                   ROUND(AVG(return_pct), 4) avg_edge_pct
+            FROM signal_outcomes
+            WHERE horizon='1d' AND outcome IN ('WIN','LOSS') AND return_pct IS NOT NULL
+            GROUP BY symbol, direction
+            HAVING n >= ? AND win_rate >= ? AND avg_edge_pct >= ?
+            ORDER BY avg_edge_pct DESC
+            LIMIT 12
+            """,
+            (min_sample, TRUST_MIN_WIN_RATE, TRUST_MIN_AVG_EDGE),
+        )
+
+        avoid_symbol_rows = fetch_rows(
+            cur,
+            """
+            SELECT symbol, direction, COUNT(1) n,
+                   ROUND(100.0 * AVG(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
+                   ROUND(AVG(return_pct), 4) avg_edge_pct
+            FROM signal_outcomes
+            WHERE horizon='1d' AND outcome IN ('WIN','LOSS') AND return_pct IS NOT NULL
+            GROUP BY symbol, direction
+            HAVING n >= ? AND avg_edge_pct <= ?
+            ORDER BY avg_edge_pct ASC
+            LIMIT 12
+            """,
+            (min_sample, AVOID_MAX_AVG_EDGE),
+        )
+
+    grade, grade_reason = data_quality_grade(no_data_rows)
     lines = [
         "WOLFE MARKET AUDIT REPORT",
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -197,6 +289,7 @@ def build_report(min_sample: int = MIN_SAMPLE) -> str:
         f"  Labeled outcomes: {outcome_count:,}",
         f"  Signal window: {signal_range[0] if signal_range else 'N/A'} -> {signal_range[1] if signal_range else 'N/A'}",
         f"  Signals last 24h: {recent_24h:,}",
+        f"  Data quality grade: {grade} ({grade_reason})",
         "",
         "Overall Edge By Horizon",
     ]
@@ -219,6 +312,30 @@ def build_report(min_sample: int = MIN_SAMPLE) -> str:
             limit=10,
         )
     )
+
+    lines.extend(["", "Recent 7-Day Leaders"])
+    lines.extend(
+        table(
+            recent_combo_rows,
+            [("horizon", "h"), ("signal_type", "signal"), ("direction", "dir"), ("n", "n"), ("win_rate", "win%"), ("avg_edge_pct", "avg%")],
+            limit=8,
+        )
+    )
+
+    lines.extend(["", "Edge By Time Session"])
+    lines.extend(
+        table(
+            session_rows,
+            [("horizon", "h"), ("time_session", "session"), ("n", "n"), ("win_rate", "win%"), ("avg_edge_pct", "avg%")],
+            limit=12,
+        )
+    )
+
+    lines.extend(["", "Trusted 1-Day Symbol Buckets"])
+    lines.extend(table(trusted_symbol_rows, [("symbol", "sym"), ("direction", "dir"), ("n", "n"), ("win_rate", "win%"), ("avg_edge_pct", "avg%")]))
+
+    lines.extend(["", "Avoid 1-Day Symbol Buckets"])
+    lines.extend(table(avoid_symbol_rows, [("symbol", "sym"), ("direction", "dir"), ("n", "n"), ("win_rate", "win%"), ("avg_edge_pct", "avg%")]))
 
     lines.extend(["", "Best 1-Day Symbol Tendencies"])
     lines.extend(table(symbol_best_rows, [("symbol", "sym"), ("direction", "dir"), ("n", "n"), ("win_rate", "win%"), ("avg_edge_pct", "avg%")]))
