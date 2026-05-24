@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import sqlite3
 from pathlib import Path
 
@@ -13,6 +14,16 @@ from app_paths import DATA_DIR
 
 DB_PATH = DATA_DIR / "wolfe_signals.db"
 DEFAULT_MARKET_LOG = DATA_DIR / "market_log.csv"
+MARKET_HEADER = [
+    "Timestamp",
+    "Sector",
+    "Ticker",
+    "Price",
+    "Change_Pct",
+    "RVOL",
+    "Money_Flow_M",
+    "Signal",
+]
 
 
 def to_float(value):
@@ -80,8 +91,17 @@ def import_rows(path: Path, batch_size: int = 1000) -> int:
         batch.clear()
 
     with path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
+        reader = csv.reader(handle)
+        first_row = next(reader, None)
+        if first_row is None:
+            conn.close()
+            return total
+        has_header = first_row == MARKET_HEADER
+        rows = reader if has_header else itertools.chain([first_row], reader)
+        for raw_row in rows:
+            if len(raw_row) < len(MARKET_HEADER):
+                continue
+            row = dict(zip(MARKET_HEADER, raw_row))
             timestamp = (row.get("Timestamp") or "").strip()
             symbol = (row.get("Ticker") or "").strip().upper()
             if not timestamp or not symbol:
