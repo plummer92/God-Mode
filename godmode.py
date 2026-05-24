@@ -410,6 +410,7 @@ def init_db() -> None:
     """
     Creates/opens SQLite DB and ensures required tables exist:
       - signals
+      - observations
       - macro_features
     """
     conn = sqlite3.connect(DB_PATH)
@@ -430,6 +431,20 @@ def init_db() -> None:
     """)
 
     c.execute("""
+    CREATE TABLE IF NOT EXISTS observations (
+        timestamp TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        price REAL,
+        rvol REAL,
+        flow_m REAL,
+        change_pct REAL,
+        signal_type TEXT,
+        sector TEXT,
+        PRIMARY KEY (timestamp, symbol)
+    )
+    """)
+
+    c.execute("""
     CREATE TABLE IF NOT EXISTS macro_features (
         timestamp TEXT,
         vix REAL,
@@ -441,6 +456,7 @@ def init_db() -> None:
 
     c.execute("CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_timestamp ON signals(symbol, timestamp)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_observations_symbol_timestamp ON observations(symbol, timestamp)")
 
     # Add news_flag column if not present (safe on existing DBs)
     try:
@@ -496,6 +512,27 @@ def save_signal_to_db(symbol: str, sector: str, signal_type: str,
         conn.commit()
     except Exception as e:
         log(f"{Fore.RED}DB Write Error (signals): {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def save_observation_to_db(symbol: str, sector: str, signal_type: str,
+                           price: float, change_pct: float, rvol: float, flow_m: float) -> None:
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            INSERT OR IGNORE INTO observations (
+                timestamp, symbol, price, rvol, flow_m, change_pct, signal_type, sector
+            ) VALUES (
+                datetime('now'), ?, ?, ?, ?, ?, ?, ?
+            )
+        """, (symbol, price, rvol, flow_m, float(change_pct), signal_type, sector))
+        conn.commit()
+    except Exception as e:
+        log(f"{Fore.RED}DB Write Error (observations): {e}")
     finally:
         if conn:
             conn.close()
@@ -873,6 +910,9 @@ def run_god_mode_pro() -> None:
                     deleted = conn.execute(
                         "DELETE FROM signals WHERE timestamp < datetime('now', '-30 days')"
                     ).rowcount
+                    conn.execute(
+                        "DELETE FROM observations WHERE timestamp < datetime('now', '-30 days')"
+                    )
                     conn.commit()
                     conn.close()
                     if deleted:
@@ -977,6 +1017,15 @@ def run_god_mode_pro() -> None:
                             "Money_Flow_M": round(flow_m, 2),
                             "Signal": signal_lbl
                         })
+                        save_observation_to_db(
+                            symbol=symbol,
+                            sector=sector,
+                            signal_type=signal_lbl,
+                            price=price,
+                            change_pct=change_pct,
+                            rvol=rvol,
+                            flow_m=flow_m,
+                        )
 
                         # DB + alert only non-neutral
                         if "Neutral" not in signal_lbl:

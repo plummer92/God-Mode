@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Backfill the observations table from market_log.csv."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import sqlite3
+from pathlib import Path
+
+from app_paths import DATA_DIR
+
+
+DB_PATH = DATA_DIR / "wolfe_signals.db"
+DEFAULT_MARKET_LOG = DATA_DIR / "market_log.csv"
+
+
+def to_float(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def ensure_observations(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS observations (
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            price REAL,
+            rvol REAL,
+            flow_m REAL,
+            change_pct REAL,
+            signal_type TEXT,
+            sector TEXT,
+            PRIMARY KEY (timestamp, symbol)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_observations_symbol_timestamp "
+        "ON observations(symbol, timestamp)"
+    )
+
+
+def import_rows(path: Path, batch_size: int = 1000) -> int:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    conn = sqlite3.connect(DB_PATH, timeout=45)
+    conn.execute("PRAGMA busy_timeout=45000")
+    ensure_observations(conn)
+    total = 0
+    batch = []
+
+    def flush_batch() -> None:
+        nonlocal total, batch
+        if not batch:
+            return
+        before = conn.total_changes
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO observations (
+                timestamp, symbol, price, rvol, flow_m, change_pct, signal_type, sector
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            batch,
+        )
+        total += conn.total_changes - before
+        conn.commit()
+        batch.clear()
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            timestamp = (row.get("Timestamp") or "").strip()
+            symbol = (row.get("Ticker") or "").strip().upper()
+            if not timestamp or not symbol:
+                continue
+            batch.append(
+                (
+                    timestamp,
+                    symbol,
+                    to_float(row.get("Price")),
+                    to_float(row.get("RVOL")),
+                    to_float(row.get("Money_Flow_M")),
+                    to_float(row.get("Change_Pct")),
+                    row.get("Signal"),
+                    row.get("Sector"),
+                )
+            )
+            if len(batch) >= batch_size:
+                flush_batch()
+    flush_batch()
+    conn.close()
+    return total
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--path", type=Path, default=DEFAULT_MARKET_LOG)
+    args = parser.parse_args()
+    saved = import_rows(args.path)
+    print(f"observations_imported={saved}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

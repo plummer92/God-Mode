@@ -148,10 +148,26 @@ def yfinance_symbol(symbol: str) -> str:
     return str(symbol).strip().upper().replace("/", "-")
 
 
-def load_due_signals(horizon: str, delta: timedelta, batch_size: int) -> list[sqlite3.Row]:
+def load_due_signals(horizon: str, delta: timedelta, batch_size: int, relabel_no_data: bool = False) -> list[sqlite3.Row]:
     cutoff = datetime.now(timezone.utc) - delta
     with connect_db() as conn:
         conn.row_factory = sqlite3.Row
+        if relabel_no_data:
+            return conn.execute(
+                """
+                SELECT signals.rowid AS signal_rowid, signals.timestamp, signals.symbol,
+                       signals.signal_type, signals.price, signals.flow_m
+                FROM signals
+                JOIN signal_outcomes o
+                  ON o.signal_rowid = signals.rowid
+                 AND o.horizon = ?
+                WHERE signals.timestamp <= ?
+                  AND o.outcome = 'NO_DATA'
+                ORDER BY signals.timestamp ASC
+                LIMIT ?
+                """,
+                (horizon, cutoff.strftime("%Y-%m-%d %H:%M:%S"), batch_size),
+            ).fetchall()
         return conn.execute(
             """
             SELECT rowid AS signal_rowid, timestamp, symbol, signal_type, price, flow_m
@@ -216,6 +232,40 @@ def price_near(frame: pd.DataFrame, target_ts: datetime, tolerance: timedelta) -
         return None
 
 
+def price_near_observations(symbol: str, target_ts: datetime, tolerance: timedelta) -> float | None:
+    start = (target_ts - tolerance).strftime("%Y-%m-%d %H:%M:%S")
+    end = (target_ts + tolerance).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with connect_db() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT timestamp, price
+                FROM observations
+                WHERE symbol = ?
+                  AND timestamp BETWEEN ? AND ?
+                  AND price IS NOT NULL
+                """,
+                (symbol, start, end),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    if not rows:
+        return None
+
+    def distance(row: sqlite3.Row) -> float:
+        parsed = parse_ts(row["timestamp"])
+        if parsed is None:
+            return float("inf")
+        return abs((parsed - target_ts).total_seconds())
+
+    closest = min(rows, key=distance)
+    try:
+        return float(closest["price"])
+    except Exception:
+        return None
+
+
 def classify_return(return_pct: float | None) -> str:
     if return_pct is None:
         return "NO_DATA"
@@ -247,12 +297,17 @@ def build_outcome_rows(
             continue
         start = min(ts for _, ts in parsed)
         end = max(ts + delta for _, ts in parsed)
-        prices = fetch_prices(symbol, start, end)
+        prices: pd.DataFrame | None = None
 
         for row, signal_dt in parsed:
             target_dt = signal_dt + delta
             signal_price = None if row["price"] is None else float(row["price"])
-            target_price = price_near(prices, target_dt, tolerance)
+            target_price = price_near_observations(symbol, target_dt, tolerance)
+            source = "observations" if target_price is not None else "yfinance_5m"
+            if target_price is None:
+                if prices is None:
+                    prices = fetch_prices(symbol, start, end)
+                target_price = price_near(prices, target_dt, tolerance)
             direction = direction_for(row["signal_type"], row["flow_m"])
             return_pct = None
             if signal_price and signal_price > 0 and target_price is not None:
@@ -275,7 +330,7 @@ def build_outcome_rows(
                     return_pct,
                     classify_return(return_pct),
                     now_text,
-                    "yfinance_5m",
+                    source,
                 )
             )
     return outcome_rows
@@ -289,7 +344,7 @@ def save_outcomes(rows: list[tuple]) -> int:
             with connect_db() as conn:
                 conn.executemany(
                     """
-                    INSERT OR IGNORE INTO signal_outcomes (
+                    INSERT OR REPLACE INTO signal_outcomes (
                         signal_rowid, horizon, symbol, signal_ts, target_ts, signal_type,
                         direction, signal_price, target_price, return_pct, outcome,
                         reviewed_at, source
@@ -307,11 +362,11 @@ def save_outcomes(rows: list[tuple]) -> int:
     return 0
 
 
-def run_once(batch_size: int) -> int:
+def run_once(batch_size: int, relabel_no_data: bool = False) -> int:
     init_db()
     total = 0
     for horizon, delta, tolerance in HORIZONS:
-        due = load_due_signals(horizon, delta, batch_size)
+        due = load_due_signals(horizon, delta, batch_size, relabel_no_data=relabel_no_data)
         outcome_rows = build_outcome_rows(due, horizon, delta, tolerance)
         saved = save_outcomes(outcome_rows)
         total += saved
@@ -324,12 +379,17 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="Run one backfill pass and exit")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--sleep-seconds", type=int, default=DEFAULT_SLEEP_SECONDS)
+    parser.add_argument(
+        "--relabel-no-data",
+        action="store_true",
+        help="Retry existing NO_DATA outcomes using all available price sources",
+    )
     args = parser.parse_args()
 
     acquire_lock()
     try:
         while True:
-            saved = run_once(max(1, args.batch_size))
+            saved = run_once(max(1, args.batch_size), relabel_no_data=args.relabel_no_data)
             if args.once:
                 break
             time.sleep(5 if saved else max(30, args.sleep_seconds))
