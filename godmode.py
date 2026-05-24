@@ -670,12 +670,15 @@ def _passes_signal_quality_gate(
     latest_bar_ts: Optional[datetime],
 ) -> tuple[bool, Optional[str]]:
     """Conservative post-classification gate to improve timing quality without changing schemas."""
-    if "Neutral" in signal_lbl or "ABSORPTION" in signal_lbl:
+    if "Neutral" in signal_lbl:
         return True, None
 
     bar_age = _bar_age_seconds(latest_bar_ts)
     if bar_age is not None and bar_age > SIGNAL_MAX_AGE_SECONDS:
         return False, f"STALE_BAR age={int(bar_age)}s>{SIGNAL_MAX_AGE_SECONDS}s"
+
+    if "ABSORPTION" in signal_lbl:
+        return True, None
 
     side = _signal_side(signal_lbl)
     base_rvol = get_rvol_threshold(symbol, vix)
@@ -1007,6 +1010,7 @@ def run_god_mode_pro() -> None:
                         open_p = float(opens.iloc[-1])
                         vol = float(volumes.iloc[-1])
                         latest_bar_ts = _latest_bar_timestamp(closes)
+                        latest_bar_age = _bar_age_seconds(latest_bar_ts)
 
                         avg_vol = float(volumes.iloc[-MIN_BARS:-1].mean())
                         rvol = (vol / avg_vol) if avg_vol > 0 else 1.0
@@ -1033,15 +1037,16 @@ def run_god_mode_pro() -> None:
                             "Money_Flow_M": round(flow_m, 2),
                             "Signal": signal_lbl
                         })
-                        save_observation_to_db(
-                            symbol=symbol,
-                            sector=sector,
-                            signal_type=signal_lbl,
-                            price=price,
-                            change_pct=change_pct,
-                            rvol=rvol,
-                            flow_m=flow_m,
-                        )
+                        if latest_bar_age is None or latest_bar_age <= SIGNAL_MAX_AGE_SECONDS:
+                            save_observation_to_db(
+                                symbol=symbol,
+                                sector=sector,
+                                signal_type=signal_lbl,
+                                price=price,
+                                change_pct=change_pct,
+                                rvol=rvol,
+                                flow_m=flow_m,
+                            )
 
                         # DB + alert only non-neutral
                         if "Neutral" not in signal_lbl:
