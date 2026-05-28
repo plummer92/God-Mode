@@ -9,6 +9,7 @@ import time
 
 from app_paths import DATA_DIR
 from audit_report import build_report as build_audit_report
+from backtest_signals import build_report as build_backtest_report
 from reporting import build_daily_report, build_morning_brief, now_et, post_to_discord
 
 
@@ -18,6 +19,12 @@ DISCORD_CHUNK_SIZE = 1800
 AUDIT_REPORT_TIME = os.getenv("AUDIT_REPORT_TIME_ET", "16:10")
 AUDIT_REPORT_MIN_SAMPLE = int(os.getenv("AUDIT_REPORT_MIN_SAMPLE", "50"))
 AUDIT_REPORT_ENABLED = os.getenv("AUDIT_REPORT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+BACKTEST_REPORT_TIME = os.getenv("BACKTEST_REPORT_TIME_ET", "16:20")
+BACKTEST_REPORT_ENABLED = os.getenv("BACKTEST_REPORT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+BACKTEST_REPORT_SINCE = os.getenv("BACKTEST_REPORT_SINCE", "2026-05-24 14:52:00")
+BACKTEST_REPORT_MIN_SAMPLE = int(os.getenv("BACKTEST_REPORT_MIN_SAMPLE", "10"))
+BACKTEST_SLIPPAGE_BPS = float(os.getenv("BACKTEST_SLIPPAGE_BPS", "2"))
+BACKTEST_SPREAD_BPS = float(os.getenv("BACKTEST_SPREAD_BPS", "3"))
 
 
 def _load_state() -> dict[str, str]:
@@ -90,6 +97,17 @@ def run_forever() -> None:
                 "audit_report",
                 trade_date,
                 lambda: build_audit_report(AUDIT_REPORT_MIN_SAMPLE),
+            )
+        elif BACKTEST_REPORT_ENABLED and hour_minute == BACKTEST_REPORT_TIME:
+            _maybe_send(
+                "backtest_report",
+                trade_date,
+                lambda: build_backtest_report(
+                    since=BACKTEST_REPORT_SINCE,
+                    min_sample=BACKTEST_REPORT_MIN_SAMPLE,
+                    slippage_bps=BACKTEST_SLIPPAGE_BPS,
+                    spread_bps=BACKTEST_SPREAD_BPS,
+                ),
             )
         time.sleep(SLEEP_SECONDS)
 

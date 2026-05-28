@@ -38,6 +38,14 @@ def fetch_rows(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[s
     return list(conn.execute(sql, params))
 
 
+def table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
 def render_rows(rows: list[sqlite3.Row], columns: list[tuple[str, str]], limit: int | None = None) -> list[str]:
     if limit is not None:
         rows = rows[:limit]
@@ -68,6 +76,8 @@ def build_report(
     cost = cost_pct(slippage_bps, spread_bps)
     net = net_expr(cost)
     with connect() as conn:
+        if not table_exists(conn, "signals") or not table_exists(conn, "signal_outcomes"):
+            return f"Backtest DB exists but is missing required tables: {DB_PATH}"
         signal_count = conn.execute(
             "SELECT COUNT(1) FROM signals WHERE timestamp >= ?",
             (since,),
