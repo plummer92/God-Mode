@@ -13,7 +13,34 @@ from typing import Iterable
 
 import pandas as pd
 
-from app_paths import DATA_DIR
+from app_paths import DATA_DIR, ENV_FILE, REPO_DIR
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
+
+
+def load_env_files() -> None:
+    env_files = [ENV_FILE, REPO_DIR / ".env"]
+    if load_dotenv is not None:
+        for env_file in env_files:
+            if env_file.exists():
+                load_dotenv(env_file, override=False)
+        return
+    for env_file in env_files:
+        if not env_file.exists():
+            continue
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            text = line.strip()
+            if not text or text.startswith("#") or "=" not in text:
+                continue
+            key, value = text.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+load_env_files()
+
 from market_data_sources import fetch_price_bars, provider_order
 
 
