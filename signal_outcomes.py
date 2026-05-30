@@ -12,9 +12,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 import pandas as pd
-import yfinance as yf
 
 from app_paths import DATA_DIR
+from market_data_sources import fetch_price_bars, provider_order
 
 
 DB_PATH = str(DATA_DIR / "wolfe_signals.db")
@@ -144,10 +144,6 @@ def direction_for(signal_type: str | None, flow_m: float | None) -> str:
         return "LONG"
 
 
-def yfinance_symbol(symbol: str) -> str:
-    return str(symbol).strip().upper().replace("/", "-")
-
-
 def load_due_signals(horizon: str, delta: timedelta, batch_size: int, relabel_no_data: bool = False) -> list[sqlite3.Row]:
     cutoff = datetime.now(timezone.utc) - delta
     with connect_db() as conn:
@@ -184,33 +180,6 @@ def load_due_signals(horizon: str, delta: timedelta, batch_size: int, relabel_no
             """,
             (cutoff.strftime("%Y-%m-%d %H:%M:%S"), horizon, batch_size),
         ).fetchall()
-
-
-def fetch_prices(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
-    try:
-        frame = yf.download(
-            yfinance_symbol(symbol),
-            start=start - timedelta(days=1),
-            end=end + timedelta(days=1),
-            interval="5m",
-            progress=False,
-            auto_adjust=False,
-            prepost=True,
-            threads=False,
-        )
-    except Exception:
-        return pd.DataFrame()
-    if frame.empty:
-        return pd.DataFrame()
-    if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = frame.columns.get_level_values(0)
-    if "Close" not in frame.columns:
-        return pd.DataFrame()
-    if frame.index.tz is None:
-        frame.index = frame.index.tz_localize("UTC")
-    else:
-        frame.index = frame.index.tz_convert("UTC")
-    return frame.sort_index()
 
 
 def price_near(frame: pd.DataFrame, target_ts: datetime, tolerance: timedelta) -> float | None:
@@ -298,16 +267,19 @@ def build_outcome_rows(
         start = min(ts for _, ts in parsed)
         end = max(ts + delta for _, ts in parsed)
         prices: pd.DataFrame | None = None
+        price_source = "no_provider_data"
+        providers = provider_order()
 
         for row, signal_dt in parsed:
             target_dt = signal_dt + delta
             signal_price = None if row["price"] is None else float(row["price"])
             target_price = price_near_observations(symbol, target_dt, tolerance)
-            source = "observations" if target_price is not None else "yfinance_5m"
+            source = "observations" if target_price is not None else "market_data_5m"
             if target_price is None:
                 if prices is None:
-                    prices = fetch_prices(symbol, start, end)
+                    prices, price_source = fetch_price_bars(symbol, start, end, minutes=5, providers=providers)
                 target_price = price_near(prices, target_dt, tolerance)
+                source = price_source
             direction = direction_for(row["signal_type"], row["flow_m"])
             return_pct = None
             if signal_price and signal_price > 0 and target_price is not None:
