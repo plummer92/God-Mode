@@ -19,6 +19,7 @@ except Exception:
 
 
 SIGNALS_DB = DATA_DIR / "wolfe_signals.db"
+DEFAULT_SINCE = "2026-05-24 14:52:00"
 MIN_SAMPLE = 50
 TRUST_MIN_WIN_RATE = 55.0
 TRUST_MIN_AVG_EDGE = 0.05
@@ -89,8 +90,8 @@ def data_quality_grade(no_data_rows: list[sqlite3.Row]) -> tuple[str, str]:
     return "D", f"avg no-data {avg_no_data:.1f}%; treat rankings as directional, not final"
 
 
-def scalar(cur: sqlite3.Cursor, sql: str, default=None):
-    row = cur.execute(sql).fetchone()
+def scalar(cur: sqlite3.Cursor, sql: str, default=None, params: tuple = ()):
+    row = cur.execute(sql, params).fetchone()
     if row is None:
         return default
     return row[0]
@@ -108,112 +109,129 @@ def table_exists(cur: sqlite3.Cursor, name: str) -> bool:
     return row is not None
 
 
-def build_report(min_sample: int = MIN_SAMPLE) -> str:
+def build_report(min_sample: int = MIN_SAMPLE, since: str | None = None) -> str:
     if not Path(SIGNALS_DB).exists():
         return f"Audit DB not found: {SIGNALS_DB}"
+
+    signal_filter = "WHERE timestamp >= ?" if since else ""
+    outcome_since = "AND signal_ts >= ?" if since else ""
+    outcome_where_since = "WHERE signal_ts >= ?" if since else ""
+    signal_params = (since,) if since else ()
+    outcome_params = (since,) if since else ()
 
     with connect() as conn:
         cur = conn.cursor()
         if not table_exists(cur, "signals") or not table_exists(cur, "signal_outcomes"):
             return f"Audit DB exists but is missing required tables: {SIGNALS_DB}"
-        signal_count = scalar(cur, "SELECT COUNT(1) FROM signals", 0)
-        outcome_count = scalar(cur, "SELECT COUNT(1) FROM signal_outcomes", 0)
-        signal_range = cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM signals").fetchone()
+        signal_count = scalar(cur, f"SELECT COUNT(1) FROM signals {signal_filter}", 0, signal_params)
+        outcome_count = scalar(cur, f"SELECT COUNT(1) FROM signal_outcomes {outcome_where_since}", 0, outcome_params)
+        signal_range = cur.execute(
+            f"SELECT MIN(timestamp), MAX(timestamp) FROM signals {signal_filter}",
+            signal_params,
+        ).fetchone()
         recent_24h = scalar(cur, "SELECT COUNT(1) FROM signals WHERE timestamp >= datetime('now','-1 day')", 0)
 
         horizon_rows = fetch_rows(
             cur,
-            """
+            f"""
             SELECT horizon, COUNT(1) n,
                    ROUND(100.0 * AVG(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
                    ROUND(AVG(return_pct), 4) avg_edge_pct
             FROM signal_outcomes
             WHERE outcome IN ('WIN','LOSS') AND return_pct IS NOT NULL
+              {outcome_since}
             GROUP BY horizon
             ORDER BY CASE horizon
                 WHEN '5m' THEN 1 WHEN '15m' THEN 2 WHEN '30m' THEN 3
                 WHEN '1h' THEN 4 WHEN '1d' THEN 5 ELSE 9 END
             """,
+            outcome_params,
         )
 
         signal_combo_rows = fetch_rows(
             cur,
-            """
+            f"""
             SELECT horizon, signal_type, direction, COUNT(1) n,
                    ROUND(100.0 * AVG(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
                    ROUND(AVG(return_pct), 4) avg_edge_pct
             FROM signal_outcomes
             WHERE outcome IN ('WIN','LOSS') AND return_pct IS NOT NULL
+              {outcome_since}
             GROUP BY horizon, signal_type, direction
             HAVING n >= ?
             ORDER BY avg_edge_pct DESC
             """,
-            (min_sample,),
+            (*outcome_params, min_sample),
         )
 
         worst_combo_rows = fetch_rows(
             cur,
-            """
+            f"""
             SELECT horizon, signal_type, direction, COUNT(1) n,
                    ROUND(100.0 * AVG(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
                    ROUND(AVG(return_pct), 4) avg_edge_pct
             FROM signal_outcomes
             WHERE outcome IN ('WIN','LOSS') AND return_pct IS NOT NULL
+              {outcome_since}
             GROUP BY horizon, signal_type, direction
             HAVING n >= ?
             ORDER BY avg_edge_pct ASC
             """,
-            (min_sample,),
+            (*outcome_params, min_sample),
         )
 
         symbol_best_rows = fetch_rows(
             cur,
-            """
+            f"""
             SELECT symbol, direction, COUNT(1) n,
                    ROUND(100.0 * AVG(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
                    ROUND(AVG(return_pct), 4) avg_edge_pct
             FROM signal_outcomes
             WHERE horizon='1d' AND outcome IN ('WIN','LOSS') AND return_pct IS NOT NULL
+              {outcome_since}
             GROUP BY symbol, direction
             HAVING n >= ?
             ORDER BY avg_edge_pct DESC
             LIMIT 10
             """,
-            (min_sample,),
+            (*outcome_params, min_sample),
         )
 
         symbol_worst_rows = fetch_rows(
             cur,
-            """
+            f"""
             SELECT symbol, direction, COUNT(1) n,
                    ROUND(100.0 * AVG(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
                    ROUND(AVG(return_pct), 4) avg_edge_pct
             FROM signal_outcomes
             WHERE horizon='1d' AND outcome IN ('WIN','LOSS') AND return_pct IS NOT NULL
+              {outcome_since}
             GROUP BY symbol, direction
             HAVING n >= ?
             ORDER BY avg_edge_pct ASC
             LIMIT 10
             """,
-            (min_sample,),
+            (*outcome_params, min_sample),
         )
 
         no_data_rows = fetch_rows(
             cur,
-            """
+            f"""
             SELECT horizon,
                    COUNT(1) total,
                    SUM(CASE WHEN outcome='NO_DATA' THEN 1 ELSE 0 END) no_data,
                    ROUND(100.0 * SUM(CASE WHEN outcome='NO_DATA' THEN 1 ELSE 0 END) / COUNT(1), 1) no_data_pct
             FROM signal_outcomes
+            {outcome_where_since}
             GROUP BY horizon
             ORDER BY horizon
             """,
+            outcome_params,
         )
 
         session_rows = fetch_rows(
             cur,
-            """
+            f"""
             SELECT o.horizon, COALESCE(s.time_session, 'UNKNOWN') time_session,
                    COUNT(1) n,
                    ROUND(100.0 * AVG(CASE WHEN o.outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
@@ -223,16 +241,17 @@ def build_report(min_sample: int = MIN_SAMPLE) -> str:
             WHERE o.outcome IN ('WIN','LOSS')
               AND o.return_pct IS NOT NULL
               AND o.horizon IN ('15m','1h','1d')
+              {"AND o.signal_ts >= ?" if since else ""}
             GROUP BY o.horizon, COALESCE(s.time_session, 'UNKNOWN')
             HAVING n >= ?
             ORDER BY o.horizon, avg_edge_pct DESC
             """,
-            (min_sample,),
+            (*outcome_params, min_sample),
         )
 
         recent_combo_rows = fetch_rows(
             cur,
-            """
+            f"""
             SELECT o.horizon, o.signal_type, o.direction, COUNT(1) n,
                    ROUND(100.0 * AVG(CASE WHEN o.outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
                    ROUND(AVG(o.return_pct), 4) avg_edge_pct
@@ -240,43 +259,46 @@ def build_report(min_sample: int = MIN_SAMPLE) -> str:
             WHERE o.outcome IN ('WIN','LOSS')
               AND o.return_pct IS NOT NULL
               AND o.signal_ts >= datetime('now', '-7 days')
+              {"AND o.signal_ts >= ?" if since else ""}
             GROUP BY o.horizon, o.signal_type, o.direction
             HAVING n >= ?
             ORDER BY avg_edge_pct DESC
             """,
-            (max(10, min_sample // 2),),
+            (*outcome_params, max(10, min_sample // 2)),
         )
 
         trusted_symbol_rows = fetch_rows(
             cur,
-            """
+            f"""
             SELECT symbol, direction, COUNT(1) n,
                    ROUND(100.0 * AVG(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
                    ROUND(AVG(return_pct), 4) avg_edge_pct
             FROM signal_outcomes
             WHERE horizon='1d' AND outcome IN ('WIN','LOSS') AND return_pct IS NOT NULL
+              {outcome_since}
             GROUP BY symbol, direction
             HAVING n >= ? AND win_rate >= ? AND avg_edge_pct >= ?
             ORDER BY avg_edge_pct DESC
             LIMIT 12
             """,
-            (min_sample, TRUST_MIN_WIN_RATE, TRUST_MIN_AVG_EDGE),
+            (*outcome_params, min_sample, TRUST_MIN_WIN_RATE, TRUST_MIN_AVG_EDGE),
         )
 
         avoid_symbol_rows = fetch_rows(
             cur,
-            """
+            f"""
             SELECT symbol, direction, COUNT(1) n,
                    ROUND(100.0 * AVG(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
                    ROUND(AVG(return_pct), 4) avg_edge_pct
             FROM signal_outcomes
             WHERE horizon='1d' AND outcome IN ('WIN','LOSS') AND return_pct IS NOT NULL
+              {outcome_since}
             GROUP BY symbol, direction
             HAVING n >= ? AND avg_edge_pct <= ?
             ORDER BY avg_edge_pct ASC
             LIMIT 12
             """,
-            (min_sample, AVOID_MAX_AVG_EDGE),
+            (*outcome_params, min_sample, AVOID_MAX_AVG_EDGE),
         )
 
     grade, grade_reason = data_quality_grade(no_data_rows)
@@ -285,6 +307,7 @@ def build_report(min_sample: int = MIN_SAMPLE) -> str:
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
         "Dataset",
+        f"  Scope: {'post-fix signals since ' + since if since else 'full retained database'}",
         f"  Signals retained: {signal_count:,}",
         f"  Labeled outcomes: {outcome_count:,}",
         f"  Signal window: {signal_range[0] if signal_range else 'N/A'} -> {signal_range[1] if signal_range else 'N/A'}",
@@ -371,6 +394,7 @@ def post_to_discord(message: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--min-sample", type=int, default=MIN_SAMPLE)
+    parser.add_argument("--since", default=None, help="Only include signals/outcomes on or after this UTC timestamp")
     parser.add_argument("--discord", action="store_true", help="Post report to Discord")
     args = parser.parse_args()
 
@@ -380,7 +404,7 @@ def main() -> int:
     except Exception:
         pass
 
-    report = build_report(max(1, args.min_sample))
+    report = build_report(max(1, args.min_sample), since=args.since)
     print(report)
     if args.discord:
         post_to_discord(report)

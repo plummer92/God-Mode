@@ -8,6 +8,7 @@ import os
 import time
 
 from app_paths import DATA_DIR
+from audit_report import DEFAULT_SINCE as DEFAULT_AUDIT_SINCE
 from audit_report import build_report as build_audit_report
 from backtest_signals import build_report as build_backtest_report
 from reporting import build_daily_report, build_morning_brief, now_et, post_to_discord
@@ -19,6 +20,7 @@ DISCORD_CHUNK_SIZE = 1800
 AUDIT_REPORT_TIME = os.getenv("AUDIT_REPORT_TIME_ET", "16:10")
 AUDIT_REPORT_MIN_SAMPLE = int(os.getenv("AUDIT_REPORT_MIN_SAMPLE", "50"))
 AUDIT_REPORT_ENABLED = os.getenv("AUDIT_REPORT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+AUDIT_REPORT_SINCE = os.getenv("AUDIT_REPORT_SINCE", DEFAULT_AUDIT_SINCE).strip() or None
 BACKTEST_REPORT_TIME = os.getenv("BACKTEST_REPORT_TIME_ET", "16:20")
 BACKTEST_REPORT_ENABLED = os.getenv("BACKTEST_REPORT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 BACKTEST_REPORT_SINCE = os.getenv("BACKTEST_REPORT_SINCE", "2026-05-24 14:52:00")
@@ -96,7 +98,7 @@ def run_forever() -> None:
             _maybe_send(
                 "audit_report",
                 trade_date,
-                lambda: build_audit_report(AUDIT_REPORT_MIN_SAMPLE),
+                lambda: build_audit_report(AUDIT_REPORT_MIN_SAMPLE, since=AUDIT_REPORT_SINCE),
             )
         elif BACKTEST_REPORT_ENABLED and hour_minute == BACKTEST_REPORT_TIME:
             _maybe_send(
