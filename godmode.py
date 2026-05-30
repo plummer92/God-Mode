@@ -42,6 +42,7 @@ _REPO_DIR = str(REPO_DIR)
 if _REPO_DIR not in __import__("sys").path:
     __import__("sys").path.insert(0, _REPO_DIR)
 from alpaca_data import get_stock_minute_bars
+from earnings_context import get_earnings_context
 
 # ---------------- INIT ----------------
 init(autoreset=True)
@@ -482,6 +483,19 @@ def init_db() -> None:
     except Exception:
         pass  # column already exists
 
+    # Earnings enrichment columns for signal research
+    for column_name, column_type in (
+        ("next_earnings_date", "TEXT"),
+        ("days_to_earnings", "INTEGER"),
+        ("earnings_window", "TEXT DEFAULT 'UNKNOWN'"),
+        ("earnings_source", "TEXT"),
+    ):
+        try:
+            c.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+
     conn.commit()
     conn.close()
     log(f"{Fore.GREEN}✅ DB ready: {DB_PATH}")
@@ -489,7 +503,7 @@ def init_db() -> None:
 def save_signal_to_db(symbol: str, sector: str, signal_type: str,
                       price: float, change_pct: float, rvol: float, flow_m: float,
                       news_flag: str = "CLEAN", time_session: str = "UNKNOWN",
-                      catalyst_type: str = "CLEAN") -> None:
+                      catalyst_type: str = "CLEAN", earnings_context: Optional[dict] = None) -> None:
     confidence = 50
     if "ABSORPTION" in signal_type:
         confidence += 30
@@ -506,12 +520,17 @@ def save_signal_to_db(symbol: str, sector: str, signal_type: str,
         c.execute("""
             INSERT INTO signals (
                 timestamp, symbol, signal_type, price, rvol, flow_m,
-                confidence, sector, change_pct, news_flag, time_session, catalyst_type
+                confidence, sector, change_pct, news_flag, time_session, catalyst_type,
+                next_earnings_date, days_to_earnings, earnings_window, earnings_source
             ) VALUES (
-                datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
         """, (symbol, signal_type, price, rvol, flow_m, confidence, sector,
-              float(change_pct), news_flag, time_session, catalyst_type))
+              float(change_pct), news_flag, time_session, catalyst_type,
+              None if not earnings_context else earnings_context.get("next_earnings_date"),
+              None if not earnings_context else earnings_context.get("days_to_earnings"),
+              "UNKNOWN" if not earnings_context else earnings_context.get("earnings_window", "UNKNOWN"),
+              None if not earnings_context else earnings_context.get("earnings_source")))
         conn.commit()
     except Exception as e:
         log(f"{Fore.RED}DB Write Error (signals): {e}")
@@ -1082,6 +1101,7 @@ def run_god_mode_pro() -> None:
                                     log(f"QUALITY GATE: {signal_lbl} on {symbol} suppressed — {gate_reason}")
                                     continue
                                 session = get_time_session()
+                                earnings_ctx = get_earnings_context(symbol)
                                 save_signal_to_db(
                                     symbol=symbol,
                                     sector=sector,
@@ -1093,13 +1113,17 @@ def run_god_mode_pro() -> None:
                                     news_flag=news_flag,
                                     time_session=session,
                                     catalyst_type=catalyst_type,
+                                    earnings_context=earnings_ctx,
                                 )
 
                                 now_epoch = time.time()
                                 if (now_epoch - last_alert_ts.get(symbol, 0) > 1200) or ("CLIMAX" in signal_lbl):
                                     news_tag = "[NEWS]" if news_flag == "NEWS_DRIVEN" else "[CLEAN]"
                                     cat_tag = f"[{catalyst_type}]" if catalyst_type != "CLEAN" else ""
-                                    log(f"🚀 {signal_lbl}: {symbol} {news_tag}{cat_tag} | Flow: ${flow_m:+.1f}M | RVOL={rvol:.2f} | Δ={change_pct*100:.2f}%")
+                                    earnings_tag = ""
+                                    if earnings_ctx.get("earnings_window") in {"PRE_EARNINGS", "EARNINGS_TODAY"}:
+                                        earnings_tag = f"[{earnings_ctx.get('earnings_window')}]"
+                                    log(f"🚀 {signal_lbl}: {symbol} {news_tag}{cat_tag}{earnings_tag} | Flow: ${flow_m:+.1f}M | RVOL={rvol:.2f} | Δ={change_pct*100:.2f}%")
                                     post_discord(symbol, signal_lbl, rvol, flow_m, news_flag)
                                     last_alert_ts[symbol] = now_epoch
 

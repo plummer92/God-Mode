@@ -266,6 +266,26 @@ def build_report(min_sample: int = MIN_SAMPLE, since: str | None = None) -> str:
             (*outcome_params, min_sample),
         )
 
+        earnings_rows = fetch_rows(
+            cur,
+            f"""
+            SELECT o.horizon, COALESCE(s.earnings_window, 'UNKNOWN') earnings_window,
+                   COUNT(1) n,
+                   ROUND(100.0 * AVG(CASE WHEN o.outcome='WIN' THEN 1 ELSE 0 END), 1) win_rate,
+                   ROUND(AVG(o.return_pct), 4) avg_edge_pct
+            FROM signal_outcomes o
+            JOIN signals s ON s.rowid = o.signal_rowid
+            WHERE o.outcome IN ('WIN','LOSS')
+              AND o.return_pct IS NOT NULL
+              AND o.horizon IN ('15m','1h','1d')
+              {"AND o.signal_ts >= ?" if since else ""}
+            GROUP BY o.horizon, COALESCE(s.earnings_window, 'UNKNOWN')
+            HAVING n >= ?
+            ORDER BY o.horizon, avg_edge_pct DESC
+            """,
+            (*outcome_params, max(10, min_sample // 2)),
+        )
+
         recent_combo_rows = fetch_rows(
             cur,
             f"""
@@ -367,6 +387,15 @@ def build_report(min_sample: int = MIN_SAMPLE, since: str | None = None) -> str:
         table(
             session_rows,
             [("horizon", "h"), ("time_session", "session"), ("n", "n"), ("win_rate", "win%"), ("avg_edge_pct", "avg%")],
+            limit=12,
+        )
+    )
+
+    lines.extend(["", "Edge By Earnings Window"])
+    lines.extend(
+        table(
+            earnings_rows,
+            [("horizon", "h"), ("earnings_window", "earnings"), ("n", "n"), ("win_rate", "win%"), ("avg_edge_pct", "avg%")],
             limit=12,
         )
     )
