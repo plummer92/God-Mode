@@ -38,17 +38,18 @@ def ensure_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def enrich_signals(since: str, batch_size: int) -> int:
+def enrich_signals(since: str, batch_size: int, force: bool = False) -> int:
     conn = sqlite3.connect(DB_PATH, timeout=45)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=45000")
     ensure_columns(conn)
+    earnings_filter = "" if force else "AND COALESCE(earnings_window, 'UNKNOWN') = 'UNKNOWN'"
     rows = conn.execute(
-        """
+        f"""
         SELECT rowid, timestamp, symbol
         FROM signals
         WHERE timestamp >= ?
-          AND COALESCE(earnings_window, 'UNKNOWN') = 'UNKNOWN'
+          {earnings_filter}
         ORDER BY timestamp ASC
         LIMIT ?
         """,
@@ -84,8 +85,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--since", default=DEFAULT_SINCE)
     parser.add_argument("--batch-size", type=int, default=500)
+    parser.add_argument("--force", action="store_true", help="Refresh rows even if earnings_window is already set")
     args = parser.parse_args()
-    saved = enrich_signals(args.since, max(1, args.batch_size))
+    saved = enrich_signals(args.since, max(1, args.batch_size), force=args.force)
     print(f"signals_enriched={saved}")
     return 0
 

@@ -20,6 +20,14 @@ EARNINGS_CONTEXT_ENABLED = os.getenv("EARNINGS_CONTEXT_ENABLED", "1").strip().lo
 }
 EARNINGS_CACHE_TTL_SECONDS = int(os.getenv("EARNINGS_CACHE_TTL_SECONDS", "21600"))
 EARNINGS_NEAR_DAYS = int(os.getenv("EARNINGS_NEAR_DAYS", "7"))
+NO_EARNINGS_SYMBOLS = {
+    item.strip().upper()
+    for item in os.getenv(
+        "NO_EARNINGS_SYMBOLS",
+        "SPY,QQQ,IWM,DIA,XLK,XLF,XLE,XLV,XLI,XLY,XLP,XLU,XLC,XLRE,SOXS,SOXL,TQQQ,SQQQ",
+    ).split(",")
+    if item.strip()
+}
 
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
@@ -109,6 +117,13 @@ def _fetch_yfinance_next_earnings_date(symbol: str) -> date | None:
 
 def get_earnings_context(symbol: str, as_of: datetime | None = None) -> dict[str, Any]:
     symbol = str(symbol).strip().upper()
+    if symbol in NO_EARNINGS_SYMBOLS:
+        return {
+            "next_earnings_date": None,
+            "days_to_earnings": None,
+            "earnings_window": "NO_EARNINGS",
+            "earnings_source": "symbol_exclusion",
+        }
     if not EARNINGS_CONTEXT_ENABLED or not is_stock_symbol(symbol):
         return {
             "next_earnings_date": None,

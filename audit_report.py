@@ -286,6 +286,21 @@ def build_report(min_sample: int = MIN_SAMPLE, since: str | None = None) -> str:
             (*outcome_params, max(10, min_sample // 2)),
         )
 
+        earnings_source_rows = fetch_rows(
+            cur,
+            f"""
+            SELECT COALESCE(earnings_source, 'UNKNOWN') earnings_source,
+                   COALESCE(earnings_window, 'UNKNOWN') earnings_window,
+                   COUNT(1) n
+            FROM signals
+            {signal_filter}
+            GROUP BY COALESCE(earnings_source, 'UNKNOWN'), COALESCE(earnings_window, 'UNKNOWN')
+            ORDER BY n DESC
+            LIMIT 8
+            """,
+            signal_params,
+        )
+
         recent_combo_rows = fetch_rows(
             cur,
             f"""
@@ -399,6 +414,9 @@ def build_report(min_sample: int = MIN_SAMPLE, since: str | None = None) -> str:
             limit=12,
         )
     )
+
+    lines.extend(["", "Earnings Source Coverage"])
+    lines.extend(table(earnings_source_rows, [("earnings_source", "source"), ("earnings_window", "window"), ("n", "n")]))
 
     lines.extend(["", "Trusted 1-Day Symbol Buckets"])
     lines.extend(table(trusted_symbol_rows, [("symbol", "sym"), ("direction", "dir"), ("n", "n"), ("win_rate", "win%"), ("avg_edge_pct", "avg%")]))
