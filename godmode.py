@@ -96,6 +96,7 @@ RVOL_VIX_ADDON = 1.0  # added to all thresholds when VIX > 25
 # Conservative timing / quality gates layered on top of the existing signal labels.
 # All thresholds are env-configurable so dashboard and bot workflows stay compatible.
 SIGNAL_MAX_AGE_SECONDS = int(os.getenv("SIGNAL_MAX_AGE_SECONDS", "900"))  # reject bars older than 15m
+SIGNAL_RETENTION_DAYS = int(os.getenv("SIGNAL_RETENTION_DAYS", "365"))  # set 0 to disable DB pruning
 OPENING_CHAOS_BLOCK_MINUTES = int(os.getenv("OPENING_CHAOS_BLOCK_MINUTES", "10"))  # 9:30-9:39 ET
 OPENING_CHAOS_COOLDOWN_MINUTES = int(os.getenv("OPENING_CHAOS_COOLDOWN_MINUTES", "20"))  # 9:40-9:49 ET
 OPENING_CHAOS_RVOL_ADDON = float(os.getenv("OPENING_CHAOS_RVOL_ADDON", "0.75"))
@@ -921,21 +922,27 @@ def run_god_mode_pro() -> None:
             assets = _load_dynamic_assets()
             all_tickers = [ticker for group in assets.values() for ticker in group]
 
-            # Daily prune: delete signals older than 30 days (runs once per calendar day)
+            # Daily prune: keep research history bounded on small VMs.
+            # Set SIGNAL_RETENTION_DAYS=0 to disable DB pruning.
             today_date = datetime.now().strftime("%Y-%m-%d")
             if today_date != _last_prune_date:
                 try:
                     conn = sqlite3.connect(DB_PATH)
-                    deleted = conn.execute(
-                        "DELETE FROM signals WHERE timestamp < datetime('now', '-30 days')"
-                    ).rowcount
-                    conn.execute(
-                        "DELETE FROM observations WHERE timestamp_utc < datetime('now', '-30 days')"
-                    )
+                    deleted = 0
+                    if SIGNAL_RETENTION_DAYS > 0:
+                        cutoff = f"-{SIGNAL_RETENTION_DAYS} days"
+                        deleted = conn.execute(
+                            "DELETE FROM signals WHERE timestamp < datetime('now', ?)",
+                            (cutoff,),
+                        ).rowcount
+                        conn.execute(
+                            "DELETE FROM observations WHERE timestamp_utc < datetime('now', ?)",
+                            (cutoff,),
+                        )
                     conn.commit()
                     conn.close()
                     if deleted:
-                        log(f"{Fore.CYAN}🗑️  Pruned {deleted} signals older than 30 days")
+                        log(f"{Fore.CYAN}Pruned {deleted} signals older than {SIGNAL_RETENTION_DAYS} days")
                 except Exception as pe:
                     log(f"{Fore.RED}Prune error: {pe}")
                 _last_prune_date = today_date
