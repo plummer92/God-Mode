@@ -229,6 +229,23 @@ def build_report(min_sample: int = MIN_SAMPLE, since: str | None = None) -> str:
             outcome_params,
         )
 
+        source_quality_rows = fetch_rows(
+            cur,
+            f"""
+            SELECT COALESCE(source, 'UNKNOWN') source,
+                   COUNT(1) total,
+                   SUM(CASE WHEN outcome='NO_DATA' THEN 1 ELSE 0 END) no_data,
+                   ROUND(100.0 * SUM(CASE WHEN outcome='NO_DATA' THEN 1 ELSE 0 END) / COUNT(1), 1) no_data_pct,
+                   SUM(CASE WHEN outcome IN ('WIN','LOSS','FLAT') THEN 1 ELSE 0 END) labeled
+            FROM signal_outcomes
+            {outcome_where_since}
+            GROUP BY COALESCE(source, 'UNKNOWN')
+            ORDER BY total DESC
+            LIMIT 10
+            """,
+            outcome_params,
+        )
+
         session_rows = fetch_rows(
             cur,
             f"""
@@ -368,6 +385,14 @@ def build_report(min_sample: int = MIN_SAMPLE, since: str | None = None) -> str:
 
     lines.extend(["", "Data Quality"])
     lines.extend(table(no_data_rows, [("horizon", "h"), ("total", "total"), ("no_data", "no_data"), ("no_data_pct", "no_data%")]))
+
+    lines.extend(["", "Label Source Quality"])
+    lines.extend(
+        table(
+            source_quality_rows,
+            [("source", "source"), ("total", "total"), ("labeled", "labeled"), ("no_data", "no_data"), ("no_data_pct", "no_data%")],
+        )
+    )
 
     lines.extend(
         [
