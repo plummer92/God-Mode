@@ -194,6 +194,102 @@ def build_report(
             (since, min_sample),
         )
 
+        context_min_sample = max(10, min_sample)
+        context_rows = fetch_rows(
+            conn,
+            f"""
+            SELECT o.horizon,
+                   o.signal_type,
+                   o.direction,
+                   COALESCE(s.earnings_window, 'UNKNOWN') earnings_window,
+                   COALESCE(s.time_session, 'UNKNOWN') time_session,
+                   COUNT(1) n,
+                   ROUND(100.0 * AVG(CASE WHEN {net} > 0 THEN 1.0 ELSE 0.0 END), 1) net_win_pct,
+                   ROUND(AVG({net}), 4) net_avg_pct,
+                   ROUND(AVG(o.return_pct), 4) gross_avg_pct
+            FROM signal_outcomes o
+            JOIN signals s ON s.rowid = o.signal_rowid
+            WHERE o.signal_ts >= ?
+              AND o.outcome IN ('WIN', 'LOSS')
+              AND o.return_pct IS NOT NULL
+            GROUP BY o.horizon, o.signal_type, o.direction,
+                     COALESCE(s.earnings_window, 'UNKNOWN'),
+                     COALESCE(s.time_session, 'UNKNOWN')
+            HAVING n >= ?
+            ORDER BY net_avg_pct DESC
+            LIMIT 15
+            """,
+            (since, context_min_sample),
+        )
+
+        weak_context_rows = fetch_rows(
+            conn,
+            f"""
+            SELECT o.horizon,
+                   o.signal_type,
+                   o.direction,
+                   COALESCE(s.earnings_window, 'UNKNOWN') earnings_window,
+                   COALESCE(s.time_session, 'UNKNOWN') time_session,
+                   COUNT(1) n,
+                   ROUND(100.0 * AVG(CASE WHEN {net} > 0 THEN 1.0 ELSE 0.0 END), 1) net_win_pct,
+                   ROUND(AVG({net}), 4) net_avg_pct,
+                   ROUND(AVG(o.return_pct), 4) gross_avg_pct
+            FROM signal_outcomes o
+            JOIN signals s ON s.rowid = o.signal_rowid
+            WHERE o.signal_ts >= ?
+              AND o.outcome IN ('WIN', 'LOSS')
+              AND o.return_pct IS NOT NULL
+            GROUP BY o.horizon, o.signal_type, o.direction,
+                     COALESCE(s.earnings_window, 'UNKNOWN'),
+                     COALESCE(s.time_session, 'UNKNOWN')
+            HAVING n >= ?
+            ORDER BY net_avg_pct ASC
+            LIMIT 15
+            """,
+            (since, context_min_sample),
+        )
+
+        earnings_rows = fetch_rows(
+            conn,
+            f"""
+            SELECT o.horizon,
+                   COALESCE(s.earnings_window, 'UNKNOWN') earnings_window,
+                   COUNT(1) n,
+                   ROUND(100.0 * AVG(CASE WHEN {net} > 0 THEN 1.0 ELSE 0.0 END), 1) net_win_pct,
+                   ROUND(AVG({net}), 4) net_avg_pct,
+                   ROUND(AVG(o.return_pct), 4) gross_avg_pct
+            FROM signal_outcomes o
+            JOIN signals s ON s.rowid = o.signal_rowid
+            WHERE o.signal_ts >= ?
+              AND o.outcome IN ('WIN', 'LOSS')
+              AND o.return_pct IS NOT NULL
+            GROUP BY o.horizon, COALESCE(s.earnings_window, 'UNKNOWN')
+            HAVING n >= ?
+            ORDER BY o.horizon, net_avg_pct DESC
+            """,
+            (since, context_min_sample),
+        )
+
+        label_source_rows = fetch_rows(
+            conn,
+            f"""
+            SELECT o.horizon,
+                   COALESCE(o.source, 'UNKNOWN') source,
+                   COUNT(1) n,
+                   ROUND(100.0 * AVG(CASE WHEN {net} > 0 THEN 1.0 ELSE 0.0 END), 1) net_win_pct,
+                   ROUND(AVG({net}), 4) net_avg_pct,
+                   ROUND(AVG(o.return_pct), 4) gross_avg_pct
+            FROM signal_outcomes o
+            WHERE o.signal_ts >= ?
+              AND o.outcome IN ('WIN', 'LOSS')
+              AND o.return_pct IS NOT NULL
+            GROUP BY o.horizon, COALESCE(o.source, 'UNKNOWN')
+            HAVING n >= ?
+            ORDER BY o.horizon, net_avg_pct DESC
+            """,
+            (since, context_min_sample),
+        )
+
         split_rows: list[sqlite3.Row] = []
         if split_ts:
             split_rows = fetch_rows(
@@ -275,6 +371,64 @@ def build_report(
                 ("n", "n"),
                 ("net_win_pct", "net_win%"),
                 ("net_avg_pct", "net_avg%"),
+            ],
+        ),
+        "",
+        "Best Net Context Buckets",
+        *render_rows(
+            context_rows,
+            [
+                ("horizon", "h"),
+                ("signal_type", "signal"),
+                ("direction", "dir"),
+                ("earnings_window", "earnings"),
+                ("time_session", "session"),
+                ("n", "n"),
+                ("net_win_pct", "net_win%"),
+                ("net_avg_pct", "net_avg%"),
+                ("gross_avg_pct", "gross_avg%"),
+            ],
+        ),
+        "",
+        "Worst Net Context Buckets",
+        *render_rows(
+            weak_context_rows,
+            [
+                ("horizon", "h"),
+                ("signal_type", "signal"),
+                ("direction", "dir"),
+                ("earnings_window", "earnings"),
+                ("time_session", "session"),
+                ("n", "n"),
+                ("net_win_pct", "net_win%"),
+                ("net_avg_pct", "net_avg%"),
+                ("gross_avg_pct", "gross_avg%"),
+            ],
+        ),
+        "",
+        "Net By Earnings Window",
+        *render_rows(
+            earnings_rows,
+            [
+                ("horizon", "h"),
+                ("earnings_window", "earnings"),
+                ("n", "n"),
+                ("net_win_pct", "net_win%"),
+                ("net_avg_pct", "net_avg%"),
+                ("gross_avg_pct", "gross_avg%"),
+            ],
+        ),
+        "",
+        "Net By Label Source",
+        *render_rows(
+            label_source_rows,
+            [
+                ("horizon", "h"),
+                ("source", "source"),
+                ("n", "n"),
+                ("net_win_pct", "net_win%"),
+                ("net_avg_pct", "net_avg%"),
+                ("gross_avg_pct", "gross_avg%"),
             ],
         ),
         "",
