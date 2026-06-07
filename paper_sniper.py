@@ -61,6 +61,17 @@ WILD_BLACKLIST = {
     "TQQQ", "SQQQ", "SPXS", "SPXU", "SPXL", "UPRO", "TNA", "TZA",
     "LABU", "LABD", "FNGU", "FNGD", "KOLD", "BOIL",
 }
+PAPER_RESEARCH_GUARDRAILS_ENABLED = env_bool("PAPER_RESEARCH_GUARDRAILS_ENABLED", True)
+PAPER_BLOCK_EARNINGS_WINDOWS = {
+    item.strip().upper()
+    for item in os.getenv("PAPER_BLOCK_EARNINGS_WINDOWS", "EARNINGS_TODAY").split(",")
+    if item.strip()
+}
+PAPER_BLOCK_LONG_SIGNAL_TERMS = tuple(
+    item.strip().upper()
+    for item in os.getenv("PAPER_BLOCK_LONG_SIGNAL_TERMS", "STRONG BUY FLOW,CLIMAX,FAKE-OUT").split(",")
+    if item.strip()
+)
 POLL_SECONDS = 10
 EOD_CLOSE_HOUR = 15
 EOD_CLOSE_MINUTE = 45
@@ -511,6 +522,30 @@ def parse_signal_direction(signal_text: str, flow_m: float | None = None, change
     return None
 
 
+def paper_research_guardrail_reason(
+    symbol: str,
+    signal_type: str,
+    direction: str,
+    earnings_window: str | None,
+    time_session: str | None,
+) -> str | None:
+    if not PAPER_RESEARCH_GUARDRAILS_ENABLED:
+        return None
+    earnings = str(earnings_window or "UNKNOWN").upper()
+    if earnings in PAPER_BLOCK_EARNINGS_WINDOWS:
+        return f"research guardrail: earnings_window={earnings}"
+    signal_text = str(signal_type or "").upper()
+    session = str(time_session or "UNKNOWN").upper()
+    if direction == "LONG" and "FAKE-OUT" in signal_text and earnings == "CLEAR" and session == "PRIME":
+        return None
+    if direction == "LONG" and any(term in signal_text for term in PAPER_BLOCK_LONG_SIGNAL_TERMS):
+        return (
+            "research guardrail: weak long bucket "
+            f"signal={signal_type} earnings={earnings} session={session}"
+        )
+    return None
+
+
 def is_tradable_symbol(symbol: str):
     text = str(symbol or "").upper()
     if not text:
@@ -573,7 +608,9 @@ def get_new_signals(last_check):
         # Wild mode: fetch ALL signal types (no signal_type filter), include rvol
         cur.execute(
             """
-            SELECT rowid, timestamp, symbol, signal_type, price, flow_m, change_pct, rvol
+            SELECT rowid, timestamp, symbol, signal_type, price, flow_m, change_pct, rvol,
+                   COALESCE(earnings_window, 'UNKNOWN') AS earnings_window,
+                   COALESCE(time_session, 'UNKNOWN') AS time_session
             FROM signals
             WHERE timestamp > ?
             ORDER BY timestamp ASC
@@ -994,6 +1031,16 @@ def _run():
         f"TP {TAKE_PROFIT_PCT:.2%} SL {STOP_LOSS_PCT:.2%} | RVOL≥{WILD_RVOL_MIN} | 3:45pm ET flat"
     )
 
+    if PAPER_RESEARCH_GUARDRAILS_ENABLED:
+        guardrail_msg = (
+            "PAPER RESEARCH GUARDRAILS ACTIVE | "
+            f"block earnings={','.join(sorted(PAPER_BLOCK_EARNINGS_WINDOWS))} | "
+            f"block long terms={','.join(PAPER_BLOCK_LONG_SIGNAL_TERMS)} | "
+            "allow FAKE-OUT LONG only when earnings=CLEAR session=PRIME"
+        )
+        log(guardrail_msg)
+        post_discord(guardrail_msg)
+
     client = get_client()
     last_check = (datetime.utcnow() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1033,7 +1080,18 @@ def _run():
                 except Exception:
                     _loop_held_symbols = set()
 
-                for rowid, signal_ts, symbol, signal_type, price, flow_m, change_pct, rvol in signals:
+                for (
+                    rowid,
+                    signal_ts,
+                    symbol,
+                    signal_type,
+                    price,
+                    flow_m,
+                    change_pct,
+                    rvol,
+                    earnings_window,
+                    time_session,
+                ) in signals:
                     sym_upper = str(symbol).upper()
 
                     # Hard guard: skip if we already hold (or just entered) this symbol
@@ -1072,6 +1130,22 @@ def _run():
                     signal_key = make_dedup_key(signal_ts, sym_upper, direction)
                     if is_signal_processed(signal_key):
                         log(f"SKIP DUPE {sym_upper} {direction}: already acted on this 5-minute window")
+                        continue
+
+                    guardrail_reason = paper_research_guardrail_reason(
+                        sym_upper,
+                        signal_type,
+                        direction,
+                        earnings_window,
+                        time_session,
+                    )
+                    if guardrail_reason:
+                        log(f"PAPER RESEARCH BLOCK {sym_upper} {direction}: {guardrail_reason}")
+                        post_discord(
+                            f"📄 PAPER RESEARCH BLOCK | {sym_upper} {direction} | "
+                            f"{signal_type} | {guardrail_reason}"
+                        )
+                        mark_signal_processed(signal_key, signal_ts, sym_upper, signal_type, direction)
                         continue
 
                     if execute_signal(client, sym_upper, float(price), signal_type, direction):
