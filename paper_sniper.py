@@ -176,6 +176,24 @@ def ensure_state_db():
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_signal_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT,
+                signal_ts TEXT,
+                symbol TEXT,
+                signal_type TEXT,
+                direction TEXT,
+                action TEXT,
+                reason TEXT,
+                earnings_window TEXT,
+                time_session TEXT,
+                price REAL,
+                rvol REAL
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -250,6 +268,46 @@ def log_exit_event(symbol: str, exit_reason: str, intended_exit_time: str,
                 1 if retry_used else 0,
                 verification_result,
                 pnl_usd,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_paper_signal_event(
+    signal_ts: str,
+    symbol: str,
+    signal_type: str,
+    direction: str,
+    action: str,
+    reason: str | None = None,
+    earnings_window: str | None = None,
+    time_session: str | None = None,
+    price=None,
+    rvol=None,
+):
+    conn = sqlite3.connect(STATE_DB_PATH)
+    try:
+        conn.execute(
+            """
+            INSERT INTO paper_signal_events (
+                created_at, signal_ts, symbol, signal_type, direction,
+                action, reason, earnings_window, time_session, price, rvol
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now_str(),
+                signal_ts,
+                str(symbol).upper(),
+                signal_type,
+                direction,
+                action,
+                reason,
+                earnings_window,
+                time_session,
+                float(price) if price is not None else None,
+                float(rvol) if rvol is not None else None,
             ),
         )
         conn.commit()
@@ -1141,6 +1199,18 @@ def _run():
                     )
                     if guardrail_reason:
                         log(f"PAPER RESEARCH BLOCK {sym_upper} {direction}: {guardrail_reason}")
+                        log_paper_signal_event(
+                            signal_ts,
+                            sym_upper,
+                            signal_type,
+                            direction,
+                            "BLOCKED",
+                            reason=guardrail_reason,
+                            earnings_window=earnings_window,
+                            time_session=time_session,
+                            price=price,
+                            rvol=rvol,
+                        )
                         post_discord(
                             f"📄 PAPER RESEARCH BLOCK | {sym_upper} {direction} | "
                             f"{signal_type} | {guardrail_reason}"
@@ -1149,6 +1219,17 @@ def _run():
                         continue
 
                     if execute_signal(client, sym_upper, float(price), signal_type, direction):
+                        log_paper_signal_event(
+                            signal_ts,
+                            sym_upper,
+                            signal_type,
+                            direction,
+                            "ENTERED",
+                            earnings_window=earnings_window,
+                            time_session=time_session,
+                            price=price,
+                            rvol=rvol,
+                        )
                         mark_signal_processed(signal_key, signal_ts, sym_upper, signal_type, direction)
                         _loop_held_symbols.add(sym_upper)  # block re-entry for rest of this batch
 

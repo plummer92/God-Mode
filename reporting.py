@@ -23,6 +23,7 @@ except Exception:  # pragma: no cover - fallback only used on minimal environmen
 BASE_DIR = DATA_DIR
 ENV_PATH = Path(ENV_FILE)
 DB_PATH = DATA_DIR / "trade_log.db"
+PAPER_STATE_DB_PATH = DATA_DIR / "paper_sniper_state.db"
 APPROVED_PATH = DATA_DIR / "approved_symbols.json"
 REGIME_PATH = DATA_DIR / "regime_snapshot.json"
 ET = ZoneInfo("America/New_York")
@@ -172,6 +173,110 @@ def _fmt_timestamp(value: Optional[str]) -> str:
     return value[:16]
 
 
+def _paper_state_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(PAPER_STATE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _paper_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def build_paper_guardrail_summary(trade_date: str) -> list[str]:
+    lines = ["", f"**Paper Guardrail Summary ({trade_date})**"]
+    if not PAPER_STATE_DB_PATH.exists():
+        lines.append("No paper state DB yet")
+        return lines
+
+    conn = _paper_state_connect()
+    try:
+        if not _paper_table_exists(conn, "paper_signal_events"):
+            lines.append("No guardrail event table yet")
+            return lines
+
+        counts = {
+            str(row["action"]): int(row["n"])
+            for row in conn.execute(
+                """
+                SELECT action, COUNT(*) AS n
+                FROM paper_signal_events
+                WHERE substr(created_at, 1, 10) = ?
+                GROUP BY action
+                """,
+                (trade_date,),
+            )
+        }
+        entered = counts.get("ENTERED", 0)
+        blocked = counts.get("BLOCKED", 0)
+        total = entered + blocked
+        lines.append(f"Signals acted on: **{total}** | entered: **{entered}** | blocked: **{blocked}**")
+
+        if blocked:
+            lines.append("Top blocked reasons:")
+            for row in conn.execute(
+                """
+                SELECT COALESCE(reason, 'unknown') AS reason, COUNT(*) AS n
+                FROM paper_signal_events
+                WHERE substr(created_at, 1, 10) = ? AND action = 'BLOCKED'
+                GROUP BY COALESCE(reason, 'unknown')
+                ORDER BY n DESC, reason ASC
+                LIMIT 5
+                """,
+                (trade_date,),
+            ):
+                lines.append(f"  {row['reason']} - {int(row['n'])}")
+        else:
+            lines.append("Top blocked reasons: none")
+
+        if entered:
+            lines.append("Entered buckets:")
+            for row in conn.execute(
+                """
+                SELECT signal_type, direction, COUNT(*) AS n
+                FROM paper_signal_events
+                WHERE substr(created_at, 1, 10) = ? AND action = 'ENTERED'
+                GROUP BY signal_type, direction
+                ORDER BY n DESC, signal_type ASC, direction ASC
+                LIMIT 6
+                """,
+                (trade_date,),
+            ):
+                lines.append(f"  {row['signal_type']} | {row['direction']} - {int(row['n'])}")
+        else:
+            lines.append("Entered buckets: none")
+
+        exit_rows = []
+        if _paper_table_exists(conn, "exit_events"):
+            exit_rows = conn.execute(
+                """
+                SELECT symbol, exit_reason, verification_result, pnl_usd, created_at
+                FROM exit_events
+                WHERE substr(created_at, 1, 10) = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (trade_date,),
+            ).fetchall()
+        closed = [row for row in exit_rows if str(row["verification_result"] or "").startswith("closed:")]
+        realized = [row for row in closed if row["pnl_usd"] is not None]
+        pnl = sum(float(row["pnl_usd"]) for row in realized)
+        wins = sum(1 for row in realized if float(row["pnl_usd"]) > 0)
+        lines.append(f"Paper exits: **{len(closed)}** | realized P&L: **{_fmt_money(pnl)}** ({wins}/{len(realized)} wins)")
+        if closed:
+            for row in closed[:6]:
+                lines.append(
+                    f"  `{row['symbol']}` {row['exit_reason']} | "
+                    f"{_fmt_money(row['pnl_usd'])} | {_fmt_timestamp(row['created_at'])}"
+                )
+    finally:
+        conn.close()
+    return lines
+
+
 def build_daily_report(trade_date: Optional[str] = None) -> str:
     trade_date = trade_date or today_et_str()
     closed_rows = fetch_closed_trades(trade_date)
@@ -205,6 +310,7 @@ def build_daily_report(trade_date: Optional[str] = None) -> str:
                 f"`{row['symbol']}` {row['direction']} @ ${float(row['entry_price']):.2f} "
                 f"| {row['signal_type']} | since {_fmt_timestamp(row['entry_time'])}"
             )
+    lines.extend(build_paper_guardrail_summary(trade_date))
     return "\n".join(lines)
 
 
