@@ -51,7 +51,9 @@ DAILY_LOSS_LIMIT = 500.0
 
 # Wild experiment: no approved_symbols.json filter, no signal-type whitelist.
 # Trade any godmode signal that passes RVOL threshold and is not a known bad actor.
-WILD_RVOL_MIN = 2.0
+WILD_RVOL_MIN = float(os.getenv("PAPER_RVOL_MIN", "2.0"))
+PAPER_FAKEOUT_SHORT_RVOL_MIN = float(os.getenv("PAPER_FAKEOUT_SHORT_RVOL_MIN", "0.0"))
+PAPER_MAX_DAILY_ENTRIES = int(os.getenv("PAPER_MAX_DAILY_ENTRIES", "5"))
 
 # Hardcoded blacklist: penny stocks, halted/delisted frequent fliers, and
 # symbols that routinely gap / have no Alpaca liquidity.
@@ -604,6 +606,30 @@ def paper_research_guardrail_reason(
     return None
 
 
+def rvol_min_for_signal(signal_type: str, direction: str) -> float:
+    signal_text = str(signal_type or "").upper()
+    if direction == "SHORT" and "FAKE-OUT" in signal_text:
+        return PAPER_FAKEOUT_SHORT_RVOL_MIN
+    return WILD_RVOL_MIN
+
+
+def count_daily_entries(day: str | None = None) -> int:
+    day = day or utc_now_str()[:10]
+    conn = sqlite3.connect(STATE_DB_PATH)
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM paper_signal_events
+            WHERE action = 'ENTERED' AND substr(created_at, 1, 10) = ?
+            """,
+            (day,),
+        ).fetchone()
+        return int(row[0] or 0)
+    finally:
+        conn.close()
+
+
 def is_tradable_symbol(symbol: str):
     text = str(symbol or "").upper()
     if not text:
@@ -1078,7 +1104,9 @@ def _run():
     )
     log(
         f"Signal max age: {MAX_SIGNAL_AGE_SECONDS}s | Dedup window: {DEDUP_WINDOW_SECONDS}s | "
-        f"EOD force close: 3:45pm ET | RVOL min: {WILD_RVOL_MIN} | Blacklist: {len(WILD_BLACKLIST)} symbols"
+        f"EOD force close: 3:45pm ET | RVOL min: {WILD_RVOL_MIN} "
+        f"(fake-out short min {PAPER_FAKEOUT_SHORT_RVOL_MIN}) | "
+        f"Daily entry cap: {PAPER_MAX_DAILY_ENTRIES} | Blacklist: {len(WILD_BLACKLIST)} symbols"
     )
     if pdt_equity_entry_block_active():
         log(f"PDT EQUITY ENTRY GUARD ACTIVE for {_trading_day_str()} ET - new equity entries paused after earlier broker exit denial")
@@ -1086,7 +1114,8 @@ def _run():
         log(f"PDT EQUITY ENTRY GUARD INACTIVE for {_trading_day_str()} ET")
     post_discord(
         f"📄 PAPER SNIPER ONLINE | wild mode (no roster filter) | ${TRADE_NOTIONAL:.0f}/trade | "
-        f"TP {TAKE_PROFIT_PCT:.2%} SL {STOP_LOSS_PCT:.2%} | RVOL≥{WILD_RVOL_MIN} | 3:45pm ET flat"
+        f"TP {TAKE_PROFIT_PCT:.2%} SL {STOP_LOSS_PCT:.2%} | RVOL≥{WILD_RVOL_MIN} "
+        f"(fake-out short ≥{PAPER_FAKEOUT_SHORT_RVOL_MIN}) | 3:45pm ET flat"
     )
 
     if PAPER_RESEARCH_GUARDRAILS_ENABLED:
@@ -1158,11 +1187,6 @@ def _run():
                         log(f"SKIP {sym_upper}: already have open position (loop guard)")
                         continue
 
-                    # Wild experiment filters (approved_symbols.json intentionally bypassed)
-                    rvol_val = float(rvol) if rvol is not None else 0.0
-                    if rvol_val < WILD_RVOL_MIN:
-                        log(f"SKIP {sym_upper}: rvol={rvol_val:.2f} < {WILD_RVOL_MIN}")
-                        continue
                     if sym_upper in WILD_BLACKLIST:
                         log(f"SKIP {sym_upper}: blacklisted")
                         continue
@@ -1170,6 +1194,13 @@ def _run():
                     direction = parse_signal_direction(signal_type, flow_m=flow_m, change_pct=change_pct)
                     if direction is None:
                         log(f"SKIP {sym_upper}: unknown direction for signal '{signal_type}'")
+                        continue
+
+                    # Wild experiment filters (approved_symbols.json intentionally bypassed)
+                    rvol_val = float(rvol) if rvol is not None else 0.0
+                    required_rvol = rvol_min_for_signal(signal_type, direction)
+                    if rvol_val < required_rvol:
+                        log(f"SKIP {sym_upper} {direction}: rvol={rvol_val:.2f} < {required_rvol}")
                         continue
 
                     parsed_ts = parse_signal_timestamp(signal_ts)
@@ -1214,6 +1245,30 @@ def _run():
                         post_discord(
                             f"📄 PAPER RESEARCH BLOCK | {sym_upper} {direction} | "
                             f"{signal_type} | {guardrail_reason}"
+                        )
+                        mark_signal_processed(signal_key, signal_ts, sym_upper, signal_type, direction)
+                        continue
+
+                    daily_entries = count_daily_entries()
+                    if daily_entries >= PAPER_MAX_DAILY_ENTRIES:
+                        reason = (
+                            "daily paper entry cap reached "
+                            f"({daily_entries}/{PAPER_MAX_DAILY_ENTRIES})"
+                        )
+                        log(
+                            f"SKIP {sym_upper} {direction}: {reason}"
+                        )
+                        log_paper_signal_event(
+                            signal_ts,
+                            sym_upper,
+                            signal_type,
+                            direction,
+                            "BLOCKED",
+                            reason=reason,
+                            earnings_window=earnings_window,
+                            time_session=time_session,
+                            price=price,
+                            rvol=rvol,
                         )
                         mark_signal_processed(signal_key, signal_ts, sym_upper, signal_type, direction)
                         continue
