@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -57,8 +58,25 @@ def post_to_discord(message: str) -> None:
     webhook = get_discord_webhook()
     if not webhook:
         raise RuntimeError(f"DISCORD_WEBHOOK is not set in {ENV_PATH}")
-    response = requests.post(webhook, json={"content": message}, timeout=10)
-    response.raise_for_status()
+    attempts = int(os.getenv("DISCORD_POST_ATTEMPTS", "5"))
+    base_delay = float(os.getenv("DISCORD_POST_RETRY_SECONDS", "2"))
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            response = requests.post(webhook, json={"content": message}, timeout=15)
+            response.raise_for_status()
+            return
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            delay = min(base_delay * (2 ** (attempt - 1)), 30.0)
+            print(
+                f"Discord post failed attempt {attempt}/{attempts}: {exc}; retrying in {delay:.1f}s",
+                flush=True,
+            )
+            time.sleep(delay)
+    raise RuntimeError(f"Discord post failed after {attempts} attempts: {last_error}")
 
 
 def now_et() -> datetime:

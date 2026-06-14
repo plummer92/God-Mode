@@ -78,7 +78,11 @@ def _maybe_send(job_name: str, trade_date: str, build_message) -> None:
     if state.get(job_name) == trade_date:
         return
     message = build_message()
-    _post_message(message)
+    try:
+        _post_message(message)
+    except Exception as exc:
+        print(f"failed to send {job_name} for {trade_date}: {exc}", flush=True)
+        return
     state[job_name] = trade_date
     _save_state(state)
     print(f"sent {job_name} for {trade_date}", flush=True)
