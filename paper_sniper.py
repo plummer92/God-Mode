@@ -54,6 +54,14 @@ DAILY_LOSS_LIMIT = 500.0
 WILD_RVOL_MIN = float(os.getenv("PAPER_RVOL_MIN", "2.0"))
 PAPER_FAKEOUT_SHORT_RVOL_MIN = float(os.getenv("PAPER_FAKEOUT_SHORT_RVOL_MIN", "0.0"))
 PAPER_MAX_DAILY_ENTRIES = int(os.getenv("PAPER_MAX_DAILY_ENTRIES", "5"))
+PAPER_RECENT_LOSER_DAYS = int(os.getenv("PAPER_RECENT_LOSER_DAYS", "10"))
+PAPER_RECENT_LOSER_MIN_TRADES = int(os.getenv("PAPER_RECENT_LOSER_MIN_TRADES", "2"))
+PAPER_RECENT_LOSER_MAX_PNL = float(os.getenv("PAPER_RECENT_LOSER_MAX_PNL", "-5.0"))
+PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS = {
+    item.strip().upper()
+    for item in os.getenv("PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS", "PRIME").split(",")
+    if item.strip()
+}
 
 # Hardcoded blacklist: penny stocks, halted/delisted frequent fliers, and
 # symbols that routinely gap / have no Alpaca liquidity.
@@ -66,7 +74,7 @@ WILD_BLACKLIST = {
 PAPER_RESEARCH_GUARDRAILS_ENABLED = env_bool("PAPER_RESEARCH_GUARDRAILS_ENABLED", True)
 PAPER_BLOCK_EARNINGS_WINDOWS = {
     item.strip().upper()
-    for item in os.getenv("PAPER_BLOCK_EARNINGS_WINDOWS", "EARNINGS_TODAY").split(",")
+    for item in os.getenv("PAPER_BLOCK_EARNINGS_WINDOWS", "EARNINGS_TODAY,PRE_EARNINGS").split(",")
     if item.strip()
 }
 PAPER_BLOCK_LONG_SIGNAL_TERMS = tuple(
@@ -596,6 +604,12 @@ def paper_research_guardrail_reason(
         return f"research guardrail: earnings_window={earnings}"
     signal_text = str(signal_type or "").upper()
     session = str(time_session or "UNKNOWN").upper()
+    if (
+        direction == "SHORT"
+        and "FAKE-OUT" in signal_text
+        and session in PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS
+    ):
+        return f"research guardrail: fake-out short blocked in session={session}"
     if direction == "LONG" and "FAKE-OUT" in signal_text and earnings == "CLEAR" and session == "PRIME":
         return None
     if direction == "LONG" and any(term in signal_text for term in PAPER_BLOCK_LONG_SIGNAL_TERMS):
@@ -606,11 +620,80 @@ def paper_research_guardrail_reason(
     return None
 
 
+def recent_paper_loser_reason(symbol: str) -> str | None:
+    if PAPER_RECENT_LOSER_DAYS <= 0:
+        return None
+    since = (utc_now() - timedelta(days=PAPER_RECENT_LOSER_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(STATE_DB_PATH)
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(pnl_usd), 0)
+            FROM exit_events
+            WHERE symbol = ? AND created_at >= ? AND pnl_usd IS NOT NULL
+            """,
+            (str(symbol).upper(), since),
+        ).fetchone()
+        trades = int(row[0] or 0)
+        pnl = float(row[1] or 0)
+        if trades >= PAPER_RECENT_LOSER_MIN_TRADES and pnl <= PAPER_RECENT_LOSER_MAX_PNL:
+            return (
+                "recent paper loser cooldown "
+                f"({trades} exits/{PAPER_RECENT_LOSER_DAYS}d, pnl=${pnl:.2f})"
+            )
+    finally:
+        conn.close()
+    return None
+
+
 def rvol_min_for_signal(signal_type: str, direction: str) -> float:
     signal_text = str(signal_type or "").upper()
     if direction == "SHORT" and "FAKE-OUT" in signal_text:
         return PAPER_FAKEOUT_SHORT_RVOL_MIN
     return WILD_RVOL_MIN
+
+
+def paper_signal_rank(signal_type: str, direction: str | None, earnings_window: str | None, time_session: str | None) -> int:
+    signal_text = str(signal_type or "").upper()
+    earnings = str(earnings_window or "UNKNOWN").upper()
+    session = str(time_session or "UNKNOWN").upper()
+    rank = 90
+    if direction == "SHORT" and "STRONG SELL FLOW" in signal_text:
+        rank = 0
+    elif direction == "SHORT" and "ABSORPTION SELL" in signal_text:
+        rank = 1
+    elif direction == "SHORT" and "FAKE-OUT" in signal_text and session == "NORMAL":
+        rank = 2
+    elif direction == "SHORT" and "FAKE-OUT" in signal_text:
+        rank = 4
+    elif direction == "SHORT":
+        rank = 5
+    elif direction == "LONG":
+        rank = 20
+    if earnings in PAPER_BLOCK_EARNINGS_WINDOWS:
+        rank += 50
+    return rank
+
+
+def paper_signal_sort_key(row):
+    (
+        _rowid,
+        signal_ts,
+        symbol,
+        signal_type,
+        _price,
+        flow_m,
+        change_pct,
+        _rvol,
+        earnings_window,
+        time_session,
+    ) = row
+    direction = parse_signal_direction(signal_type, flow_m=flow_m, change_pct=change_pct)
+    return (
+        paper_signal_rank(signal_type, direction, earnings_window, time_session),
+        str(signal_ts or ""),
+        str(symbol or ""),
+    )
 
 
 def count_daily_entries(day: str | None = None) -> int:
@@ -1122,7 +1205,10 @@ def _run():
         guardrail_msg = (
             "PAPER RESEARCH GUARDRAILS ACTIVE | "
             f"block earnings={','.join(sorted(PAPER_BLOCK_EARNINGS_WINDOWS))} | "
+            f"block fake-out short sessions={','.join(sorted(PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS)) or 'none'} | "
             f"block long terms={','.join(PAPER_BLOCK_LONG_SIGNAL_TERMS)} | "
+            f"recent loser cooldown={PAPER_RECENT_LOSER_MIN_TRADES} trades/"
+            f"{PAPER_RECENT_LOSER_DAYS}d <= ${PAPER_RECENT_LOSER_MAX_PNL:.2f} | "
             "allow FAKE-OUT LONG only when earnings=CLEAR session=PRIME"
         )
         log(guardrail_msg)
@@ -1159,6 +1245,7 @@ def _run():
 
             signals = get_new_signals(last_check)
             if signals and can_open_new_positions_now():
+                signals = sorted(signals, key=paper_signal_sort_key)
                 # Snapshot held symbols once per loop so that orders submitted
                 # earlier in this same batch are treated as "already open" even
                 # before Alpaca reflects the fill in get_all_positions().
@@ -1245,6 +1332,28 @@ def _run():
                         post_discord(
                             f"📄 PAPER RESEARCH BLOCK | {sym_upper} {direction} | "
                             f"{signal_type} | {guardrail_reason}"
+                        )
+                        mark_signal_processed(signal_key, signal_ts, sym_upper, signal_type, direction)
+                        continue
+
+                    loser_reason = recent_paper_loser_reason(sym_upper)
+                    if loser_reason:
+                        log(f"PAPER RESEARCH BLOCK {sym_upper} {direction}: {loser_reason}")
+                        log_paper_signal_event(
+                            signal_ts,
+                            sym_upper,
+                            signal_type,
+                            direction,
+                            "BLOCKED",
+                            reason=loser_reason,
+                            earnings_window=earnings_window,
+                            time_session=time_session,
+                            price=price,
+                            rvol=rvol,
+                        )
+                        post_discord(
+                            f"ðŸ“„ PAPER RESEARCH BLOCK | {sym_upper} {direction} | "
+                            f"{signal_type} | {loser_reason}"
                         )
                         mark_signal_processed(signal_key, signal_ts, sym_upper, signal_type, direction)
                         continue
