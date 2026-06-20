@@ -11,6 +11,7 @@ from app_paths import DATA_DIR
 from audit_report import DEFAULT_SINCE as DEFAULT_AUDIT_SINCE
 from audit_report import build_report as build_audit_report
 from backtest_signals import build_report as build_backtest_report
+from paper_trade_review import build_report as build_paper_trade_review
 from reporting import build_daily_report, build_morning_brief, now_et, post_to_discord
 
 
@@ -27,6 +28,11 @@ BACKTEST_REPORT_SINCE = os.getenv("BACKTEST_REPORT_SINCE", "2026-05-24 14:52:00"
 BACKTEST_REPORT_MIN_SAMPLE = int(os.getenv("BACKTEST_REPORT_MIN_SAMPLE", "10"))
 BACKTEST_SLIPPAGE_BPS = float(os.getenv("BACKTEST_SLIPPAGE_BPS", "2"))
 BACKTEST_SPREAD_BPS = float(os.getenv("BACKTEST_SPREAD_BPS", "3"))
+PAPER_REVIEW_ENABLED = os.getenv("PAPER_REVIEW_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+PAPER_REVIEW_DAY_ET = int(os.getenv("PAPER_REVIEW_DAY_ET", "5"))  # Monday=0, Saturday=5
+PAPER_REVIEW_TIME_ET = os.getenv("PAPER_REVIEW_TIME_ET", "11:00")
+PAPER_REVIEW_DAYS = int(os.getenv("PAPER_REVIEW_DAYS", "7"))
+PAPER_REVIEW_TRADE_LIMIT = int(os.getenv("PAPER_REVIEW_TRADE_LIMIT", "30"))
 
 
 def _load_state() -> dict[str, str]:
@@ -114,6 +120,12 @@ def run_forever() -> None:
                     slippage_bps=BACKTEST_SLIPPAGE_BPS,
                     spread_bps=BACKTEST_SPREAD_BPS,
                 ),
+            )
+        elif PAPER_REVIEW_ENABLED and now.weekday() == PAPER_REVIEW_DAY_ET and hour_minute == PAPER_REVIEW_TIME_ET:
+            _maybe_send(
+                "paper_trade_review",
+                trade_date,
+                lambda: build_paper_trade_review(days=PAPER_REVIEW_DAYS, trade_limit=PAPER_REVIEW_TRADE_LIMIT),
             )
         time.sleep(SLEEP_SECONDS)
 
