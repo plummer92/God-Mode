@@ -657,6 +657,173 @@ def _scenario_lines(
     return lines
 
 
+def _load_event_rows(
+    *,
+    since_utc: str,
+    state_db: Path,
+    signals_db: Path,
+) -> tuple[list[dict[str, Any]], str]:
+    state_db = Path(state_db).expanduser()
+    signals_db = Path(signals_db).expanduser()
+    if not state_db.exists():
+        return [], f"missing paper state DB at {state_db}"
+
+    with _connect_ro(state_db) as state_conn:
+        if not _table_exists(state_conn, "paper_signal_events"):
+            return [], "missing paper_signal_events table"
+        events = _fetch_all_signal_events(state_conn, since_utc)
+
+    signals_conn = None
+    signals_status = f"missing at {signals_db}"
+    try:
+        if signals_db.exists():
+            signals_conn = _connect_ro(signals_db)
+            signals_status = "available"
+            if not _table_exists(signals_conn, "signal_outcomes"):
+                signals_status = "missing signal_outcomes table"
+                signals_conn.close()
+                signals_conn = None
+        return _build_event_rows(signals_conn, events), signals_status
+    finally:
+        if signals_conn is not None:
+            signals_conn.close()
+
+
+def _scenario_stats(
+    results: dict[str, dict[str, Any]],
+    scenario: str,
+    horizon: str,
+) -> dict[str, float]:
+    return results[scenario]["horizons"][horizon]
+
+
+def _scenario_delta(
+    results: dict[str, dict[str, Any]],
+    scenario: str,
+    horizon: str,
+    baseline: str = "Current guardrails (longs blocked)",
+) -> float:
+    return _scenario_stats(results, scenario, horizon)["pnl"] - _scenario_stats(results, baseline, horizon)["pnl"]
+
+
+def _delta_summary(
+    results: dict[str, dict[str, Any]],
+    scenario: str,
+    *,
+    baseline: str = "Current guardrails (longs blocked)",
+) -> str:
+    helped: list[str] = []
+    hurt: list[str] = []
+    flat: list[str] = []
+    for horizon in EVENT_HORIZONS:
+        delta = _scenario_delta(results, scenario, horizon, baseline)
+        item = f"{horizon} ({_fmt_money(delta)})"
+        if delta > 0.01:
+            helped.append(item)
+        elif delta < -0.01:
+            hurt.append(item)
+        else:
+            flat.append(item)
+    parts: list[str] = []
+    if helped:
+        parts.append("helped " + ", ".join(helped))
+    if hurt:
+        parts.append("hurt " + ", ".join(hurt))
+    if flat:
+        parts.append("flat " + ", ".join(flat))
+    return "; ".join(parts) if parts else "no scored comparison"
+
+
+def _primary_verdict(delta: float) -> str:
+    if delta > 25:
+        return "consider paper-only test"
+    if delta > 0:
+        return "watch"
+    if delta < 0:
+        return "keep blocked"
+    return "keep"
+
+
+def build_guardrail_ab_summary(
+    *,
+    since: str | None = None,
+    days: int = DEFAULT_DAYS,
+    horizon: str = DEFAULT_HORIZON,
+    notional: float = DEFAULT_NOTIONAL,
+    state_db: Path = PAPER_STATE_DB_PATH,
+    signals_db: Path = SIGNALS_DB_PATH,
+) -> str:
+    if horizon not in HORIZONS:
+        raise ValueError(f"Unsupported horizon {horizon!r}; choose one of {', '.join(HORIZONS)}")
+
+    since_utc = _parse_since(since, days)
+    event_rows, signals_status = _load_event_rows(
+        since_utc=since_utc,
+        state_db=Path(state_db),
+        signals_db=Path(signals_db),
+    )
+    if not event_rows:
+        return (
+            "Paper Guardrail A/B Summary\n"
+            f"Since: {since_utc} UTC\n"
+            f"No paper signal events found ({signals_status})."
+        )
+
+    results = _score_event_rows(event_rows, notional)
+    baseline = "Current guardrails (longs blocked)"
+    fakeout = "Allow FAKE-OUT SHORT PRIME"
+    daily_cap = "Allow short daily-cap overflow"
+    actual = "Actual recorded entries"
+    combo = "Allow PRIME fake-out + daily-cap shorts"
+
+    baseline_stats = _scenario_stats(results, baseline, horizon)
+    fakeout_delta = _scenario_delta(results, fakeout, horizon)
+    daily_cap_delta = _scenario_delta(results, daily_cap, horizon)
+    long_block_delta = baseline_stats["pnl"] - _scenario_stats(results, actual, horizon)["pnl"]
+    combo_delta = _scenario_delta(results, combo, horizon)
+
+    if fakeout_delta > 25 and _scenario_delta(results, fakeout, "5m") < 0:
+        fakeout_action = "consider paper-only test for 1h+ holds, not 5m scalps"
+    else:
+        fakeout_action = _primary_verdict(fakeout_delta)
+
+    daily_cap_action = _primary_verdict(daily_cap_delta)
+    long_action = "keep long block" if long_block_delta >= 0 else "review long block"
+    if combo_delta > max(fakeout_delta, daily_cap_delta, 0):
+        suggested = (
+            f"{long_action}; watch fake-out PRIME plus daily-cap shorts as the best {horizon} variant."
+        )
+    elif fakeout_delta > 0:
+        suggested = f"{long_action}; {fakeout_action}."
+    elif daily_cap_delta > 0:
+        suggested = f"{long_action}; watch daily-cap overflow."
+    else:
+        suggested = f"{long_action}; keep current short guardrails."
+
+    selected = int(baseline_stats["selected"])
+    scored = int(baseline_stats["n"])
+    lines = [
+        "Paper Guardrail A/B Summary",
+        f"Since: {since_utc} UTC | primary={horizon} | notional=${notional:.0f}",
+        f"Signal outcomes DB: {signals_status}",
+        "",
+        "Current guardrails vs alternates",
+        (
+            f"Current guardrails: selected={selected} scored={scored} "
+            f"{horizon} P&L={_fmt_money(baseline_stats['pnl'])}"
+        ),
+        f"FAKE-OUT SHORT PRIME: {_delta_summary(results, fakeout)} | {fakeout_action}",
+        f"Daily cap overflow: {_delta_summary(results, daily_cap)} | {daily_cap_action}",
+        f"Long block: {_delta_summary(results, baseline, baseline=actual)} | {long_action}",
+        f"PRIME fake-out + daily-cap shorts: {_delta_summary(results, combo)} | {_primary_verdict(combo_delta)}",
+        f"Suggested action: {suggested}",
+        "",
+        "Read This As",
+        "This is read-only research using horizon-close proxy P&L, not broker TP/SL fills.",
+    ]
+    return "\n".join(lines)
+
+
 def _summarize_actual_trades(
     conn: sqlite3.Connection,
     exits: list[sqlite3.Row],
@@ -943,7 +1110,21 @@ def main() -> int:
     parser.add_argument("--csv", type=Path, default=None, help="Optional path for full event-level CSV export")
     parser.add_argument("--state-db", type=Path, default=PAPER_STATE_DB_PATH)
     parser.add_argument("--signals-db", type=Path, default=SIGNALS_DB_PATH)
+    parser.add_argument("--ab-summary", action="store_true", help="Print the compact Discord guardrail A/B summary")
     args = parser.parse_args()
+
+    if args.ab_summary:
+        print(
+            build_guardrail_ab_summary(
+                since=args.since,
+                days=max(1, args.days),
+                horizon=args.horizon,
+                notional=max(1.0, args.notional),
+                state_db=args.state_db,
+                signals_db=args.signals_db,
+            )
+        )
+        return 0
 
     print(
         build_report(
