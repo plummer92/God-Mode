@@ -468,6 +468,195 @@ def _write_event_csv(path: Path, event_rows: list[dict[str, Any]]) -> int:
     return len(event_rows)
 
 
+def _is_action(row: dict[str, Any], action: str) -> bool:
+    return str(row.get("action") or "").upper() == action.upper()
+
+
+def _is_short(row: dict[str, Any]) -> bool:
+    return str(row.get("direction") or "").upper() == "SHORT"
+
+
+def _signal_has(row: dict[str, Any], term: str) -> bool:
+    return term.upper() in str(row.get("signal_type") or "").upper()
+
+
+def _session_is(row: dict[str, Any], session: str) -> bool:
+    return str(row.get("time_session") or "").upper() == session.upper()
+
+
+def _is_earnings_blocked(row: dict[str, Any]) -> bool:
+    earnings = str(row.get("earnings_window") or "").upper()
+    reason = str(row.get("reason_category") or "").lower()
+    return earnings in {"EARNINGS_TODAY", "PRE_EARNINGS"} or reason.startswith("earnings window")
+
+
+def _is_fakeout_short_prime(row: dict[str, Any]) -> bool:
+    return _is_short(row) and _signal_has(row, "FAKE-OUT") and _session_is(row, "PRIME")
+
+
+def _is_short_daily_cap(row: dict[str, Any]) -> bool:
+    return _is_short(row) and str(row.get("reason_category") or "") == "daily entry cap"
+
+
+def _scenario_specs():
+    return [
+        (
+            "Current guardrails (longs blocked)",
+            "actual ENTERED short events only",
+            lambda row: _is_action(row, "ENTERED") and _is_short(row),
+        ),
+        (
+            "Actual recorded entries",
+            "actual ENTERED events, including historical longs",
+            lambda row: _is_action(row, "ENTERED"),
+        ),
+        (
+            "Allow FAKE-OUT SHORT PRIME",
+            "entered shorts plus blocked FAKE-OUT SHORT PRIME; all longs blocked",
+            lambda row: (
+                (_is_action(row, "ENTERED") and _is_short(row))
+                or (_is_action(row, "BLOCKED") and _is_fakeout_short_prime(row))
+            ),
+        ),
+        (
+            "Allow short daily-cap overflow",
+            "entered shorts plus short events blocked only by daily cap",
+            lambda row: (
+                (_is_action(row, "ENTERED") and _is_short(row))
+                or (_is_action(row, "BLOCKED") and _is_short_daily_cap(row))
+            ),
+        ),
+        (
+            "Allow PRIME fake-out + daily-cap shorts",
+            "entered shorts plus FAKE-OUT SHORT PRIME and short daily-cap blocks",
+            lambda row: (
+                (_is_action(row, "ENTERED") and _is_short(row))
+                or (
+                    _is_action(row, "BLOCKED")
+                    and _is_short(row)
+                    and (_is_fakeout_short_prime(row) or _is_short_daily_cap(row))
+                )
+            ),
+        ),
+        (
+            "STRONG SELL FLOW shorts only",
+            "all matching short events except earnings-window blocks",
+            lambda row: (
+                _is_short(row)
+                and _signal_has(row, "STRONG SELL FLOW")
+                and not _is_earnings_blocked(row)
+            ),
+        ),
+        (
+            "STRONG/ABSORPTION SELL shorts",
+            "all matching short events except earnings-window blocks",
+            lambda row: (
+                _is_short(row)
+                and (_signal_has(row, "STRONG SELL FLOW") or _signal_has(row, "ABSORPTION SELL"))
+                and not _is_earnings_blocked(row)
+            ),
+        ),
+        (
+            "All shorts except earnings windows",
+            "all entered/blocked short events except EARNINGS_TODAY and PRE_EARNINGS",
+            lambda row: _is_short(row) and not _is_earnings_blocked(row),
+        ),
+    ]
+
+
+def _new_ab_stats() -> dict[str, float]:
+    stats = _new_stats()
+    stats.update({"selected": 0.0, "missing": 0.0, "no_data": 0.0})
+    return stats
+
+
+def _score_event_rows(event_rows: list[dict[str, Any]], notional: float) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    for name, description, predicate in _scenario_specs():
+        horizon_stats = {horizon: _new_ab_stats() for horizon in EVENT_HORIZONS}
+        selected_rows = [row for row in event_rows if predicate(row)]
+        for row in selected_rows:
+            for horizon in EVENT_HORIZONS:
+                stats = horizon_stats[horizon]
+                stats["selected"] += 1
+                cell = str(row.get(f"{horizon}_cell") or "")
+                raw_return = row.get(f"{horizon}_return_pct")
+                if raw_return == "" or raw_return is None:
+                    if cell == "NO_DATA":
+                        stats["no_data"] += 1
+                    else:
+                        stats["missing"] += 1
+                    continue
+                pnl = notional * float(raw_return) / 100.0
+                _add_stat(stats, pnl)
+        results[name] = {
+            "description": description,
+            "selected": len(selected_rows),
+            "horizons": horizon_stats,
+        }
+    return results
+
+
+def _ab_line(horizon: str, stats: dict[str, float], baseline: dict[str, float] | None) -> str:
+    n = int(stats["n"])
+    selected = int(stats["selected"])
+    wr = (stats["wins"] / n * 100.0) if n else 0.0
+    avg = (stats["pnl"] / n) if n else 0.0
+    if baseline is None:
+        delta_text = "delta=n/a"
+        verdict = "baseline"
+    else:
+        delta = stats["pnl"] - baseline["pnl"]
+        delta_text = f"delta={_fmt_money(delta)}"
+        verdict = "improved" if delta > 0.01 else "hurt" if delta < -0.01 else "flat"
+    return (
+        f"    {horizon:<3} | selected={selected:<3} scored={n:<3} "
+        f"P&L={_fmt_money(stats['pnl'])} {delta_text} {verdict} | "
+        f"avg={_fmt_money(avg)} WR={wr:.1f}% | "
+        f"missing={int(stats['missing'])} no_data={int(stats['no_data'])}"
+    )
+
+
+def _scenario_lines(
+    results: dict[str, dict[str, Any]],
+    *,
+    primary_horizon: str,
+    notional: float,
+    scenario_limit: int,
+) -> list[str]:
+    lines = ["", f"Guardrail A/B Simulator (${notional:.0f}/event horizon-close proxy)"]
+    if not results:
+        lines.append("  None")
+        return lines
+
+    baseline_name = "Current guardrails (longs blocked)"
+    baseline = results.get(baseline_name, {}).get("horizons", {})
+    primary_baseline = baseline.get(primary_horizon)
+    ranking = sorted(
+        results.items(),
+        key=lambda item: item[1]["horizons"][primary_horizon]["pnl"],
+        reverse=True,
+    )
+
+    lines.append(f"Ranking by {primary_horizon} P&L vs {baseline_name}:")
+    for name, result in ranking[:scenario_limit]:
+        stats = result["horizons"][primary_horizon]
+        baseline_stats = None if name == baseline_name else primary_baseline
+        lines.append("  " + name)
+        lines.append(_ab_line(primary_horizon, stats, baseline_stats))
+    if len(ranking) > scenario_limit:
+        lines.append("  ...")
+
+    lines.append("")
+    lines.append("Scenario Details")
+    for name, result in results.items():
+        lines.append(f"  {name} - {result['description']}")
+        for horizon in EVENT_HORIZONS:
+            baseline_stats = None if name == baseline_name else baseline.get(horizon)
+            lines.append(_ab_line(horizon, result["horizons"][horizon], baseline_stats))
+    return lines
+
+
 def _summarize_actual_trades(
     conn: sqlite3.Connection,
     exits: list[sqlite3.Row],
@@ -600,6 +789,7 @@ def build_report(
     limit: int = 8,
     trade_limit: int = 30,
     event_limit: int = 24,
+    scenario_limit: int = 8,
 ) -> str:
     since_utc = _parse_since(since, days)
     state_db = Path(state_db).expanduser()
@@ -647,6 +837,7 @@ def build_report(
     if csv_path is not None:
         written = _write_event_csv(Path(csv_path), event_rows)
         csv_status = f"CSV exported: {Path(csv_path).expanduser()} ({written} rows)"
+    scenario_results = _score_event_rows(event_rows, notional)
 
     actual_total = actual["total"]
     blocked_proxy_pnl = sum(stats["pnl"] for stats in blocked_summary["by_category"].values())
@@ -712,6 +903,15 @@ def build_report(
         )
     )
 
+    lines.extend(
+        _scenario_lines(
+            scenario_results,
+            primary_horizon=horizon,
+            notional=notional,
+            scenario_limit=scenario_limit,
+        )
+    )
+
     lines.extend(_event_table_lines(event_rows, limit=event_limit))
 
     lines.append("")
@@ -725,6 +925,7 @@ def build_report(
     lines.append("  This is read-only research; it does not place orders or modify either SQLite DB.")
     lines.append("  Blocked what-if uses signal_outcomes forward returns, not broker TP/SL fill simulation.")
     lines.append("  Multi-horizon rows show direction-adjusted returns for the paper event direction.")
+    lines.append("  A/B scenarios score hypothetical allow/block rules from recorded entered and blocked events.")
     lines.append("  Use it to decide which guardrails deserve more data, tighter blocking, or a paper-only A/B test.")
     return "\n".join(lines)
 
@@ -738,6 +939,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--trade-limit", type=int, default=30)
     parser.add_argument("--event-limit", type=int, default=24)
+    parser.add_argument("--scenario-limit", type=int, default=8)
     parser.add_argument("--csv", type=Path, default=None, help="Optional path for full event-level CSV export")
     parser.add_argument("--state-db", type=Path, default=PAPER_STATE_DB_PATH)
     parser.add_argument("--signals-db", type=Path, default=SIGNALS_DB_PATH)
@@ -755,6 +957,7 @@ def main() -> int:
             limit=max(1, args.limit),
             trade_limit=max(1, args.trade_limit),
             event_limit=max(1, args.event_limit),
+            scenario_limit=max(1, args.scenario_limit),
         )
     )
     return 0
