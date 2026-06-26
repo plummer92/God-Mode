@@ -8,6 +8,7 @@ to either database. It is meant for research, not trade execution.
 from __future__ import annotations
 
 import argparse
+import csv
 import sqlite3
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -26,7 +27,9 @@ SIGNALS_DB_PATH = DATA_DIR / "wolfe_signals.db"
 DEFAULT_DAYS = 7
 DEFAULT_HORIZON = "1h"
 DEFAULT_NOTIONAL = 500.0
+FLAT_BAND_PCT = 0.05
 HORIZONS = ("5m", "15m", "30m", "1h", "1d")
+EVENT_HORIZONS = HORIZONS
 
 
 def _sqlite_ro_uri(path: Path) -> str:
@@ -208,6 +211,22 @@ def _fetch_signal_events(conn: sqlite3.Connection, since: str, action: str) -> l
     )
 
 
+def _fetch_all_signal_events(conn: sqlite3.Connection, since: str) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT id, created_at, signal_ts, symbol, signal_type, direction,
+                   action, reason, earnings_window, time_session, price, rvol
+            FROM paper_signal_events
+            WHERE created_at >= ?
+              AND action IN ('ENTERED', 'BLOCKED')
+            ORDER BY created_at ASC, id ASC
+            """,
+            (since,),
+        )
+    )
+
+
 def _lookup_outcome(
     conn: sqlite3.Connection,
     event: sqlite3.Row,
@@ -316,6 +335,137 @@ def _event_return_pct(event: sqlite3.Row, outcome: sqlite3.Row) -> float | None:
     if event_direction == "SHORT":
         return ((signal_price - target_price) / signal_price) * 100.0
     return ((target_price - signal_price) / signal_price) * 100.0
+
+
+def _classify_return(return_pct: float | None) -> str:
+    if return_pct is None:
+        return ""
+    if abs(return_pct) < FLAT_BAND_PCT:
+        return "FLAT"
+    return "WIN" if return_pct > 0 else "LOSS"
+
+
+def _event_horizon_outcome(
+    signals_conn: sqlite3.Connection | None,
+    event: sqlite3.Row,
+    horizon: str,
+) -> tuple[sqlite3.Row | None, float | None]:
+    if signals_conn is None:
+        return None, None
+    outcome = _lookup_outcome(signals_conn, event, horizon)
+    if outcome is None:
+        outcome = _lookup_any_direction_outcome(signals_conn, event, horizon)
+    if outcome is None:
+        return None, None
+    return outcome, _event_return_pct(event, outcome)
+
+
+def _format_outcome_cell(outcome: sqlite3.Row | None, return_pct: float | None) -> str:
+    if outcome is None:
+        return "MISSING"
+    raw_outcome = str(outcome["outcome"] or "UNKNOWN").upper()
+    if raw_outcome == "NO_DATA":
+        return raw_outcome
+    adjusted_outcome = _classify_return(return_pct)
+    if return_pct is None or not adjusted_outcome:
+        return raw_outcome
+    return f"{return_pct:+.2f}%/{adjusted_outcome}"
+
+
+def _build_event_rows(
+    signals_conn: sqlite3.Connection | None,
+    events: list[sqlite3.Row],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for event in events:
+        row: dict[str, Any] = {
+            "id": event["id"],
+            "created_at": event["created_at"],
+            "signal_ts": event["signal_ts"],
+            "symbol": _normalize_key(event["symbol"]),
+            "signal_type": _normalize_key(event["signal_type"]),
+            "direction": _normalize_key(event["direction"]),
+            "action": _normalize_key(event["action"]),
+            "reason": _clean_label(event["reason"]),
+            "reason_category": _reason_category(event["reason"]) if event["action"] == "BLOCKED" else "",
+            "earnings_window": _normalize_key(event["earnings_window"]),
+            "time_session": _normalize_key(event["time_session"]),
+            "price": event["price"],
+            "rvol": event["rvol"],
+        }
+        for horizon in EVENT_HORIZONS:
+            outcome, return_pct = _event_horizon_outcome(signals_conn, event, horizon)
+            prefix = f"{horizon}_"
+            raw_outcome = "" if outcome is None else str(outcome["outcome"] or "")
+            adjusted_outcome = "" if str(raw_outcome).upper() == "NO_DATA" else _classify_return(return_pct)
+            row[f"{prefix}cell"] = _format_outcome_cell(outcome, return_pct)
+            row[f"{prefix}return_pct"] = "" if return_pct is None else round(return_pct, 6)
+            row[f"{prefix}outcome"] = adjusted_outcome
+            row[f"{prefix}raw_outcome"] = raw_outcome
+            row[f"{prefix}matched_direction"] = "" if outcome is None else str(outcome["direction"] or "")
+            row[f"{prefix}source"] = "" if outcome is None else str(outcome["source"] or "")
+            row[f"{prefix}target_ts"] = "" if outcome is None else str(outcome["target_ts"] or "")
+        rows.append(row)
+    return rows
+
+
+def _event_table_lines(event_rows: list[dict[str, Any]], limit: int) -> list[str]:
+    lines = ["", f"Multi-Horizon Event Table ({min(len(event_rows), limit)}/{len(event_rows)})"]
+    if not event_rows:
+        lines.append("  None")
+        return lines
+    for row in event_rows[-limit:]:
+        reason = row["reason_category"] or row["action"]
+        lines.append(
+            "  "
+            f"{str(row['created_at'])[:16]} | {row['action']:<7} | "
+            f"{row['symbol']} {row['direction']} | {row['signal_type']} | "
+            f"{row['earnings_window']}/{row['time_session']} | {reason}"
+        )
+        lines.append(
+            "    "
+            + " | ".join(f"{h}={row[f'{h}_cell']}" for h in EVENT_HORIZONS)
+        )
+    return lines
+
+
+def _write_event_csv(path: Path, event_rows: list[dict[str, Any]]) -> int:
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    base_fields = [
+        "id",
+        "created_at",
+        "signal_ts",
+        "symbol",
+        "signal_type",
+        "direction",
+        "action",
+        "reason_category",
+        "reason",
+        "earnings_window",
+        "time_session",
+        "price",
+        "rvol",
+    ]
+    horizon_fields: list[str] = []
+    for horizon in EVENT_HORIZONS:
+        horizon_fields.extend(
+            [
+                f"{horizon}_cell",
+                f"{horizon}_return_pct",
+                f"{horizon}_outcome",
+                f"{horizon}_raw_outcome",
+                f"{horizon}_matched_direction",
+                f"{horizon}_source",
+                f"{horizon}_target_ts",
+            ]
+        )
+    fieldnames = base_fields + horizon_fields
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(event_rows)
+    return len(event_rows)
 
 
 def _summarize_actual_trades(
@@ -446,8 +596,10 @@ def build_report(
     notional: float = DEFAULT_NOTIONAL,
     state_db: Path = PAPER_STATE_DB_PATH,
     signals_db: Path = SIGNALS_DB_PATH,
+    csv_path: Path | None = None,
     limit: int = 8,
     trade_limit: int = 30,
+    event_limit: int = 24,
 ) -> str:
     since_utc = _parse_since(since, days)
     state_db = Path(state_db).expanduser()
@@ -466,10 +618,12 @@ def build_report(
         exits = _fetch_closed_exits(state_conn, since_utc)
         entered = _fetch_signal_events(state_conn, since_utc, "ENTERED")
         blocked = _fetch_signal_events(state_conn, since_utc, "BLOCKED")
+        events = _fetch_all_signal_events(state_conn, since_utc)
         actual, trade_lines = _summarize_actual_trades(state_conn, exits)
 
         signals_conn = None
         signals_status = f"missing at {signals_db}"
+        event_rows: list[dict[str, Any]] = []
         try:
             if signals_db.exists():
                 signals_conn = _connect_ro(signals_db)
@@ -484,9 +638,15 @@ def build_report(
                 horizon=horizon,
                 notional=notional,
             )
+            event_rows = _build_event_rows(signals_conn, events)
         finally:
             if signals_conn is not None:
                 signals_conn.close()
+
+    csv_status = ""
+    if csv_path is not None:
+        written = _write_event_csv(Path(csv_path), event_rows)
+        csv_status = f"CSV exported: {Path(csv_path).expanduser()} ({written} rows)"
 
     actual_total = actual["total"]
     blocked_proxy_pnl = sum(stats["pnl"] for stats in blocked_summary["by_category"].values())
@@ -500,6 +660,7 @@ def build_report(
         f"Window since: {since_utc} UTC",
         f"State DB: {state_db}",
         f"Signal outcomes DB: {signals_status}",
+        *([csv_status] if csv_status else []),
         "",
         "Actual Entered Trades",
         f"  entered={len(entered)} | closed={len(exits)} | blocked={len(blocked)}",
@@ -551,6 +712,8 @@ def build_report(
         )
     )
 
+    lines.extend(_event_table_lines(event_rows, limit=event_limit))
+
     lines.append("")
     lines.append(f"Closed Trade Detail ({min(len(trade_lines), trade_limit)}/{len(trade_lines)})")
     lines.extend(trade_lines[:trade_limit] or ["  None"])
@@ -561,6 +724,7 @@ def build_report(
     lines.append("Read This As")
     lines.append("  This is read-only research; it does not place orders or modify either SQLite DB.")
     lines.append("  Blocked what-if uses signal_outcomes forward returns, not broker TP/SL fill simulation.")
+    lines.append("  Multi-horizon rows show direction-adjusted returns for the paper event direction.")
     lines.append("  Use it to decide which guardrails deserve more data, tighter blocking, or a paper-only A/B test.")
     return "\n".join(lines)
 
@@ -573,6 +737,8 @@ def main() -> int:
     parser.add_argument("--notional", type=float, default=DEFAULT_NOTIONAL)
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--trade-limit", type=int, default=30)
+    parser.add_argument("--event-limit", type=int, default=24)
+    parser.add_argument("--csv", type=Path, default=None, help="Optional path for full event-level CSV export")
     parser.add_argument("--state-db", type=Path, default=PAPER_STATE_DB_PATH)
     parser.add_argument("--signals-db", type=Path, default=SIGNALS_DB_PATH)
     args = parser.parse_args()
@@ -585,8 +751,10 @@ def main() -> int:
             notional=max(1.0, args.notional),
             state_db=args.state_db,
             signals_db=args.signals_db,
+            csv_path=args.csv,
             limit=max(1, args.limit),
             trade_limit=max(1, args.trade_limit),
+            event_limit=max(1, args.event_limit),
         )
     )
     return 0
