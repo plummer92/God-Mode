@@ -72,6 +72,7 @@ WILD_BLACKLIST = {
     "LABU", "LABD", "FNGU", "FNGD", "KOLD", "BOIL",
 }
 PAPER_RESEARCH_GUARDRAILS_ENABLED = env_bool("PAPER_RESEARCH_GUARDRAILS_ENABLED", True)
+PAPER_BLOCK_ALL_LONGS = env_bool("PAPER_BLOCK_ALL_LONGS", True)
 PAPER_BLOCK_EARNINGS_WINDOWS = {
     item.strip().upper()
     for item in os.getenv("PAPER_BLOCK_EARNINGS_WINDOWS", "EARNINGS_TODAY,PRE_EARNINGS").split(",")
@@ -610,6 +611,8 @@ def paper_research_guardrail_reason(
         and session in PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS
     ):
         return f"research guardrail: fake-out short blocked in session={session}"
+    if direction == "LONG" and PAPER_BLOCK_ALL_LONGS:
+        return "research guardrail: all long paper entries disabled"
     if direction == "LONG" and "FAKE-OUT" in signal_text and earnings == "CLEAR" and session == "PRIME":
         return None
     if direction == "LONG" and any(term in signal_text for term in PAPER_BLOCK_LONG_SIGNAL_TERMS):
@@ -1202,14 +1205,21 @@ def _run():
     )
 
     if PAPER_RESEARCH_GUARDRAILS_ENABLED:
+        long_policy = (
+            "all long entries disabled"
+            if PAPER_BLOCK_ALL_LONGS
+            else (
+                f"block long terms={','.join(PAPER_BLOCK_LONG_SIGNAL_TERMS)} | "
+                "allow FAKE-OUT LONG only when earnings=CLEAR session=PRIME"
+            )
+        )
         guardrail_msg = (
             "PAPER RESEARCH GUARDRAILS ACTIVE | "
             f"block earnings={','.join(sorted(PAPER_BLOCK_EARNINGS_WINDOWS))} | "
             f"block fake-out short sessions={','.join(sorted(PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS)) or 'none'} | "
-            f"block long terms={','.join(PAPER_BLOCK_LONG_SIGNAL_TERMS)} | "
+            f"{long_policy} | "
             f"recent loser cooldown={PAPER_RECENT_LOSER_MIN_TRADES} trades/"
-            f"{PAPER_RECENT_LOSER_DAYS}d <= ${PAPER_RECENT_LOSER_MAX_PNL:.2f} | "
-            "allow FAKE-OUT LONG only when earnings=CLEAR session=PRIME"
+            f"{PAPER_RECENT_LOSER_DAYS}d <= ${PAPER_RECENT_LOSER_MAX_PNL:.2f}"
         )
         log(guardrail_msg)
         post_discord(guardrail_msg)
