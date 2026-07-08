@@ -59,7 +59,12 @@ PAPER_RECENT_LOSER_MIN_TRADES = int(os.getenv("PAPER_RECENT_LOSER_MIN_TRADES", "
 PAPER_RECENT_LOSER_MAX_PNL = float(os.getenv("PAPER_RECENT_LOSER_MAX_PNL", "-5.0"))
 PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS = {
     item.strip().upper()
-    for item in os.getenv("PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS", "PRIME").split(",")
+    for item in os.getenv("PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS", "").split(",")
+    if item.strip()
+}
+PAPER_ALLOW_FAKEOUT_SHORT_SESSIONS = {
+    item.strip().upper()
+    for item in os.getenv("PAPER_ALLOW_FAKEOUT_SHORT_SESSIONS", "PRIME,PRE").split(",")
     if item.strip()
 }
 
@@ -611,6 +616,13 @@ def paper_research_guardrail_reason(
         and session in PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS
     ):
         return f"research guardrail: fake-out short blocked in session={session}"
+    if (
+        direction == "SHORT"
+        and "FAKE-OUT" in signal_text
+        and PAPER_ALLOW_FAKEOUT_SHORT_SESSIONS
+        and session not in PAPER_ALLOW_FAKEOUT_SHORT_SESSIONS
+    ):
+        return f"research guardrail: fake-out short blocked outside allowed sessions session={session}"
     if direction == "LONG" and PAPER_BLOCK_ALL_LONGS:
         return "research guardrail: all long paper entries disabled"
     if direction == "LONG" and "FAKE-OUT" in signal_text and earnings == "CLEAR" and session == "PRIME":
@@ -665,10 +677,12 @@ def paper_signal_rank(signal_type: str, direction: str | None, earnings_window: 
         rank = 0
     elif direction == "SHORT" and "ABSORPTION SELL" in signal_text:
         rank = 1
-    elif direction == "SHORT" and "FAKE-OUT" in signal_text and session == "NORMAL":
+    elif direction == "SHORT" and "FAKE-OUT" in signal_text and session == "PRIME":
         rank = 2
+    elif direction == "SHORT" and "FAKE-OUT" in signal_text and session == "PRE":
+        rank = 3
     elif direction == "SHORT" and "FAKE-OUT" in signal_text:
-        rank = 4
+        rank = 40
     elif direction == "SHORT":
         rank = 5
     elif direction == "LONG":
@@ -676,6 +690,14 @@ def paper_signal_rank(signal_type: str, direction: str | None, earnings_window: 
     if earnings in PAPER_BLOCK_EARNINGS_WINDOWS:
         rank += 50
     return rank
+
+
+def paper_ab_entry_label(signal_type: str, direction: str | None, time_session: str | None) -> str:
+    signal_text = str(signal_type or "").upper()
+    session = str(time_session or "UNKNOWN").upper()
+    if direction == "SHORT" and "FAKE-OUT" in signal_text and session == "PRIME":
+        return " | PAPER A/B TEST | FAKE-OUT SHORT PRIME"
+    return ""
 
 
 def paper_signal_sort_key(row):
@@ -1109,7 +1131,14 @@ def can_open_new_positions_now():
     return now_et < close_time
 
 
-def execute_signal(client, symbol: str, price: float, signal: str, direction: str):
+def execute_signal(
+    client,
+    symbol: str,
+    price: float,
+    signal: str,
+    direction: str,
+    time_session: str | None = None,
+):
     try:
         if not is_tradable_symbol(symbol):
             log(f"SKIP {symbol}: not tradable via Alpaca paper")
@@ -1143,8 +1172,12 @@ def execute_signal(client, symbol: str, price: float, signal: str, direction: st
                 time_in_force=TimeInForce.DAY,
             )
         )
-        log(f"{direction} ENTERED: {symbol} ${TRADE_NOTIONAL:.2f} | {signal}")
-        post_discord(f"📄 PAPER {direction} ENTERED | {symbol} @ ~${price:.2f} | {signal} | ${TRADE_NOTIONAL:.0f} notional")
+        ab_label = paper_ab_entry_label(signal, direction, time_session)
+        log(f"{direction} ENTERED: {symbol} ${TRADE_NOTIONAL:.2f} | {signal}{ab_label}")
+        post_discord(
+            f"📄 PAPER {direction} ENTERED | {symbol} @ ~${price:.2f} | "
+            f"{signal}{ab_label} | ${TRADE_NOTIONAL:.0f} notional"
+        )
         return True
     except Exception as e:
         log(f"ENTRY FAIL {symbol} {direction}: {e}")
@@ -1216,7 +1249,8 @@ def _run():
         guardrail_msg = (
             "PAPER RESEARCH GUARDRAILS ACTIVE | "
             f"block earnings={','.join(sorted(PAPER_BLOCK_EARNINGS_WINDOWS))} | "
-            f"block fake-out short sessions={','.join(sorted(PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS)) or 'none'} | "
+            f"allow fake-out short sessions={','.join(sorted(PAPER_ALLOW_FAKEOUT_SHORT_SESSIONS)) or 'none'} | "
+            f"explicit block fake-out short sessions={','.join(sorted(PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS)) or 'none'} | "
             f"{long_policy} | "
             f"recent loser cooldown={PAPER_RECENT_LOSER_MIN_TRADES} trades/"
             f"{PAPER_RECENT_LOSER_DAYS}d <= ${PAPER_RECENT_LOSER_MAX_PNL:.2f}"
@@ -1392,7 +1426,14 @@ def _run():
                         mark_signal_processed(signal_key, signal_ts, sym_upper, signal_type, direction)
                         continue
 
-                    if execute_signal(client, sym_upper, float(price), signal_type, direction):
+                    if execute_signal(
+                        client,
+                        sym_upper,
+                        float(price),
+                        signal_type,
+                        direction,
+                        time_session=time_session,
+                    ):
                         log_paper_signal_event(
                             signal_ts,
                             sym_upper,
