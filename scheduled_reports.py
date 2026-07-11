@@ -34,6 +34,7 @@ PAPER_AB_REPORT_TIME_ET = os.getenv("PAPER_AB_REPORT_TIME_ET", "16:25")
 PAPER_AB_REPORT_SINCE = os.getenv("PAPER_AB_REPORT_SINCE", "2026-06-20")
 PAPER_AB_REPORT_HORIZON = os.getenv("PAPER_AB_REPORT_HORIZON", "1h")
 PAPER_AB_REPORT_DAYS = int(os.getenv("PAPER_AB_REPORT_DAYS", "7"))
+PAPER_AB_REPORT_MIN_SAMPLE = int(os.getenv("PAPER_AB_REPORT_MIN_SAMPLE", "10"))
 PAPER_REVIEW_ENABLED = os.getenv("PAPER_REVIEW_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 PAPER_REVIEW_DAY_ET = int(os.getenv("PAPER_REVIEW_DAY_ET", "5"))  # Monday=0, Saturday=5
 PAPER_REVIEW_TIME_ET = os.getenv("PAPER_REVIEW_TIME_ET", "11:00")
@@ -135,6 +136,7 @@ def run_forever() -> None:
                     since=PAPER_AB_REPORT_SINCE,
                     days=PAPER_AB_REPORT_DAYS,
                     horizon=PAPER_AB_REPORT_HORIZON,
+                    min_sample=PAPER_AB_REPORT_MIN_SAMPLE,
                 ),
             )
         elif PAPER_REVIEW_ENABLED and now.weekday() == PAPER_REVIEW_DAY_ET and hour_minute == PAPER_REVIEW_TIME_ET:

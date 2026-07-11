@@ -744,12 +744,63 @@ def _primary_verdict(delta: float) -> str:
     return "keep"
 
 
+def _closed_entry_stats(
+    *,
+    since_utc: str,
+    state_db: Path,
+    signal_term: str,
+    direction: str,
+    sessions: set[str],
+) -> dict[str, float]:
+    stats = _new_stats()
+    state_db = Path(state_db).expanduser()
+    if not state_db.exists():
+        return stats
+
+    with _connect_ro(state_db) as conn:
+        if not _table_exists(conn, "exit_events") or not _table_exists(conn, "paper_signal_events"):
+            return stats
+        for exit_row in _fetch_closed_exits(conn, since_utc):
+            entry = _entry_for_exit(conn, str(exit_row["symbol"]), str(exit_row["created_at"]))
+            if entry is None:
+                continue
+            signal_text = str(entry["signal_type"] or "").upper()
+            entry_direction = str(entry["direction"] or "").upper()
+            entry_session = str(entry["time_session"] or "UNKNOWN").upper()
+            if signal_term.upper() not in signal_text:
+                continue
+            if entry_direction != direction.upper():
+                continue
+            if entry_session not in sessions:
+                continue
+            _add_stat(stats, float(exit_row["pnl_usd"] or 0.0))
+    return stats
+
+
+def _actual_sample_line(label: str, stats: dict[str, float], min_sample: int) -> str:
+    n = int(stats["n"])
+    wr = (stats["wins"] / n * 100.0) if n else 0.0
+    if n < min_sample:
+        verdict = "too early, keep collecting"
+    elif stats["pnl"] > 0:
+        verdict = "sample ready and green"
+    elif stats["pnl"] < 0:
+        verdict = "sample ready but negative"
+    else:
+        verdict = "sample ready but flat"
+    return (
+        f"{label}: {_fmt_money(stats['pnl'])} actual, n={n}, "
+        f"WR={wr:.1f}% - {verdict}"
+    )
+
+
 def build_guardrail_ab_summary(
     *,
     since: str | None = None,
     days: int = DEFAULT_DAYS,
     horizon: str = DEFAULT_HORIZON,
     notional: float = DEFAULT_NOTIONAL,
+    min_sample: int = 10,
     state_db: Path = PAPER_STATE_DB_PATH,
     signals_db: Path = SIGNALS_DB_PATH,
 ) -> str:
@@ -781,6 +832,20 @@ def build_guardrail_ab_summary(
     daily_cap_delta = _scenario_delta(results, daily_cap, horizon)
     long_block_delta = baseline_stats["pnl"] - _scenario_stats(results, actual, horizon)["pnl"]
     combo_delta = _scenario_delta(results, combo, horizon)
+    fakeout_prime_actual = _closed_entry_stats(
+        since_utc=since_utc,
+        state_db=Path(state_db),
+        signal_term="FAKE-OUT",
+        direction="SHORT",
+        sessions={"PRIME"},
+    )
+    fakeout_pre_actual = _closed_entry_stats(
+        since_utc=since_utc,
+        state_db=Path(state_db),
+        signal_term="FAKE-OUT",
+        direction="SHORT",
+        sessions={"PRE"},
+    )
 
     if fakeout_delta > 25 and _scenario_delta(results, fakeout, "5m") < 0:
         fakeout_action = "consider paper-only test for 1h+ holds, not 5m scalps"
@@ -813,6 +878,8 @@ def build_guardrail_ab_summary(
             f"{horizon} P&L={_fmt_money(baseline_stats['pnl'])}"
         ),
         f"FAKE-OUT SHORT PRIME: {_delta_summary(results, fakeout)} | {fakeout_action}",
+        _actual_sample_line("FAKE-OUT SHORT PRIME actual", fakeout_prime_actual, min_sample),
+        _actual_sample_line("FAKE-OUT SHORT PRE actual", fakeout_pre_actual, min_sample),
         f"Daily cap overflow: {_delta_summary(results, daily_cap)} | {daily_cap_action}",
         f"Long block: {_delta_summary(results, baseline, baseline=actual)} | {long_action}",
         f"PRIME fake-out + daily-cap shorts: {_delta_summary(results, combo)} | {_primary_verdict(combo_delta)}",
@@ -1107,6 +1174,7 @@ def main() -> int:
     parser.add_argument("--trade-limit", type=int, default=30)
     parser.add_argument("--event-limit", type=int, default=24)
     parser.add_argument("--scenario-limit", type=int, default=8)
+    parser.add_argument("--min-sample", type=int, default=10)
     parser.add_argument("--csv", type=Path, default=None, help="Optional path for full event-level CSV export")
     parser.add_argument("--state-db", type=Path, default=PAPER_STATE_DB_PATH)
     parser.add_argument("--signals-db", type=Path, default=SIGNALS_DB_PATH)
@@ -1120,6 +1188,7 @@ def main() -> int:
                 days=max(1, args.days),
                 horizon=args.horizon,
                 notional=max(1.0, args.notional),
+                min_sample=max(1, args.min_sample),
                 state_db=args.state_db,
                 signals_db=args.signals_db,
             )
