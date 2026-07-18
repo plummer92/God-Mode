@@ -64,7 +64,7 @@ PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS = {
 }
 PAPER_ALLOW_FAKEOUT_SHORT_SESSIONS = {
     item.strip().upper()
-    for item in os.getenv("PAPER_ALLOW_FAKEOUT_SHORT_SESSIONS", "PRIME,PRE").split(",")
+    for item in os.getenv("PAPER_ALLOW_FAKEOUT_SHORT_SESSIONS", "").split(",")
     if item.strip()
 }
 
@@ -616,6 +616,8 @@ def paper_research_guardrail_reason(
         and session in PAPER_BLOCK_FAKEOUT_SHORT_SESSIONS
     ):
         return f"research guardrail: fake-out short blocked in session={session}"
+    if direction == "SHORT" and "FAKE-OUT" in signal_text and not PAPER_ALLOW_FAKEOUT_SHORT_SESSIONS:
+        return "research guardrail: all fake-out short paper entries disabled"
     if (
         direction == "SHORT"
         and "FAKE-OUT" in signal_text
