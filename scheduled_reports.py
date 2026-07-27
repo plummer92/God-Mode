@@ -14,6 +14,7 @@ from backtest_signals import build_report as build_backtest_report
 from paper_trade_lab import build_guardrail_ab_summary
 from paper_trade_review import build_report as build_paper_trade_review
 from reporting import build_daily_report, build_morning_brief, now_et, post_to_discord
+from signal_score_lab import build_report as build_signal_score_report
 
 
 STATE_PATH = DATA_DIR / "report_schedule_state.json"
@@ -35,6 +36,14 @@ PAPER_AB_REPORT_SINCE = os.getenv("PAPER_AB_REPORT_SINCE", "2026-06-20")
 PAPER_AB_REPORT_HORIZON = os.getenv("PAPER_AB_REPORT_HORIZON", "1h")
 PAPER_AB_REPORT_DAYS = int(os.getenv("PAPER_AB_REPORT_DAYS", "7"))
 PAPER_AB_REPORT_MIN_SAMPLE = int(os.getenv("PAPER_AB_REPORT_MIN_SAMPLE", "10"))
+SIGNAL_SCORE_REPORT_ENABLED = os.getenv("SIGNAL_SCORE_REPORT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+SIGNAL_SCORE_REPORT_TIME_ET = os.getenv("SIGNAL_SCORE_REPORT_TIME_ET", "16:30")
+SIGNAL_SCORE_REPORT_SINCE = os.getenv("SIGNAL_SCORE_REPORT_SINCE", "2026-05-24 14:52:00")
+SIGNAL_SCORE_REPORT_HORIZON = os.getenv("SIGNAL_SCORE_REPORT_HORIZON", "1h")
+SIGNAL_SCORE_REPORT_MIN_SAMPLE = int(os.getenv("SIGNAL_SCORE_REPORT_MIN_SAMPLE", "25"))
+SIGNAL_SCORE_REPORT_RECENT_LIMIT = int(os.getenv("SIGNAL_SCORE_REPORT_RECENT_LIMIT", "12"))
+SIGNAL_SCORE_SLIPPAGE_BPS = float(os.getenv("SIGNAL_SCORE_SLIPPAGE_BPS", "2"))
+SIGNAL_SCORE_SPREAD_BPS = float(os.getenv("SIGNAL_SCORE_SPREAD_BPS", "3"))
 PAPER_REVIEW_ENABLED = os.getenv("PAPER_REVIEW_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 PAPER_REVIEW_DAY_ET = int(os.getenv("PAPER_REVIEW_DAY_ET", "5"))  # Monday=0, Saturday=5
 PAPER_REVIEW_TIME_ET = os.getenv("PAPER_REVIEW_TIME_ET", "11:00")
@@ -137,6 +146,19 @@ def run_forever() -> None:
                     days=PAPER_AB_REPORT_DAYS,
                     horizon=PAPER_AB_REPORT_HORIZON,
                     min_sample=PAPER_AB_REPORT_MIN_SAMPLE,
+                ),
+            )
+        elif SIGNAL_SCORE_REPORT_ENABLED and hour_minute == SIGNAL_SCORE_REPORT_TIME_ET:
+            _maybe_send(
+                "signal_score_report",
+                trade_date,
+                lambda: build_signal_score_report(
+                    since=SIGNAL_SCORE_REPORT_SINCE,
+                    horizon=SIGNAL_SCORE_REPORT_HORIZON,
+                    min_sample=SIGNAL_SCORE_REPORT_MIN_SAMPLE,
+                    recent_limit=SIGNAL_SCORE_REPORT_RECENT_LIMIT,
+                    slippage_bps=SIGNAL_SCORE_SLIPPAGE_BPS,
+                    spread_bps=SIGNAL_SCORE_SPREAD_BPS,
                 ),
             )
         elif PAPER_REVIEW_ENABLED and now.weekday() == PAPER_REVIEW_DAY_ET and hour_minute == PAPER_REVIEW_TIME_ET:
