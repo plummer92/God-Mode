@@ -13,7 +13,7 @@ import sqlite3
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -30,6 +30,7 @@ DEFAULT_NOTIONAL = 500.0
 FLAT_BAND_PCT = 0.05
 HORIZONS = ("5m", "15m", "30m", "1h", "1d")
 EVENT_HORIZONS = HORIZONS
+DEFAULT_COST_BPS = 7.0
 
 
 def _sqlite_ro_uri(path: Path) -> str:
@@ -476,6 +477,10 @@ def _is_short(row: dict[str, Any]) -> bool:
     return str(row.get("direction") or "").upper() == "SHORT"
 
 
+def _is_long(row: dict[str, Any]) -> bool:
+    return str(row.get("direction") or "").upper() == "LONG"
+
+
 def _signal_has(row: dict[str, Any], term: str) -> bool:
     return term.upper() in str(row.get("signal_type") or "").upper()
 
@@ -496,6 +501,26 @@ def _is_fakeout_short_prime(row: dict[str, Any]) -> bool:
 
 def _is_short_daily_cap(row: dict[str, Any]) -> bool:
     return _is_short(row) and str(row.get("reason_category") or "") == "daily entry cap"
+
+
+def _is_entered_short(row: dict[str, Any]) -> bool:
+    return _is_action(row, "ENTERED") and _is_short(row)
+
+
+def _is_any_short_candidate(row: dict[str, Any]) -> bool:
+    return _is_short(row) and not _is_earnings_blocked(row)
+
+
+def _is_fakeout_short(row: dict[str, Any]) -> bool:
+    return _is_short(row) and _signal_has(row, "FAKE-OUT")
+
+
+def _is_fakeout_short_session(row: dict[str, Any], sessions: set[str]) -> bool:
+    return _is_fakeout_short(row) and str(row.get("time_session") or "").upper() in sessions
+
+
+def _is_blocked_long(row: dict[str, Any]) -> bool:
+    return _is_action(row, "BLOCKED") and _is_long(row)
 
 
 def _scenario_specs():
@@ -564,6 +589,77 @@ def _scenario_specs():
     ]
 
 
+def _shadow_policy_specs() -> list[tuple[str, str, Callable[[dict[str, Any]], bool]]]:
+    return [
+        (
+            "Current live paper shorts",
+            "actual entered short events under the deployed guardrails",
+            lambda row: _is_entered_short(row),
+        ),
+        (
+            "All entered trades",
+            "actual entered events, including any historical longs",
+            lambda row: _is_action(row, "ENTERED"),
+        ),
+        (
+            "No FAKE-OUT shorts",
+            "short candidates except fake-out and earnings-window blocks",
+            lambda row: _is_any_short_candidate(row) and not _is_fakeout_short(row),
+        ),
+        (
+            "FAKE-OUT SHORT PRIME only",
+            "fake-out shorts in PRIME, including blocked shadow events",
+            lambda row: _is_fakeout_short_session(row, {"PRIME"}) and not _is_earnings_blocked(row),
+        ),
+        (
+            "FAKE-OUT SHORT PRE only",
+            "fake-out shorts in PRE, including blocked shadow events",
+            lambda row: _is_fakeout_short_session(row, {"PRE"}) and not _is_earnings_blocked(row),
+        ),
+        (
+            "FAKE-OUT SHORT NORMAL only",
+            "fake-out shorts in NORMAL, including blocked shadow events",
+            lambda row: _is_fakeout_short_session(row, {"NORMAL"}) and not _is_earnings_blocked(row),
+        ),
+        (
+            "STRONG SELL FLOW only",
+            "strong sell-flow shorts except earnings-window blocks",
+            lambda row: _is_any_short_candidate(row) and _signal_has(row, "STRONG SELL FLOW"),
+        ),
+        (
+            "ABSORPTION SELL only",
+            "absorption-sell shorts except earnings-window blocks",
+            lambda row: _is_any_short_candidate(row) and _signal_has(row, "ABSORPTION SELL"),
+        ),
+        (
+            "CLIMAX shorts only",
+            "climax shorts except earnings-window blocks",
+            lambda row: _is_any_short_candidate(row) and _signal_has(row, "CLIMAX"),
+        ),
+        (
+            "No EOD short entries",
+            "short candidates except EOD and earnings-window blocks",
+            lambda row: _is_any_short_candidate(row) and not _session_is(row, "EOD"),
+        ),
+        (
+            "PRIME/NORMAL shorts",
+            "short candidates in PRIME or NORMAL except earnings-window blocks",
+            lambda row: _is_any_short_candidate(row)
+            and str(row.get("time_session") or "").upper() in {"PRIME", "NORMAL"},
+        ),
+        (
+            "All shorts except earnings",
+            "all entered/blocked short events except EARNINGS_TODAY and PRE_EARNINGS",
+            lambda row: _is_any_short_candidate(row),
+        ),
+        (
+            "Blocked longs shadow",
+            "long events blocked by current guardrails, for opportunity-cost monitoring only",
+            lambda row: _is_blocked_long(row),
+        ),
+    ]
+
+
 def _new_ab_stats() -> dict[str, float]:
     stats = _new_stats()
     stats.update({"selected": 0.0, "missing": 0.0, "no_data": 0.0})
@@ -588,6 +684,40 @@ def _score_event_rows(event_rows: list[dict[str, Any]], notional: float) -> dict
                         stats["missing"] += 1
                     continue
                 pnl = notional * float(raw_return) / 100.0
+                _add_stat(stats, pnl)
+        results[name] = {
+            "description": description,
+            "selected": len(selected_rows),
+            "horizons": horizon_stats,
+        }
+    return results
+
+
+def _score_shadow_policy_rows(
+    event_rows: list[dict[str, Any]],
+    *,
+    notional: float,
+    cost_bps: float,
+) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    cost_pct = max(0.0, cost_bps) / 100.0
+    for name, description, predicate in _shadow_policy_specs():
+        horizon_stats = {horizon: _new_ab_stats() for horizon in EVENT_HORIZONS}
+        selected_rows = [row for row in event_rows if predicate(row)]
+        for row in selected_rows:
+            for horizon in EVENT_HORIZONS:
+                stats = horizon_stats[horizon]
+                stats["selected"] += 1
+                cell = str(row.get(f"{horizon}_cell") or "")
+                raw_return = row.get(f"{horizon}_return_pct")
+                if raw_return == "" or raw_return is None:
+                    if cell == "NO_DATA":
+                        stats["no_data"] += 1
+                    else:
+                        stats["missing"] += 1
+                    continue
+                net_return = float(raw_return) - cost_pct
+                pnl = notional * net_return / 100.0
                 _add_stat(stats, pnl)
         results[name] = {
             "description": description,
@@ -792,6 +922,219 @@ def _actual_sample_line(label: str, stats: dict[str, float], min_sample: int) ->
         f"{label}: {_fmt_money(stats['pnl'])} actual, n={n}, "
         f"WR={wr:.1f}% - {verdict}"
     )
+
+
+def _filter_event_rows_since(event_rows: list[dict[str, Any]], since_utc: str) -> list[dict[str, Any]]:
+    threshold = since_utc.replace("T", " ")[:19]
+    return [row for row in event_rows if str(row.get("created_at") or "")[:19] >= threshold]
+
+
+def _shadow_policy_line(
+    name: str,
+    stats: dict[str, float],
+    *,
+    baseline: dict[str, float] | None,
+    min_sample: int,
+) -> str:
+    selected = int(stats["selected"])
+    scored = int(stats["n"])
+    wr = (stats["wins"] / scored * 100.0) if scored else 0.0
+    avg = (stats["pnl"] / scored) if scored else 0.0
+    if baseline is None:
+        delta_text = "baseline"
+    else:
+        delta_text = f"delta={_fmt_money(stats['pnl'] - baseline['pnl'])}"
+    if scored < min_sample:
+        sample_text = "too early"
+    elif stats["pnl"] > 0:
+        sample_text = "green"
+    elif stats["pnl"] < 0:
+        sample_text = "red"
+    else:
+        sample_text = "flat"
+    return (
+        f"  {name}: selected={selected} scored={scored} "
+        f"P&L={_fmt_money(stats['pnl'])} {delta_text} | "
+        f"avg={_fmt_money(avg)} WR={wr:.1f}% | {sample_text}"
+    )
+
+
+def _shadow_leaderboard_lines(
+    title: str,
+    results: dict[str, dict[str, Any]],
+    *,
+    horizon: str,
+    limit: int,
+    min_sample: int,
+) -> list[str]:
+    lines = ["", title]
+    if not results:
+        lines.append("  None")
+        return lines
+    baseline_name = "Current live paper shorts"
+    baseline_stats = results.get(baseline_name, {}).get("horizons", {}).get(horizon)
+    ranked = sorted(
+        results.items(),
+        key=lambda item: (
+            item[1]["horizons"][horizon]["pnl"],
+            item[1]["horizons"][horizon]["n"],
+        ),
+        reverse=True,
+    )
+    lines.append(f"  Ranked by {horizon} net proxy P&L after costs")
+    for name, result in ranked[:limit]:
+        stats = result["horizons"][horizon]
+        baseline = None if name == baseline_name else baseline_stats
+        lines.append(_shadow_policy_line(name, stats, baseline=baseline, min_sample=min_sample))
+    if len(ranked) > limit:
+        lines.append("  ...")
+    return lines
+
+
+def _shadow_multi_horizon_lines(
+    title: str,
+    results: dict[str, dict[str, Any]],
+    *,
+    names: list[str],
+    min_sample: int,
+) -> list[str]:
+    lines = ["", title]
+    for name in names:
+        result = results.get(name)
+        if not result:
+            continue
+        pieces: list[str] = []
+        for horizon in EVENT_HORIZONS:
+            stats = result["horizons"][horizon]
+            scored = int(stats["n"])
+            tag = "early" if scored < min_sample else "ok"
+            pieces.append(f"{horizon}:{_fmt_money(stats['pnl'])}/n={scored}/{tag}")
+        lines.append(f"  {name}: " + " | ".join(pieces))
+    if len(lines) == 2:
+        lines.append("  None")
+    return lines
+
+
+def _best_shadow_candidate(
+    results: dict[str, dict[str, Any]],
+    *,
+    horizon: str,
+    min_sample: int,
+) -> tuple[str, dict[str, float]] | None:
+    candidates: list[tuple[str, dict[str, float]]] = []
+    for name, result in results.items():
+        if name == "Current live paper shorts":
+            continue
+        stats = result["horizons"][horizon]
+        if stats["n"] >= min_sample:
+            candidates.append((name, stats))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[1]["pnl"])
+
+
+def build_shadow_policy_report(
+    *,
+    since: str | None = None,
+    days: int = 30,
+    recent_days: int = 7,
+    horizon: str = DEFAULT_HORIZON,
+    notional: float = DEFAULT_NOTIONAL,
+    min_sample: int = 25,
+    limit: int = 8,
+    cost_bps: float = DEFAULT_COST_BPS,
+    state_db: Path = PAPER_STATE_DB_PATH,
+    signals_db: Path = SIGNALS_DB_PATH,
+) -> str:
+    if horizon not in HORIZONS:
+        raise ValueError(f"Unsupported horizon {horizon!r}; choose one of {', '.join(HORIZONS)}")
+
+    since_utc = _parse_since(since, days)
+    recent_since_utc = _parse_since(None, max(1, recent_days))
+    event_rows, signals_status = _load_event_rows(
+        since_utc=since_utc,
+        state_db=Path(state_db),
+        signals_db=Path(signals_db),
+    )
+    if not event_rows:
+        return (
+            "Paper Shadow Policy Lab\n"
+            f"Since: {since_utc} UTC\n"
+            f"No paper signal events found ({signals_status})."
+        )
+
+    recent_rows = _filter_event_rows_since(event_rows, recent_since_utc)
+    full_results = _score_shadow_policy_rows(event_rows, notional=notional, cost_bps=cost_bps)
+    recent_results = _score_shadow_policy_rows(recent_rows, notional=notional, cost_bps=cost_bps)
+
+    baseline = full_results["Current live paper shorts"]["horizons"][horizon]
+    best_full = _best_shadow_candidate(full_results, horizon=horizon, min_sample=min_sample)
+    if best_full is None:
+        best_line = "No challenger has enough scored samples yet."
+    else:
+        best_name, best_stats = best_full
+        best_line = (
+            f"Best sampled challenger: {best_name} "
+            f"{_fmt_money(best_stats['pnl'])} vs current {_fmt_money(baseline['pnl'])} "
+            f"on {horizon} net proxy."
+        )
+
+    watch_names = [
+        "Current live paper shorts",
+        "No FAKE-OUT shorts",
+        "FAKE-OUT SHORT PRIME only",
+        "FAKE-OUT SHORT NORMAL only",
+        "STRONG SELL FLOW only",
+        "ABSORPTION SELL only",
+        "No EOD short entries",
+        "All shorts except earnings",
+        "Blocked longs shadow",
+    ]
+
+    lines = [
+        "Paper Shadow Policy Lab",
+        f"Full window since: {since_utc} UTC | recent window: last {max(1, recent_days)}d",
+        f"Primary horizon: {horizon} | notional=${notional:.0f}/event | cost={cost_bps:.1f} bps/event",
+        f"Signal outcomes DB: {signals_status}",
+        f"Events: full={len(event_rows)} | recent={len(recent_rows)}",
+        "",
+        "Decision Frame",
+        f"  {best_line}",
+        f"  Promote only after n>={min_sample}, green net P&L, and no ugly 1d tail.",
+        "  Keep live execution conservative while shadow policies collect more reps.",
+    ]
+    lines.extend(
+        _shadow_leaderboard_lines(
+            f"Full Window Leaderboard ({horizon})",
+            full_results,
+            horizon=horizon,
+            limit=limit,
+            min_sample=min_sample,
+        )
+    )
+    lines.extend(
+        _shadow_leaderboard_lines(
+            f"Recent Leaderboard ({horizon})",
+            recent_results,
+            horizon=horizon,
+            limit=limit,
+            min_sample=min_sample,
+        )
+    )
+    lines.extend(
+        _shadow_multi_horizon_lines(
+            "Key Policies Across Horizons",
+            full_results,
+            names=watch_names,
+            min_sample=min_sample,
+        )
+    )
+    lines.append("")
+    lines.append("Read This As")
+    lines.append("  This is read-only shadow research from entered + blocked events; it does not place orders.")
+    lines.append("  P&L is horizon-close proxy after estimated costs, not broker TP/SL fill simulation.")
+    lines.append("  The point is faster learning: many policies are scored while only one conservative policy trades.")
+    return "\n".join(lines)
 
 
 def build_guardrail_ab_summary(
@@ -1175,11 +1518,31 @@ def main() -> int:
     parser.add_argument("--event-limit", type=int, default=24)
     parser.add_argument("--scenario-limit", type=int, default=8)
     parser.add_argument("--min-sample", type=int, default=10)
+    parser.add_argument("--recent-days", type=int, default=7)
+    parser.add_argument("--cost-bps", type=float, default=DEFAULT_COST_BPS)
     parser.add_argument("--csv", type=Path, default=None, help="Optional path for full event-level CSV export")
     parser.add_argument("--state-db", type=Path, default=PAPER_STATE_DB_PATH)
     parser.add_argument("--signals-db", type=Path, default=SIGNALS_DB_PATH)
     parser.add_argument("--ab-summary", action="store_true", help="Print the compact Discord guardrail A/B summary")
+    parser.add_argument("--shadow-summary", action="store_true", help="Print the compact shadow policy leaderboard")
     args = parser.parse_args()
+
+    if args.shadow_summary:
+        print(
+            build_shadow_policy_report(
+                since=args.since,
+                days=max(1, args.days),
+                recent_days=max(1, args.recent_days),
+                horizon=args.horizon,
+                notional=max(1.0, args.notional),
+                min_sample=max(1, args.min_sample),
+                limit=max(1, args.limit),
+                cost_bps=max(0.0, args.cost_bps),
+                state_db=args.state_db,
+                signals_db=args.signals_db,
+            )
+        )
+        return 0
 
     if args.ab_summary:
         print(

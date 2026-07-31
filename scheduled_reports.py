@@ -11,7 +11,7 @@ from app_paths import DATA_DIR
 from audit_report import DEFAULT_SINCE as DEFAULT_AUDIT_SINCE
 from audit_report import build_report as build_audit_report
 from backtest_signals import build_report as build_backtest_report
-from paper_trade_lab import build_guardrail_ab_summary
+from paper_trade_lab import build_guardrail_ab_summary, build_shadow_policy_report
 from paper_trade_review import build_report as build_paper_trade_review
 from reporting import build_daily_report, build_morning_brief, now_et, post_to_discord
 from signal_score_lab import build_report as build_signal_score_report
@@ -36,6 +36,15 @@ PAPER_AB_REPORT_SINCE = os.getenv("PAPER_AB_REPORT_SINCE", "2026-06-20")
 PAPER_AB_REPORT_HORIZON = os.getenv("PAPER_AB_REPORT_HORIZON", "1h")
 PAPER_AB_REPORT_DAYS = int(os.getenv("PAPER_AB_REPORT_DAYS", "7"))
 PAPER_AB_REPORT_MIN_SAMPLE = int(os.getenv("PAPER_AB_REPORT_MIN_SAMPLE", "10"))
+PAPER_SHADOW_REPORT_ENABLED = os.getenv("PAPER_SHADOW_REPORT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+PAPER_SHADOW_REPORT_TIME_ET = os.getenv("PAPER_SHADOW_REPORT_TIME_ET", "16:35")
+PAPER_SHADOW_REPORT_SINCE = os.getenv("PAPER_SHADOW_REPORT_SINCE", "2026-06-20")
+PAPER_SHADOW_REPORT_HORIZON = os.getenv("PAPER_SHADOW_REPORT_HORIZON", "1h")
+PAPER_SHADOW_REPORT_DAYS = int(os.getenv("PAPER_SHADOW_REPORT_DAYS", "30"))
+PAPER_SHADOW_REPORT_RECENT_DAYS = int(os.getenv("PAPER_SHADOW_REPORT_RECENT_DAYS", "7"))
+PAPER_SHADOW_REPORT_MIN_SAMPLE = int(os.getenv("PAPER_SHADOW_REPORT_MIN_SAMPLE", "25"))
+PAPER_SHADOW_REPORT_LIMIT = int(os.getenv("PAPER_SHADOW_REPORT_LIMIT", "8"))
+PAPER_SHADOW_REPORT_COST_BPS = float(os.getenv("PAPER_SHADOW_REPORT_COST_BPS", "7"))
 SIGNAL_SCORE_REPORT_ENABLED = os.getenv("SIGNAL_SCORE_REPORT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 SIGNAL_SCORE_REPORT_TIME_ET = os.getenv("SIGNAL_SCORE_REPORT_TIME_ET", "16:30")
 SIGNAL_SCORE_REPORT_SINCE = os.getenv("SIGNAL_SCORE_REPORT_SINCE", "2026-05-24 14:52:00")
@@ -146,6 +155,20 @@ def run_forever() -> None:
                     days=PAPER_AB_REPORT_DAYS,
                     horizon=PAPER_AB_REPORT_HORIZON,
                     min_sample=PAPER_AB_REPORT_MIN_SAMPLE,
+                ),
+            )
+        elif PAPER_SHADOW_REPORT_ENABLED and hour_minute == PAPER_SHADOW_REPORT_TIME_ET:
+            _maybe_send(
+                "paper_shadow_report",
+                trade_date,
+                lambda: build_shadow_policy_report(
+                    since=PAPER_SHADOW_REPORT_SINCE,
+                    days=PAPER_SHADOW_REPORT_DAYS,
+                    recent_days=PAPER_SHADOW_REPORT_RECENT_DAYS,
+                    horizon=PAPER_SHADOW_REPORT_HORIZON,
+                    min_sample=PAPER_SHADOW_REPORT_MIN_SAMPLE,
+                    limit=PAPER_SHADOW_REPORT_LIMIT,
+                    cost_bps=PAPER_SHADOW_REPORT_COST_BPS,
                 ),
             )
         elif SIGNAL_SCORE_REPORT_ENABLED and hour_minute == SIGNAL_SCORE_REPORT_TIME_ET:
