@@ -481,6 +481,10 @@ def _is_long(row: dict[str, Any]) -> bool:
     return str(row.get("direction") or "").upper() == "LONG"
 
 
+def _is_micro_lane(row: dict[str, Any]) -> bool:
+    return str(row.get("reason") or "").lower().startswith("micro paper lane:")
+
+
 def _signal_has(row: dict[str, Any], term: str) -> bool:
     return term.upper() in str(row.get("signal_type") or "").upper()
 
@@ -504,7 +508,11 @@ def _is_short_daily_cap(row: dict[str, Any]) -> bool:
 
 
 def _is_entered_short(row: dict[str, Any]) -> bool:
-    return _is_action(row, "ENTERED") and _is_short(row)
+    return _is_action(row, "ENTERED") and _is_short(row) and not _is_micro_lane(row)
+
+
+def _is_micro_entered_short(row: dict[str, Any]) -> bool:
+    return _is_action(row, "ENTERED") and _is_short(row) and _is_micro_lane(row)
 
 
 def _is_any_short_candidate(row: dict[str, Any]) -> bool:
@@ -528,7 +536,7 @@ def _scenario_specs():
         (
             "Current guardrails (longs blocked)",
             "actual ENTERED short events only",
-            lambda row: _is_action(row, "ENTERED") and _is_short(row),
+            lambda row: _is_entered_short(row),
         ),
         (
             "Actual recorded entries",
@@ -600,6 +608,11 @@ def _shadow_policy_specs() -> list[tuple[str, str, Callable[[dict[str, Any]], bo
             "All entered trades",
             "actual entered events, including any historical longs",
             lambda row: _is_action(row, "ENTERED"),
+        ),
+        (
+            "Micro lane actual shorts",
+            "actual entered short events from the isolated micro-paper experiment lane",
+            lambda row: _is_micro_entered_short(row),
         ),
         (
             "No FAKE-OUT shorts",
@@ -764,6 +777,11 @@ def _tournament_policy_specs() -> list[tuple[str, str, Callable[[dict[str, Any]]
             "LIVE_CURRENT",
             "actual entered shorts under deployed guardrails",
             lambda row: _is_entered_short(row),
+        ),
+        (
+            "MICRO_LANE_ACTUAL",
+            "actual entered shorts from the isolated micro-paper experiment lane",
+            lambda row: _is_micro_entered_short(row),
         )
     ]
     for signal_name, signal_predicate in signal_filters:
@@ -1341,6 +1359,7 @@ def build_shadow_policy_report(
 
     watch_names = [
         "Current live paper shorts",
+        "Micro lane actual shorts",
         "No FAKE-OUT shorts",
         "FAKE-OUT SHORT PRIME only",
         "FAKE-OUT SHORT NORMAL only",

@@ -54,6 +54,15 @@ DAILY_LOSS_LIMIT = 500.0
 WILD_RVOL_MIN = float(os.getenv("PAPER_RVOL_MIN", "2.0"))
 PAPER_FAKEOUT_SHORT_RVOL_MIN = float(os.getenv("PAPER_FAKEOUT_SHORT_RVOL_MIN", "0.0"))
 PAPER_MAX_DAILY_ENTRIES = int(os.getenv("PAPER_MAX_DAILY_ENTRIES", "5"))
+PAPER_MICRO_LANE_ENABLED = env_bool("PAPER_MICRO_LANE_ENABLED", False)
+PAPER_MICRO_NOTIONAL = float(os.getenv("PAPER_MICRO_NOTIONAL", "50"))
+PAPER_MICRO_MAX_DAILY_ENTRIES = int(os.getenv("PAPER_MICRO_MAX_DAILY_ENTRIES", "2"))
+PAPER_MICRO_ALLOW_ONE_SHARE_OVER_NOTIONAL = env_bool("PAPER_MICRO_ALLOW_ONE_SHARE_OVER_NOTIONAL", False)
+PAPER_MICRO_ALLOWED_POLICIES = {
+    item.strip().upper()
+    for item in os.getenv("PAPER_MICRO_ALLOWED_POLICIES", "FAKE-OUT|SHORT|PRIME").split(",")
+    if item.strip()
+}
 PAPER_RECENT_LOSER_DAYS = int(os.getenv("PAPER_RECENT_LOSER_DAYS", "10"))
 PAPER_RECENT_LOSER_MIN_TRADES = int(os.getenv("PAPER_RECENT_LOSER_MIN_TRADES", "2"))
 PAPER_RECENT_LOSER_MAX_PNL = float(os.getenv("PAPER_RECENT_LOSER_MAX_PNL", "-5.0"))
@@ -637,6 +646,45 @@ def paper_research_guardrail_reason(
     return None
 
 
+def micro_policy_key(signal_type: str, direction: str, time_session: str | None) -> str:
+    signal_text = str(signal_type or "").upper()
+    session = str(time_session or "UNKNOWN").upper()
+    if "FAKE-OUT" in signal_text:
+        family = "FAKE-OUT"
+    elif "STRONG SELL FLOW" in signal_text:
+        family = "STRONG_SELL_FLOW"
+    elif "ABSORPTION SELL" in signal_text:
+        family = "ABSORPTION_SELL"
+    elif "CLIMAX" in signal_text:
+        family = "CLIMAX"
+    else:
+        family = "OTHER"
+    return f"{family}|{str(direction or 'UNKNOWN').upper()}|{session}"
+
+
+def micro_lane_reason(
+    signal_type: str,
+    direction: str,
+    earnings_window: str | None,
+    time_session: str | None,
+    guardrail_reason: str | None,
+) -> str | None:
+    if not PAPER_MICRO_LANE_ENABLED:
+        return None
+    if direction != "SHORT":
+        return None
+    earnings = str(earnings_window or "UNKNOWN").upper()
+    if earnings in PAPER_BLOCK_EARNINGS_WINDOWS:
+        return None
+    policy_key = micro_policy_key(signal_type, direction, time_session)
+    if policy_key not in PAPER_MICRO_ALLOWED_POLICIES:
+        return None
+    reason_text = str(guardrail_reason or "").lower()
+    if "fake-out short" not in reason_text:
+        return None
+    return f"micro paper lane: {policy_key}"
+
+
 def recent_paper_loser_reason(symbol: str) -> str | None:
     if PAPER_RECENT_LOSER_DAYS <= 0:
         return None
@@ -723,7 +771,26 @@ def paper_signal_sort_key(row):
     )
 
 
-def count_daily_entries(day: str | None = None) -> int:
+def count_daily_entries(day: str | None = None, *, include_micro: bool = False) -> int:
+    day = day or utc_now_str()[:10]
+    conn = sqlite3.connect(STATE_DB_PATH)
+    try:
+        micro_clause = "" if include_micro else "AND COALESCE(reason, '') NOT LIKE 'micro paper lane:%'"
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM paper_signal_events
+            WHERE action = 'ENTERED' AND substr(created_at, 1, 10) = ?
+              {micro_clause}
+            """,
+            (day,),
+        ).fetchone()
+        return int(row[0] or 0)
+    finally:
+        conn.close()
+
+
+def count_daily_micro_entries(day: str | None = None) -> int:
     day = day or utc_now_str()[:10]
     conn = sqlite3.connect(STATE_DB_PATH)
     try:
@@ -731,7 +798,9 @@ def count_daily_entries(day: str | None = None) -> int:
             """
             SELECT COUNT(*)
             FROM paper_signal_events
-            WHERE action = 'ENTERED' AND substr(created_at, 1, 10) = ?
+            WHERE action = 'ENTERED'
+              AND substr(created_at, 1, 10) = ?
+              AND COALESCE(reason, '') LIKE 'micro paper lane:%'
             """,
             (day,),
         ).fetchone()
@@ -1140,13 +1209,24 @@ def execute_signal(
     signal: str,
     direction: str,
     time_session: str | None = None,
+    notional: float | None = None,
+    lane_label: str = "PAPER",
+    event_label: str | None = None,
+    allow_one_share_over_notional: bool = True,
 ):
     try:
+        trade_notional = float(notional if notional is not None else TRADE_NOTIONAL)
         if not is_tradable_symbol(symbol):
             log(f"SKIP {symbol}: not tradable via Alpaca paper")
             return False
         if price <= 0:
             log(f"SKIP {symbol}: invalid signal price {price}")
+            return False
+        if price > trade_notional and not allow_one_share_over_notional:
+            log(
+                f"SKIP {symbol}: {lane_label} cannot size below one share "
+                f"price=${price:.2f} notional=${trade_notional:.2f}"
+            )
             return False
         positions = client.get_all_positions()
         kill_switch_reason = entry_kill_switch_reason(client, positions=positions)
@@ -1164,7 +1244,7 @@ def execute_signal(
             log(f"SKIP {symbol}: max positions reached ({MAX_OPEN_POSITIONS})")
             return False
 
-        qty = max(1, int(TRADE_NOTIONAL / price))
+        qty = max(1, int(trade_notional / price))
         side = OrderSide.SELL if direction == "SHORT" else OrderSide.BUY
         client.submit_order(
             MarketOrderRequest(
@@ -1174,11 +1254,11 @@ def execute_signal(
                 time_in_force=TimeInForce.DAY,
             )
         )
-        ab_label = paper_ab_entry_label(signal, direction, time_session)
-        log(f"{direction} ENTERED: {symbol} ${TRADE_NOTIONAL:.2f} | {signal}{ab_label}")
+        ab_label = event_label if event_label is not None else paper_ab_entry_label(signal, direction, time_session)
+        log(f"{lane_label} {direction} ENTERED: {symbol} ${trade_notional:.2f} | {signal}{ab_label}")
         post_discord(
-            f"📄 PAPER {direction} ENTERED | {symbol} @ ~${price:.2f} | "
-            f"{signal}{ab_label} | ${TRADE_NOTIONAL:.0f} notional"
+            f"📄 {lane_label} {direction} ENTERED | {symbol} @ ~${price:.2f} | "
+            f"{signal}{ab_label} | ${trade_notional:.0f} notional"
         )
         return True
     except Exception as e:
@@ -1259,6 +1339,16 @@ def _run():
         )
         log(guardrail_msg)
         post_discord(guardrail_msg)
+    if PAPER_MICRO_LANE_ENABLED:
+        micro_msg = (
+            "PAPER MICRO LANE ACTIVE | "
+            f"notional=${PAPER_MICRO_NOTIONAL:.0f} | "
+            f"max/day={PAPER_MICRO_MAX_DAILY_ENTRIES} | "
+            f"policies={','.join(sorted(PAPER_MICRO_ALLOWED_POLICIES)) or 'none'} | "
+            f"one-share-over-notional={PAPER_MICRO_ALLOW_ONE_SHARE_OVER_NOTIONAL}"
+        )
+        log(micro_msg)
+        post_discord(micro_msg)
 
     client = get_client()
     last_check = (datetime.utcnow() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1362,6 +1452,49 @@ def _run():
                         time_session,
                     )
                     if guardrail_reason:
+                        micro_reason = micro_lane_reason(
+                            signal_type,
+                            direction,
+                            earnings_window,
+                            time_session,
+                            guardrail_reason,
+                        )
+                        if micro_reason:
+                            micro_entries = count_daily_micro_entries()
+                            if micro_entries < PAPER_MICRO_MAX_DAILY_ENTRIES and execute_signal(
+                                client,
+                                sym_upper,
+                                float(price),
+                                signal_type,
+                                direction,
+                                time_session=time_session,
+                                notional=PAPER_MICRO_NOTIONAL,
+                                lane_label="PAPER MICRO",
+                                event_label=f" | MICRO TEST | {micro_policy_key(signal_type, direction, time_session)}",
+                                allow_one_share_over_notional=PAPER_MICRO_ALLOW_ONE_SHARE_OVER_NOTIONAL,
+                            ):
+                                log_paper_signal_event(
+                                    signal_ts,
+                                    sym_upper,
+                                    signal_type,
+                                    direction,
+                                    "ENTERED",
+                                    reason=micro_reason,
+                                    earnings_window=earnings_window,
+                                    time_session=time_session,
+                                    price=price,
+                                    rvol=rvol,
+                                )
+                                mark_signal_processed(signal_key, signal_ts, sym_upper, signal_type, direction)
+                                _loop_held_symbols.add(sym_upper)
+                                continue
+                            if micro_entries >= PAPER_MICRO_MAX_DAILY_ENTRIES:
+                                guardrail_reason = (
+                                    f"{guardrail_reason}; micro paper lane cap reached "
+                                    f"({micro_entries}/{PAPER_MICRO_MAX_DAILY_ENTRIES})"
+                                )
+                            else:
+                                guardrail_reason = f"{guardrail_reason}; micro paper lane entry skipped"
                         log(f"PAPER RESEARCH BLOCK {sym_upper} {direction}: {guardrail_reason}")
                         log_paper_signal_event(
                             signal_ts,
