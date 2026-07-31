@@ -727,6 +727,252 @@ def _score_shadow_policy_rows(
     return results
 
 
+def _row_net_pnl(
+    row: dict[str, Any],
+    *,
+    horizon: str,
+    notional: float,
+    cost_bps: float,
+) -> float | None:
+    raw_return = row.get(f"{horizon}_return_pct")
+    if raw_return == "" or raw_return is None:
+        return None
+    net_return = float(raw_return) - (max(0.0, cost_bps) / 100.0)
+    return notional * net_return / 100.0
+
+
+def _tournament_policy_specs() -> list[tuple[str, str, Callable[[dict[str, Any]], bool]]]:
+    signal_filters: list[tuple[str, Callable[[dict[str, Any]], bool]]] = [
+        ("ALL_SHORTS", lambda row: True),
+        ("FAKE-OUT", lambda row: _signal_has(row, "FAKE-OUT")),
+        ("STRONG_SELL_FLOW", lambda row: _signal_has(row, "STRONG SELL FLOW")),
+        ("ABSORPTION_SELL", lambda row: _signal_has(row, "ABSORPTION SELL")),
+        ("CLIMAX", lambda row: _signal_has(row, "CLIMAX")),
+    ]
+    session_filters: list[tuple[str, Callable[[dict[str, Any]], bool]]] = [
+        ("ANY_SESSION", lambda row: True),
+        ("PRIME", lambda row: _session_is(row, "PRIME")),
+        ("NORMAL", lambda row: _session_is(row, "NORMAL")),
+        ("PRE", lambda row: _session_is(row, "PRE")),
+        ("EOD", lambda row: _session_is(row, "EOD")),
+        ("NO_EOD", lambda row: not _session_is(row, "EOD")),
+        ("PRIME_OR_NORMAL", lambda row: str(row.get("time_session") or "").upper() in {"PRIME", "NORMAL"}),
+    ]
+
+    specs: list[tuple[str, str, Callable[[dict[str, Any]], bool]]] = [
+        (
+            "LIVE_CURRENT",
+            "actual entered shorts under deployed guardrails",
+            lambda row: _is_entered_short(row),
+        )
+    ]
+    for signal_name, signal_predicate in signal_filters:
+        for session_name, session_predicate in session_filters:
+            name = f"{signal_name} | {session_name}"
+            description = "auto tournament short policy, earnings blocks excluded"
+            specs.append(
+                (
+                    name,
+                    description,
+                    lambda row, sp=signal_predicate, tp=session_predicate: (
+                        _is_any_short_candidate(row) and sp(row) and tp(row)
+                    ),
+                )
+            )
+    specs.append(
+        (
+            "BLOCKED_LONGS_SHADOW",
+            "long events blocked by current guardrails, opportunity-cost monitor",
+            lambda row: _is_blocked_long(row),
+        )
+    )
+    return specs
+
+
+def _score_tournament_policy(
+    selected_rows: list[dict[str, Any]],
+    *,
+    notional: float,
+    cost_bps: float,
+) -> dict[str, dict[str, float]]:
+    horizon_stats = {horizon: _new_ab_stats() for horizon in EVENT_HORIZONS}
+    for row in selected_rows:
+        for horizon in EVENT_HORIZONS:
+            stats = horizon_stats[horizon]
+            stats["selected"] += 1
+            pnl = _row_net_pnl(row, horizon=horizon, notional=notional, cost_bps=cost_bps)
+            if pnl is None:
+                cell = str(row.get(f"{horizon}_cell") or "")
+                if cell == "NO_DATA":
+                    stats["no_data"] += 1
+                else:
+                    stats["missing"] += 1
+                continue
+            _add_stat(stats, pnl)
+    return horizon_stats
+
+
+def _concentration_warnings(
+    selected_rows: list[dict[str, Any]],
+    *,
+    horizon: str,
+    notional: float,
+    cost_bps: float,
+) -> tuple[list[str], dict[str, Any]]:
+    by_symbol: dict[str, float] = {}
+    by_day: dict[str, float] = {}
+    scored = 0
+    total_pnl = 0.0
+    positive_pnl = 0.0
+    for row in selected_rows:
+        pnl = _row_net_pnl(row, horizon=horizon, notional=notional, cost_bps=cost_bps)
+        if pnl is None:
+            continue
+        scored += 1
+        total_pnl += pnl
+        positive_pnl += max(0.0, pnl)
+        symbol = _normalize_key(row.get("symbol"))
+        day = str(row.get("created_at") or "")[:10] or "UNKNOWN"
+        by_symbol[symbol] = by_symbol.get(symbol, 0.0) + pnl
+        by_day[day] = by_day.get(day, 0.0) + pnl
+
+    warnings: list[str] = []
+    top_symbol = max(by_symbol.items(), key=lambda item: item[1], default=("NONE", 0.0))
+    top_day = max(by_day.items(), key=lambda item: item[1], default=("NONE", 0.0))
+    denominator = positive_pnl if positive_pnl > 0.01 else 1.0
+    top_symbol_share = max(0.0, top_symbol[1]) / denominator
+    top_day_share = max(0.0, top_day[1]) / denominator
+    if scored and len(by_symbol) < 3:
+        warnings.append(f"symbol breadth low ({len(by_symbol)})")
+    if scored and len(by_day) < 3:
+        warnings.append(f"day breadth low ({len(by_day)})")
+    if total_pnl > 0 and top_symbol_share > 0.50:
+        warnings.append(f"symbol concentration {top_symbol[0]} {top_symbol_share * 100:.0f}%")
+    if total_pnl > 0 and top_day_share > 0.50:
+        warnings.append(f"day concentration {top_day[0]} {top_day_share * 100:.0f}%")
+    meta = {
+        "scored": scored,
+        "symbols": len(by_symbol),
+        "days": len(by_day),
+        "top_symbol": top_symbol[0],
+        "top_symbol_pnl": top_symbol[1],
+        "top_day": top_day[0],
+        "top_day_pnl": top_day[1],
+        "total_pnl": total_pnl,
+    }
+    return warnings, meta
+
+
+def _policy_status(
+    *,
+    best_stats: dict[str, float],
+    one_day_stats: dict[str, float],
+    min_sample: int,
+    warnings: list[str],
+    horizon: str,
+) -> str:
+    if int(best_stats["n"]) < min_sample:
+        return "WATCH_EARLY"
+    if best_stats["pnl"] <= 0:
+        return "REJECT"
+    if horizon != "1d" and int(one_day_stats["n"]) >= min_sample and one_day_stats["pnl"] < 0:
+        return "DANGER_BAD_1D_TAIL"
+    if warnings:
+        return "WATCH_OVERFIT"
+    return "PROMOTE_CANDIDATE"
+
+
+def _build_policy_tournament(
+    event_rows: list[dict[str, Any]],
+    *,
+    notional: float,
+    cost_bps: float,
+    min_sample: int,
+) -> list[dict[str, Any]]:
+    policies: list[dict[str, Any]] = []
+    for name, description, predicate in _tournament_policy_specs():
+        selected_rows = [row for row in event_rows if predicate(row)]
+        horizons = _score_tournament_policy(selected_rows, notional=notional, cost_bps=cost_bps)
+        best_horizon = max(EVENT_HORIZONS, key=lambda horizon: horizons[horizon]["pnl"])
+        best_stats = horizons[best_horizon]
+        warnings, concentration = _concentration_warnings(
+            selected_rows,
+            horizon=best_horizon,
+            notional=notional,
+            cost_bps=cost_bps,
+        )
+        status = _policy_status(
+            best_stats=best_stats,
+            one_day_stats=horizons["1d"],
+            min_sample=min_sample,
+            warnings=warnings,
+            horizon=best_horizon,
+        )
+        policies.append(
+            {
+                "name": name,
+                "description": description,
+                "selected": len(selected_rows),
+                "horizons": horizons,
+                "best_horizon": best_horizon,
+                "best_stats": best_stats,
+                "status": status,
+                "warnings": warnings,
+                "concentration": concentration,
+            }
+        )
+    return policies
+
+
+def _tournament_policy_line(
+    policy: dict[str, Any],
+    baseline_horizons: dict[str, dict[str, float]] | None = None,
+) -> str:
+    stats = policy["best_stats"]
+    scored = int(stats["n"])
+    selected = int(stats["selected"])
+    wr = (stats["wins"] / scored * 100.0) if scored else 0.0
+    avg = stats["pnl"] / scored if scored else 0.0
+    delta = ""
+    if baseline_horizons is not None:
+        baseline = baseline_horizons.get(policy["best_horizon"])
+        if baseline is not None:
+            delta = f" | delta={_fmt_money(stats['pnl'] - baseline['pnl'])}"
+    warnings = "; ".join(policy["warnings"][:2]) if policy["warnings"] else "clean"
+    return (
+        f"  {policy['name']} [{policy['status']}] best={policy['best_horizon']} "
+        f"selected={selected} scored={scored} P&L={_fmt_money(stats['pnl'])}{delta} "
+        f"avg={_fmt_money(avg)} WR={wr:.1f}% | {warnings}"
+    )
+
+
+def _tournament_section_lines(
+    title: str,
+    policies: list[dict[str, Any]],
+    *,
+    statuses: set[str],
+    limit: int,
+    baseline_horizons: dict[str, dict[str, float]] | None,
+) -> list[str]:
+    lines = ["", title]
+    selected = [policy for policy in policies if policy["status"] in statuses]
+    selected.sort(
+        key=lambda policy: (
+            policy["best_stats"]["pnl"],
+            policy["best_stats"]["n"],
+        ),
+        reverse=True,
+    )
+    if not selected:
+        lines.append("  None")
+        return lines
+    for policy in selected[:limit]:
+        lines.append(_tournament_policy_line(policy, baseline_horizons=baseline_horizons))
+    if len(selected) > limit:
+        lines.append("  ...")
+    return lines
+
+
 def _ab_line(horizon: str, stats: dict[str, float], baseline: dict[str, float] | None) -> str:
     n = int(stats["n"])
     selected = int(stats["selected"])
@@ -1066,8 +1312,22 @@ def build_shadow_policy_report(
     recent_rows = _filter_event_rows_since(event_rows, recent_since_utc)
     full_results = _score_shadow_policy_rows(event_rows, notional=notional, cost_bps=cost_bps)
     recent_results = _score_shadow_policy_rows(recent_rows, notional=notional, cost_bps=cost_bps)
+    tournament = _build_policy_tournament(
+        event_rows,
+        notional=notional,
+        cost_bps=cost_bps,
+        min_sample=min_sample,
+    )
+    recent_tournament = _build_policy_tournament(
+        recent_rows,
+        notional=notional,
+        cost_bps=cost_bps,
+        min_sample=min_sample,
+    )
 
     baseline = full_results["Current live paper shorts"]["horizons"][horizon]
+    live_policy = next((policy for policy in tournament if policy["name"] == "LIVE_CURRENT"), None)
+    live_horizons = None if live_policy is None else live_policy["horizons"]
     best_full = _best_shadow_candidate(full_results, horizon=horizon, min_sample=min_sample)
     if best_full is None:
         best_line = "No challenger has enough scored samples yet."
@@ -1119,6 +1379,42 @@ def build_shadow_policy_report(
             horizon=horizon,
             limit=limit,
             min_sample=min_sample,
+        )
+    )
+    lines.extend(
+        _tournament_section_lines(
+            "Policy Tournament - Promote Candidates",
+            tournament,
+            statuses={"PROMOTE_CANDIDATE"},
+            limit=limit,
+            baseline_horizons=live_horizons,
+        )
+    )
+    lines.extend(
+        _tournament_section_lines(
+            "Policy Tournament - Watch / Overfit",
+            tournament,
+            statuses={"WATCH_OVERFIT", "WATCH_EARLY", "DANGER_BAD_1D_TAIL"},
+            limit=limit,
+            baseline_horizons=live_horizons,
+        )
+    )
+    lines.extend(
+        _tournament_section_lines(
+            "Policy Tournament - Reject",
+            tournament,
+            statuses={"REJECT"},
+            limit=limit,
+            baseline_horizons=live_horizons,
+        )
+    )
+    lines.extend(
+        _tournament_section_lines(
+            "Recent Tournament Watchlist",
+            recent_tournament,
+            statuses={"PROMOTE_CANDIDATE", "WATCH_OVERFIT", "DANGER_BAD_1D_TAIL"},
+            limit=limit,
+            baseline_horizons=None,
         )
     )
     lines.extend(
